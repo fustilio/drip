@@ -180,8 +180,17 @@ async function main() {
     if (!tree) continue;
 
     for (const hunk of file.hunks) {
-      const line0 = Math.max(0, (hunk.newLines > 0 ? hunk.newStart : hunk.oldStart) - 1);
-      hunk.enclosingSymbol = smallestEnclosingDefinition(tree.rootNode, line0);
+      const start = hunk.newLines > 0 ? hunk.newStart : hunk.oldStart;
+      const count = Math.max(hunk.newLines, hunk.oldLines, 1);
+      // Scan every line in the hunk, not just its first — a hunk's first line
+      // is often an import or blank line above the symbol it actually touches.
+      for (let line = start; line < start + count; line++) {
+        const sym = smallestEnclosingDefinition(tree.rootNode, line - 1);
+        if (sym) {
+          hunk.enclosingSymbol = sym;
+          break;
+        }
+      }
     }
   }
 
