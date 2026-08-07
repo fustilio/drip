@@ -1,6 +1,5 @@
 {
-  "name": "drip-feed",
-  "module": "index.ts",
+  "name": "drip",
   "type": "module",
   "private": true,
   "devDependencies": {
