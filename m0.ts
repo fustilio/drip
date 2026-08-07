@@ -100,13 +100,24 @@ function definitionName(node: Node): string | null {
   return nameNode?.text ?? null;
 }
 
+function isDefinition(n: Node): boolean {
+  if (!DEF_TYPES.has(n.type)) return false;
+  if (n.type === "variable_declarator") {
+    // Only counts as a definition if it's bound to a function — a plain
+    // `const x = new Map()` isn't a symbol other hunks meaningfully "call".
+    const value = n.childForFieldName("value");
+    return value?.type === "arrow_function" || value?.type === "function_expression" || value?.type === "function";
+  }
+  return true;
+}
+
 function smallestEnclosingDefinition(root: Node, line0: number): string | null {
   let best: Node | null = null;
   const stack: Node[] = [root];
   while (stack.length) {
     const n = stack.pop()!;
     if (n.startPosition.row <= line0 && line0 <= n.endPosition.row) {
-      if (DEF_TYPES.has(n.type) && definitionName(n)) {
+      if (isDefinition(n) && definitionName(n)) {
         const span = n.endPosition.row - n.startPosition.row;
         const bestSpan = best ? best.endPosition.row - best.startPosition.row : Infinity;
         if (span < bestSpan) best = n;
@@ -137,12 +148,13 @@ class UnionFind {
 
 async function main() {
   const branch = process.argv[2];
+  const targetDir = process.argv[3] ?? process.cwd();
   if (!branch) {
-    console.error("usage: bun m0.ts <branch>");
+    console.error("usage: bun m0.ts <branch> [repo-path]");
     process.exit(2);
   }
 
-  const repoRoot = git(["rev-parse", "--show-toplevel"]).trim();
+  const repoRoot = git(["rev-parse", "--show-toplevel"], targetDir).trim();
   const mergeBase = git(["merge-base", "main", branch!], repoRoot).trim();
   const diffText = git(["diff", "-U3", mergeBase, branch!], repoRoot);
   const files = parseDiff(diffText);
