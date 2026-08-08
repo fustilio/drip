@@ -113,3 +113,86 @@ test("mutually-recursive cross-file def-use forms a cycle — reported as unreso
     cleanup();
   }
 });
+
+test("issue #4: two unrelated changed constructors don't create a false cycle via the shared leaf name 'constructor'", async () => {
+  const { repoRoot: ctorRoot, cleanup } = makeTempRepo("drip-planner-test-ctor-");
+  try {
+    writeFileSync(join(ctorRoot, "service.ts"), `export class Service {\n  constructor() {}\n}\n`);
+    writeFileSync(join(ctorRoot, "controller.ts"), `import { Service } from "./service";\n\nexport class Controller {\n  x = 1;\n}\n`);
+    commit(ctorRoot, "init");
+
+    git(["checkout", "-q", "-b", "feature"], ctorRoot);
+    // Both constructors change in the same diff. Controller's constructor
+    // references Service (meaningful edge). Service's constructor body does
+    // not mention "Controller" (no reverse edge should be inferred).
+    writeFileSync(join(ctorRoot, "service.ts"), `export class Service {\n  constructor() {\n    console.log("ready");\n  }\n}\n`);
+    writeFileSync(
+      join(ctorRoot, "controller.ts"),
+      `import { Service } from "./service";\n\nexport class Controller {\n  constructor(private readonly service: Service) {}\n}\n`,
+    );
+    commit(ctorRoot, "constructors changed");
+
+    const plan = await computePlan({ git: backend, repoRoot: ctorRoot, branch: "feature", baseBranch: "main" });
+    expect(plan.order).not.toBeNull(); // no false cycle
+
+    const controllerSlice = sliceContaining(plan, "controller.ts");
+    const serviceSlice = sliceContaining(plan, "service.ts");
+    expect(controllerSlice).not.toBe(serviceSlice);
+    // Meaningful edge retained: Controller depends on Service.
+    expect(plan.edges).toContainEqual([controllerSlice, serviceSlice]);
+    // No spurious reverse edge from Service to Controller via "constructor".
+    expect(plan.edges).not.toContainEqual([serviceSlice, controllerSlice]);
+  } finally {
+    cleanup();
+  }
+});
+
+test("issue #5: same-named unexported local helpers in different files don't create a cross-file edge", async () => {
+  const { repoRoot: localRoot, cleanup } = makeTempRepo("drip-planner-test-local-helper-");
+  try {
+    writeFileSync(join(localRoot, "one.test.ts"), `function renderSection() {\n  return "a";\n}\nrenderSection();\n`);
+    writeFileSync(join(localRoot, "two.test.ts"), `function renderSection() {\n  return "b";\n}\nrenderSection();\n`);
+    commit(localRoot, "init");
+
+    git(["checkout", "-q", "-b", "feature"], localRoot);
+    writeFileSync(join(localRoot, "one.test.ts"), `function renderSection() {\n  return "a2";\n}\nrenderSection();\n`);
+    writeFileSync(join(localRoot, "two.test.ts"), `function renderSection() {\n  return "b2";\n}\nrenderSection();\n`);
+    commit(localRoot, "both helpers changed");
+
+    const plan = await computePlan({ git: backend, repoRoot: localRoot, branch: "feature", baseBranch: "main" });
+    expect(plan.order).not.toBeNull(); // no false cycle
+
+    const oneSlice = sliceContaining(plan, "one.test.ts");
+    const twoSlice = sliceContaining(plan, "two.test.ts");
+    expect(plan.edges).not.toContainEqual([oneSlice, twoSlice]);
+    expect(plan.edges).not.toContainEqual([twoSlice, oneSlice]);
+  } finally {
+    cleanup();
+  }
+});
+
+test("issue #5: a changed exported helper still produces a real cross-file dependency edge", async () => {
+  const { repoRoot: expRoot, cleanup } = makeTempRepo("drip-planner-test-exported-helper-");
+  try {
+    writeFileSync(join(expRoot, "helper.ts"), `export function renderSection() {\n  return "a";\n}\n`);
+    writeFileSync(join(expRoot, "page.ts"), `import { renderSection } from "./helper";\n\nexport function page() {\n  return renderSection();\n}\n`);
+    commit(expRoot, "init");
+
+    git(["checkout", "-q", "-b", "feature"], expRoot);
+    writeFileSync(join(expRoot, "helper.ts"), `export function renderSection() {\n  return "a2";\n}\n`);
+    writeFileSync(
+      join(expRoot, "page.ts"),
+      `import { renderSection } from "./helper";\n\nexport function page() {\n  return renderSection() + "!";\n}\n`,
+    );
+    commit(expRoot, "both changed");
+
+    const plan = await computePlan({ git: backend, repoRoot: expRoot, branch: "feature", baseBranch: "main" });
+    expect(plan.order).not.toBeNull();
+
+    const helperSlice = sliceContaining(plan, "helper.ts");
+    const pageSlice = sliceContaining(plan, "page.ts");
+    expect(plan.edges).toContainEqual([pageSlice, helperSlice]);
+  } finally {
+    cleanup();
+  }
+});

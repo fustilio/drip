@@ -28,6 +28,7 @@ export type Hunk = {
   raw: string;
   changedText: string;
   qualifiedSymbol: string | null; // e.g. "UserService.getUser" — see docs/adr/0004-override-selector.md
+  exported: boolean; // is the top-level declaration in qualifiedSymbol's chain exported? see docs/adr/0014-def-use-edge-precision.md
 };
 
 export type FileSection = { header: string; path: string; hunks: Hunk[] };
@@ -94,6 +95,7 @@ export function parseDiff(diffText: string): FileSection[] {
         raw,
         changedText,
         qualifiedSymbol: null,
+        exported: false,
       });
     }
     if (hunks.length) files.push({ header, path, hunks });
@@ -122,34 +124,62 @@ function isDefinition(n: Node): boolean {
   return true;
 }
 
+// Is `n` (or its variable_declarator/lexical_declaration wrapper) directly
+// under an `export` statement? Covers `export function`/`export class`/
+// `export const x = ...`/`export default ...` — not `export { x }` named-
+// export lists, which would need cross-referencing a separate identifier
+// list against local declarations (out of scope, see docs/adr/0014).
+function isExportedDeclaration(n: Node): boolean {
+  let p: Node | null = n.parent;
+  while (p && (p.type === "lexical_declaration" || p.type === "variable_declaration")) p = p.parent;
+  return p?.type === "export_statement";
+}
+
 // Returns the dot-joined ancestor chain of definition names enclosing line0,
 // e.g. "UserService.getUser" — not just the innermost name. Two same-named
-// symbols in different scopes must not collide (docs/adr/0004).
-function findQualifiedSymbol(root: Node, line0: number): string | null {
+// symbols in different scopes must not collide (docs/adr/0004). Also reports
+// whether the top-level (module-scope) declaration in that chain is exported —
+// used to gate cross-file def-use matching (docs/adr/0014).
+function findQualifiedSymbol(root: Node, line0: number): { path: string; exported: boolean } | null {
   // Mutable box, not a reassigned nullable — TS's control-flow narrowing
   // doesn't track mutations made inside a nested closure reliably.
-  const best = { path: "", span: Infinity, found: false };
+  const best = { path: "", span: Infinity, found: false, exported: false };
 
-  function visit(node: Node, ancestry: string[]) {
+  function visit(node: Node, ancestry: string[], topLevelExported: boolean) {
     if (!(node.startPosition.row <= line0 && line0 <= node.endPosition.row)) return;
     let nextAncestry = ancestry;
+    let nextTopLevelExported = topLevelExported;
     if (isDefinition(node)) {
       const name = node.childForFieldName("name")?.text;
       if (name) {
+        if (ancestry.length === 0) nextTopLevelExported = isExportedDeclaration(node);
         nextAncestry = [...ancestry, name];
         const span = node.endPosition.row - node.startPosition.row;
         if (span < best.span) {
           best.path = nextAncestry.join(".");
           best.span = span;
           best.found = true;
+          best.exported = nextTopLevelExported;
         }
       }
     }
-    for (const child of node.namedChildren) if (child) visit(child, nextAncestry);
+    for (const child of node.namedChildren) if (child) visit(child, nextAncestry, nextTopLevelExported);
   }
 
-  visit(root, []);
-  return best.found ? best.path : null;
+  visit(root, [], false);
+  return best.found ? { path: best.path, exported: best.exported } : null;
+}
+
+// The cross-file def-use key for a qualified symbol. Constructors all share
+// the leaf "constructor" — matching on that literal word creates a spurious
+// edge between any two changed classes' constructors, since every changed
+// constructor's own declaration contains the word "constructor" (issue #4).
+// The enclosing class name is the meaningful key: that's what a caller
+// actually writes (`new Service()`), not the word "constructor" itself.
+function defUseKey(qualifiedSymbol: string): string {
+  const parts = qualifiedSymbol.split(".");
+  const leaf = parts[parts.length - 1]!;
+  return leaf === "constructor" && parts.length > 1 ? parts[parts.length - 2]! : leaf;
 }
 
 class UnionFind {
@@ -253,7 +283,8 @@ export async function computePlan(opts: {
       for (let line = start; line < start + count; line++) {
         const sym = findQualifiedSymbol(tree.rootNode, line - 1);
         if (sym) {
-          hunk.qualifiedSymbol = sym;
+          hunk.qualifiedSymbol = sym.path;
+          hunk.exported = sym.exported;
           break;
         }
       }
@@ -298,13 +329,15 @@ export async function computePlan(opts: {
 
   // Def-use edges: reference-matching uses the leaf symbol name (how code
   // actually calls it), grouping/selectors use the full qualified path.
+  // Constructors are keyed by their enclosing class name, not the literal
+  // word "constructor" (issue #4, see docs/adr/0014).
   const definersByName = new Map<string, number[]>();
   for (const h of allHunks) {
     if (!h.qualifiedSymbol) continue;
-    const leaf = h.qualifiedSymbol.split(".").pop()!;
-    const list = definersByName.get(leaf) ?? [];
+    const key = defUseKey(h.qualifiedSymbol);
+    const list = definersByName.get(key) ?? [];
     list.push(h.index);
-    definersByName.set(leaf, list);
+    definersByName.set(key, list);
   }
 
   const sliceOf = (h: Hunk) => (h.qualifiedSymbol ? String(uf.find(h.index)) : UNGROUPED);
@@ -317,6 +350,12 @@ export async function computePlan(opts: {
       for (const aIdx of definerIdxs) {
         const a = allHunks[aIdx]!;
         if (a.index === b.index) continue;
+        // Cross-file matching on a name alone is unsound for unexported
+        // locals (issue #5) — two files can each define their own private
+        // `renderSection`. Require the definer to be exported once files
+        // differ; same-file matching is unaffected (name is unambiguous
+        // enough within one file for this heuristic).
+        if (a.file !== b.file && !a.exported) continue;
         const from = sliceOf(b),
           to = sliceOf(a);
         if (from === to) continue;
