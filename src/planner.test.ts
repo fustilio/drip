@@ -2,7 +2,7 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ShellGitBackend } from "./git-backend";
-import { computePlan } from "./planner";
+import { computeCycleDiagnostics, computePlan, planToJson } from "./planner";
 import { commit, git, makeTempRepo } from "./test-helpers";
 
 const backend = new ShellGitBackend();
@@ -93,6 +93,22 @@ test("mutually-recursive cross-file def-use forms a cycle — reported as unreso
 
     const plan = await computePlan({ git: backend, repoRoot: cycleRoot, branch: "feature", baseBranch: "main" });
     expect(plan.order).toBeNull();
+
+    // Issue #3: a null order must not swallow the diagnostics needed to act on it.
+    const cycles = computeCycleDiagnostics(plan);
+    expect(cycles).toHaveLength(1);
+    expect(cycles[0]!.slices).toHaveLength(2);
+    expect(cycles[0]!.edges).toHaveLength(2); // isEven->isOdd and isOdd->isEven
+    for (const e of cycles[0]!.edges) {
+      expect(e.evidence.length).toBeGreaterThan(0);
+      expect(e.evidence[0]!.symbol === "isEven" || e.evidence[0]!.symbol === "isOdd").toBe(true);
+    }
+    expect(cycles[0]!.overridesTouching).toEqual([]); // no overrides configured in this fixture
+
+    const json = planToJson(plan) as { ok: boolean; slices: unknown[]; cycles: unknown[] };
+    expect(json.ok).toBe(false);
+    expect(json.slices).toHaveLength(2); // inferred slices are surfaced even on failure
+    expect(json.cycles).toHaveLength(1);
   } finally {
     cleanup();
   }

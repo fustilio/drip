@@ -56,7 +56,7 @@ server.tool(
       const repoRoot = resolveRepoRoot(git, repo);
       const { db, mergeBase, plan } = await loadPlan({ git, repoRoot, branch, baseBranch: base });
       if (plan.hunks.length === 0) return textResult({ ok: true, message: "no changes — nothing to verify" });
-      if (!plan.order) return textResult({ ok: false, error: "dependency cycle in slice DAG" });
+      if (!plan.order) return textResult(planToJson(plan));
 
       const result = await runVerify({ git, db, branch, repoRoot, mergeBase, plan, buildCmdOverride: buildCmd, noBuildCheck });
       const build =

@@ -32,15 +32,28 @@ export type Hunk = {
 
 export type FileSection = { header: string; path: string; hunks: Hunk[] };
 
+// Why a slice->slice edge exists: the symbol reference (leaf name) found in
+// the referencing hunk's changed text, and the locations on both ends —
+// surfaced in cycle diagnostics so a user can judge real-vs-false-positive.
+export type EdgeEvidence = {
+  symbol: string;
+  referencingFile: string;
+  referencingHunk: { startLine: number; endLine: number };
+  definitionFile: string;
+  definitionHunk: { startLine: number; endLine: number };
+};
+
 export type PlanResult = {
   hunks: Hunk[];
   files: FileSection[];
   slices: Map<string, Hunk[]>;
   edges: [string, string][];
+  edgeEvidence: Map<string, EdgeEvidence[]>; // key: `${from} ${to}`
   order: string[] | null;
   idToNum: Map<string, number>;
   ungroupedId: string;
   ignoredOverrides: string[];
+  overrides: Override[];
 };
 
 const UNGROUPED = "ungrouped";
@@ -195,7 +208,18 @@ export async function computePlan(opts: {
   const allHunks: Hunk[] = files.flatMap((f) => f.hunks);
 
   if (allHunks.length === 0) {
-    return { hunks: [], files, slices: new Map(), edges: [], order: [], idToNum: new Map(), ungroupedId: UNGROUPED, ignoredOverrides: [] };
+    return {
+      hunks: [],
+      files,
+      slices: new Map(),
+      edges: [],
+      edgeEvidence: new Map(),
+      order: [],
+      idToNum: new Map(),
+      ungroupedId: UNGROUPED,
+      ignoredOverrides: [],
+      overrides,
+    };
   }
 
   await Parser.init();
@@ -285,7 +309,8 @@ export async function computePlan(opts: {
 
   const sliceOf = (h: Hunk) => (h.qualifiedSymbol ? String(uf.find(h.index)) : UNGROUPED);
 
-  const sliceEdges = new Set<string>();
+  const sliceEdges = new Map<string, EdgeEvidence[]>();
+  const hunkLoc = (h: Hunk) => ({ startLine: h.newStart, endLine: h.newStart + Math.max(h.newLines, 1) - 1 });
   for (const b of allHunks) {
     for (const [name, definerIdxs] of definersByName) {
       if (!new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(b.changedText)) continue;
@@ -294,7 +319,17 @@ export async function computePlan(opts: {
         if (a.index === b.index) continue;
         const from = sliceOf(b),
           to = sliceOf(a);
-        if (from !== to) sliceEdges.add(`${from} ${to}`);
+        if (from === to) continue;
+        const key = `${from} ${to}`;
+        const evidence = sliceEdges.get(key) ?? [];
+        evidence.push({
+          symbol: name,
+          referencingFile: b.file,
+          referencingHunk: hunkLoc(b),
+          definitionFile: a.file,
+          definitionHunk: hunkLoc(a),
+        });
+        sliceEdges.set(key, evidence);
       }
     }
   }
@@ -307,45 +342,122 @@ export async function computePlan(opts: {
     slices.set(id, list);
   }
 
-  const edges = [...sliceEdges].map((e) => e.split(" ") as [string, string]);
+  const edges = [...sliceEdges.keys()].map((e) => e.split(" ") as [string, string]);
   const order = topoSort([...slices.keys()], edges);
-  const idToNum = order ? new Map(order.map((id, i) => [id, i])) : new Map();
+  // Cyclic plans still need deterministic slice numbering for diagnostics —
+  // fall back to first-seen-in-diff order (the insertion order of `slices`).
+  const numberingOrder = order ?? [...slices.keys()];
+  const idToNum = new Map(numberingOrder.map((id, i) => [id, i]));
 
-  return { hunks: allHunks, files, slices, edges, order, idToNum, ungroupedId: UNGROUPED, ignoredOverrides };
+  return { hunks: allHunks, files, slices, edges, edgeEvidence: sliceEdges, order, idToNum, ungroupedId: UNGROUPED, ignoredOverrides, overrides };
+}
+
+// Strongly-connected components (Tarjan) restricted to components with more
+// than one member — a single-node "SCC" just means no cycle through that
+// node, not a cycle to report. Self-loops can't occur here (edge-building
+// skips from === to), so size > 1 is the only cycle shape possible.
+function findCycles(nodes: string[], edges: [string, string][]): string[][] {
+  const adj = new Map<string, string[]>(nodes.map((n) => [n, []]));
+  for (const [from, to] of edges) adj.get(from)!.push(to);
+
+  let counter = 0;
+  const indices = new Map<string, number>();
+  const lowlink = new Map<string, number>();
+  const onStack = new Set<string>();
+  const stack: string[] = [];
+  const sccs: string[][] = [];
+
+  function strongconnect(v: string) {
+    indices.set(v, counter);
+    lowlink.set(v, counter);
+    counter++;
+    stack.push(v);
+    onStack.add(v);
+    for (const w of adj.get(v) ?? []) {
+      if (!indices.has(w)) {
+        strongconnect(w);
+        lowlink.set(v, Math.min(lowlink.get(v)!, lowlink.get(w)!));
+      } else if (onStack.has(w)) {
+        lowlink.set(v, Math.min(lowlink.get(v)!, indices.get(w)!));
+      }
+    }
+    if (lowlink.get(v) === indices.get(v)) {
+      const component: string[] = [];
+      let w: string;
+      do {
+        w = stack.pop()!;
+        onStack.delete(w);
+        component.push(w);
+      } while (w !== v);
+      if (component.length > 1) sccs.push(component);
+    }
+  }
+  for (const n of nodes) if (!indices.has(n)) strongconnect(n);
+  return sccs;
+}
+
+export type CycleDiagnostic = {
+  slices: string[]; // "slice{n}" ids, in this SCC
+  edges: { from: string; dependsOn: string; evidence: EdgeEvidence[] }[];
+  overridesTouching: Override[]; // existing overrides whose selector matches a symbol in this cycle
+};
+
+export function computeCycleDiagnostics(plan: PlanResult): CycleDiagnostic[] {
+  const sccs = findCycles([...plan.slices.keys()], plan.edges);
+  const sliceLabel = (id: string) => `slice${plan.idToNum.get(id)}`;
+
+  return sccs.map((component) => {
+    const members = new Set(component);
+    const symbolsInCycle = new Set<string>();
+    for (const id of component) {
+      for (const h of plan.slices.get(id) ?? []) {
+        if (h.qualifiedSymbol) symbolsInCycle.add(`${h.file}::${h.qualifiedSymbol}`);
+      }
+    }
+    return {
+      slices: component.map(sliceLabel),
+      edges: plan.edges
+        .filter(([from, to]) => members.has(from) && members.has(to))
+        .map(([from, to]) => ({ from: sliceLabel(from), dependsOn: sliceLabel(to), evidence: plan.edgeEvidence.get(`${from} ${to}`) ?? [] })),
+      overridesTouching: plan.overrides.filter((o) => symbolsInCycle.has(o.selectorA) || (!!o.selectorB && symbolsInCycle.has(o.selectorB))),
+    };
+  });
 }
 
 // Machine-readable plan output — for an external tool (agent, MCP wrapper,
 // CI script) to read ambiguous-boundary/naming context and write decisions
 // back through the existing `drip override add` CLI. See BUILD-PLAN.md §9:
 // the AI belongs upstream of the tool, not inside it.
+// Slice display order: topological when acyclic, else the same first-seen
+// fallback used for idToNum, so numbering is consistent either way.
+function displayOrder(plan: PlanResult): string[] {
+  return plan.order ?? [...plan.idToNum.entries()].sort((a, b) => a[1] - b[1]).map(([id]) => id);
+}
+
 export function planToJson(plan: PlanResult): object {
+  const order = displayOrder(plan);
+  const slices = order.map((id) => {
+    const hunks = plan.slices.get(id)!.sort((a, b) => a.newStart - b.newStart);
+    return {
+      slice: `slice${plan.idToNum.get(id)}`,
+      ungrouped: id === plan.ungroupedId,
+      files: [...new Set(hunks.map((h) => h.file))],
+      symbols: [...new Set(hunks.map((h) => h.qualifiedSymbol).filter((s): s is string => !!s))],
+      hunks: hunks.map((h) => ({ file: h.file, startLine: h.newStart, endLine: h.newStart + Math.max(h.newLines, 1) - 1 })),
+    };
+  });
+  const edges = plan.edges.map(([from, to]) => ({ from: `slice${plan.idToNum.get(from)}`, dependsOn: `slice${plan.idToNum.get(to)}` }));
+
   if (!plan.order) {
-    return { ok: false, error: "dependency cycle in slice DAG", slices: [] };
+    return { ok: false, error: "dependency cycle in slice DAG", slices, edges, cycles: computeCycleDiagnostics(plan), unmatchedOverrideSelectors: plan.ignoredOverrides };
   }
-  return {
-    ok: true,
-    slices: plan.order.map((id) => {
-      const hunks = plan.slices.get(id)!.sort((a, b) => a.newStart - b.newStart);
-      return {
-        slice: `slice${plan.idToNum.get(id)}`,
-        ungrouped: id === plan.ungroupedId,
-        files: [...new Set(hunks.map((h) => h.file))],
-        symbols: [...new Set(hunks.map((h) => h.qualifiedSymbol).filter((s): s is string => !!s))],
-        hunks: hunks.map((h) => ({ file: h.file, startLine: h.newStart, endLine: h.newStart + Math.max(h.newLines, 1) - 1 })),
-      };
-    }),
-    edges: plan.edges.map(([from, to]) => ({ from: `slice${plan.idToNum.get(from)}`, dependsOn: `slice${plan.idToNum.get(to)}` })),
-    unmatchedOverrideSelectors: plan.ignoredOverrides,
-  };
+  return { ok: true, slices, edges, unmatchedOverrideSelectors: plan.ignoredOverrides };
 }
 
 export function printPlan(plan: PlanResult): void {
-  if (!plan.order) {
-    console.error("PLAN: FAIL — dependency cycle in slice DAG");
-    return;
-  }
+  const order = displayOrder(plan);
   console.log("SLICES:");
-  for (const id of plan.order) {
+  for (const id of order) {
     console.log(`  slice${plan.idToNum.get(id)}${id === plan.ungroupedId ? " (ungrouped)" : ""}:`);
     for (const h of plan.slices.get(id)!.sort((a, b) => a.newStart - b.newStart)) {
       console.log(`    ${h.file}:${h.newStart}-${h.newStart + Math.max(h.newLines, 1) - 1}`);
@@ -356,5 +468,28 @@ export function printPlan(plan: PlanResult): void {
   if (plan.ignoredOverrides.length) {
     console.log("\nWARNINGS:");
     for (const s of plan.ignoredOverrides) console.log(`  override selector matched nothing in this diff: ${s}`);
+  }
+
+  if (!plan.order) {
+    console.log("\nPLAN: FAIL — dependency cycle in slice DAG");
+    for (const cycle of computeCycleDiagnostics(plan)) {
+      console.log(`\nCYCLE: ${cycle.slices.join(" -> ")}`);
+      for (const e of cycle.edges) {
+        console.log(`  ${e.from} depends-on ${e.dependsOn}`);
+        for (const ev of e.evidence) {
+          console.log(
+            `    via symbol '${ev.symbol}': ${ev.referencingFile}:${ev.referencingHunk.startLine}-${ev.referencingHunk.endLine} references ${ev.definitionFile}:${ev.definitionHunk.startLine}-${ev.definitionHunk.endLine}`,
+          );
+        }
+      }
+      if (cycle.overridesTouching.length) {
+        console.log("  overrides touching this cycle:");
+        for (const o of cycle.overridesTouching) {
+          console.log(`    ${o.kind} ${o.selectorA}${o.selectorB ? ` <-> ${o.selectorB}` : ""}${o.note ? ` (${o.note})` : ""}`);
+        }
+      } else {
+        console.log("  no existing override touches this cycle — consider `drip override add --kind force_split` on one of the symbols above");
+      }
+    }
   }
 }
