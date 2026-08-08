@@ -57,6 +57,15 @@ export function openStore(repoRoot: string): Database {
       db.run(`ALTER TABLE correspondence ADD COLUMN ${col}`);
     } catch {}
   }
+  db.run(`
+    CREATE TABLE IF NOT EXISTS comment_anchors (
+      pr_comment_id INTEGER PRIMARY KEY,
+      branch TEXT NOT NULL,
+      slice_signature TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('unchanged','orphaned')),
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
   return db;
 }
 
@@ -127,6 +136,16 @@ export function addOverride(
 export function removeOverride(db: Database, id: number): boolean {
   const result = db.query("DELETE FROM overrides WHERE id = ?").run(id);
   return result.changes > 0;
+}
+
+export function wasCommentProcessed(db: Database, prCommentId: number): boolean {
+  return !!db.query("SELECT 1 FROM comment_anchors WHERE pr_comment_id = ?").get(prCommentId);
+}
+
+export function markCommentProcessed(db: Database, prCommentId: number, branch: string, sliceSignature: string, status: "unchanged" | "orphaned"): void {
+  db.query(
+    "INSERT OR IGNORE INTO comment_anchors (pr_comment_id, branch, slice_signature, status) VALUES (?, ?, ?, ?)",
+  ).run(prCommentId, branch, sliceSignature, status);
 }
 
 export function recordTiming(

@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
+import { reconcileComments } from "./anchors";
 import type { GitBackend } from "./git-backend";
 import { ghCreatePr, ghPrClose, ghPrComment } from "./github";
 import { buildSlicePatch, materializeSliceCommits } from "./materialize";
@@ -116,6 +117,8 @@ export async function push(opts: {
           const body = ["Interdiff (previous force-push → this one):", "", "```diff", interdiff.slice(0, 60000), "```"].join("\n");
           ghPrComment(repoRoot, prNumber, body);
         }
+        // M4: relocate/orphan review comments anchored to hunks this push changed.
+        await reconcileComments({ git, db, repoRoot, branch, sliceSignature: signature, mergeBase, oldCommitSha: existing.commitSha, newHunks: hunks, prNumber });
       }
 
       upsertCorrespondence(db, { branch, sliceSignature: signature, sliceBranch: branchName, prNumber, prUrl, contentHash, commitSha: commit });

@@ -48,5 +48,9 @@ A Gerrit-format `Change-Id: I<40-hex>` trailer identifying a logical change acro
 **Correspondence**:
 The durable link between a slice and its projection — `slice branch ↔ PR number/URL` — persisted in `.git/drip.db` so `drip push` updates an existing PR instead of opening a duplicate on every run. Keyed by slice signature, not the slice itself (slices are recomputed, disposable; correspondence is what survives).
 
+**Anchor**:
+The link between a review comment and the code it refers to, used to survive force-push regeneration. M4 anchors on exact hunk hash only (`sha1` of the hunk's raw patch text) — see `docs/adr/0007-comment-anchor-scope.md` for why the plan's symbol-path and fuzzy tiers aren't built yet. A comment whose hunk hash no longer appears in the new push is orphaned with a loud reply on its thread, never silently dropped.
+_Avoid_: link, mapping, reference
+
 **Slice signature**:
 A slice's identity key for correspondence purposes in M2: the sorted, joined list of `file::QualifiedSymbolPath` group-keys the slice unions together. An intermediate stand-in for real content-addressing (M3) — see `docs/adr/0006-slice-correspondence-key.md`.
