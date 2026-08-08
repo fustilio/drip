@@ -7,6 +7,7 @@ import { DripError } from "./errors";
 import { ShellGitBackend, type GitBackend } from "./git-backend";
 import { computePlan, planToJson, printPlan, type PlanResult } from "./planner";
 import { push } from "./push";
+import { resolveMergeBase, resolveRepoRoot } from "./repo";
 import { addOverride, listOverrides, openStore, recordTiming, removeOverride, type OverrideKind } from "./store";
 import { DEFAULT_BUILD_CMD, verifyPerSliceBuild, verifyTreeHash } from "./verify";
 
@@ -19,30 +20,8 @@ function usage(): never {
   );
   console.error("       drip override list <branch> [--repo path]");
   console.error("       drip override remove <id> [--repo path]");
+  console.error("       drip mcp   (starts an MCP stdio server exposing plan/verify/override as tools)");
   process.exit(2);
-}
-
-function resolveRepoRoot(git: GitBackend, targetDir: string): string {
-  try {
-    return git.showToplevel(targetDir);
-  } catch {
-    throw new DripError(`'${targetDir}' is not inside a git repository`);
-  }
-}
-
-function resolveMergeBase(git: GitBackend, baseBranch: string, branch: string, repoRoot: string): string {
-  try {
-    return git.mergeBase(baseBranch, branch, repoRoot);
-  } catch (e: any) {
-    const stderr = String(e.stderr ?? e.message ?? "");
-    if (/Not a valid object name|unknown revision/.test(stderr)) {
-      throw new DripError(
-        `branch '${branch}' or base '${baseBranch}' not found in this repo — if you just cloned, run ` +
-          `\`git checkout ${branch}\` first (only the default branch is checked out locally after a fresh clone)`,
-      );
-    }
-    throw new DripError(`could not compute merge-base of '${baseBranch}' and '${branch}': ${stderr.trim() || e.message}`);
-  }
 }
 
 function reportTiming(
@@ -193,6 +172,12 @@ async function main() {
   });
 
   const [command, branch] = positionals;
+
+  if (command === "mcp") {
+    await import("./mcp");
+    return;
+  }
+
   const git = new ShellGitBackend();
 
   if (command === "override") {
