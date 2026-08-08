@@ -63,6 +63,11 @@ export function addOverride(
   );
 }
 
+export function removeOverride(db: Database, id: number): boolean {
+  const result = db.query("DELETE FROM overrides WHERE id = ?").run(id);
+  return result.changes > 0;
+}
+
 export function recordTiming(
   db: Database,
   branch: string,

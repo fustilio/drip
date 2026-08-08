@@ -27,7 +27,10 @@ export interface GitBackend {
 }
 
 function run(args: string[], cwd: string, env: Env = process.env): string {
-  return execFileSync("git", args, { cwd, env, maxBuffer: 1024 * 1024 * 64 }).toString();
+  // Bun's execFileSync inherits stderr live by default (unlike Node's pure
+  // pipe-and-capture) — force it to pipe so failed git calls don't dump raw
+  // "fatal: ..." noise before our own clean error message.
+  return execFileSync("git", args, { cwd, env, maxBuffer: 1024 * 1024 * 64, stdio: ["ignore", "pipe", "pipe"] }).toString();
 }
 
 // Every method here is plain node:child_process + git plumbing — no Bun-specific

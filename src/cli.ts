@@ -3,15 +3,104 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { assignChangeIds } from "./change-id";
-import { ShellGitBackend } from "./git-backend";
+import { DripError } from "./errors";
+import { ShellGitBackend, type GitBackend } from "./git-backend";
 import { computePlan, printPlan } from "./planner";
-import { listOverrides, openStore, recordTiming } from "./store";
+import { addOverride, listOverrides, openStore, recordTiming, removeOverride, type OverrideKind } from "./store";
 import { DEFAULT_BUILD_CMD, verifyPerSliceBuild, verifyTreeHash } from "./verify";
 
 function usage(): never {
   console.error("usage: drip plan <branch> [--repo path] [--base branch] [--timing] [--assign-ids]");
   console.error("       drip verify <branch> [--repo path] [--base branch] [--timing] [--build-cmd cmd] [--no-build-check]");
+  console.error(
+    "       drip override add <branch> --kind force_merge|force_split --selector-a file::Symbol [--selector-b file::Symbol] [--note text] [--repo path]",
+  );
+  console.error("       drip override list <branch> [--repo path]");
+  console.error("       drip override remove <id> [--repo path]");
   process.exit(2);
+}
+
+function resolveRepoRoot(git: GitBackend, targetDir: string): string {
+  try {
+    return git.showToplevel(targetDir);
+  } catch {
+    throw new DripError(`'${targetDir}' is not inside a git repository`);
+  }
+}
+
+function resolveMergeBase(git: GitBackend, baseBranch: string, branch: string, repoRoot: string): string {
+  try {
+    return git.mergeBase(baseBranch, branch, repoRoot);
+  } catch (e: any) {
+    const stderr = String(e.stderr ?? e.message ?? "");
+    if (/Not a valid object name|unknown revision/.test(stderr)) {
+      throw new DripError(
+        `branch '${branch}' or base '${baseBranch}' not found in this repo — if you just cloned, run ` +
+          `\`git checkout ${branch}\` first (only the default branch is checked out locally after a fresh clone)`,
+      );
+    }
+    throw new DripError(`could not compute merge-base of '${baseBranch}' and '${branch}': ${stderr.trim() || e.message}`);
+  }
+}
+
+async function runOverrideCommand(git: GitBackend, positionals: string[], values: Record<string, unknown>) {
+  const [, sub, arg] = positionals;
+  const targetDir = (values.repo as string | undefined) ?? process.cwd();
+  const repoRoot = resolveRepoRoot(git, targetDir);
+  const db = openStore(repoRoot);
+
+  if (sub === "add") {
+    const branch = arg;
+    if (!branch) throw new DripError("override add requires a branch: drip override add <branch> --kind ... --selector-a ...");
+    const kind = values.kind as string | undefined;
+    if (kind !== "force_merge" && kind !== "force_split") {
+      throw new DripError("--kind must be 'force_merge' or 'force_split'");
+    }
+    const selectorA = values["selector-a"] as string | undefined;
+    if (!selectorA) throw new DripError("--selector-a is required (format: file::QualifiedSymbolPath)");
+    if (!selectorA.includes("::")) {
+      throw new DripError(`--selector-a '${selectorA}' doesn't look like 'file::QualifiedSymbolPath' — missing '::'`);
+    }
+    const selectorB = values["selector-b"] as string | undefined;
+    if (kind === "force_merge" && !selectorB) {
+      throw new DripError("force_merge requires --selector-b as well");
+    }
+    if (kind === "force_split" && selectorB) {
+      throw new DripError("force_split takes only --selector-a, not --selector-b");
+    }
+    if (selectorB && !selectorB.includes("::")) {
+      throw new DripError(`--selector-b '${selectorB}' doesn't look like 'file::QualifiedSymbolPath' — missing '::'`);
+    }
+    addOverride(db, branch, kind as OverrideKind, selectorA, kind === "force_merge" ? selectorB! : null, (values.note as string) ?? null);
+    console.log(`added ${kind} override for ${branch}`);
+    return;
+  }
+
+  if (sub === "list") {
+    const branch = arg;
+    if (!branch) throw new DripError("override list requires a branch: drip override list <branch>");
+    const overrides = listOverrides(db, branch);
+    if (!overrides.length) {
+      console.log(`no overrides for ${branch}`);
+      return;
+    }
+    for (const o of overrides) {
+      const pair = o.kind === "force_merge" ? `${o.selectorA} <-> ${o.selectorB}` : o.selectorA;
+      console.log(`  [${o.id}] ${o.kind}: ${pair}${o.note ? `  (${o.note})` : ""}`);
+    }
+    return;
+  }
+
+  if (sub === "remove") {
+    const idStr = arg;
+    const id = Number(idStr);
+    if (!idStr || !Number.isInteger(id)) throw new DripError("override remove requires a numeric id: drip override remove <id>");
+    const removed = removeOverride(db, id);
+    console.log(removed ? `removed override ${id}` : `no override with id ${id}`);
+    return;
+  }
+
+  usage();
 }
 
 async function main() {
@@ -25,15 +114,25 @@ async function main() {
       "assign-ids": { type: "boolean", default: false },
       "build-cmd": { type: "string" },
       "no-build-check": { type: "boolean", default: false },
+      kind: { type: "string" },
+      "selector-a": { type: "string" },
+      "selector-b": { type: "string" },
+      note: { type: "string" },
     },
   });
 
   const [command, branch] = positionals;
+  const git = new ShellGitBackend();
+
+  if (command === "override") {
+    await runOverrideCommand(git, positionals, values);
+    return;
+  }
+
   if (!command || !branch || (command !== "plan" && command !== "verify")) usage();
 
-  const git = new ShellGitBackend();
   const targetDir = values.repo ?? process.cwd();
-  const repoRoot = git.showToplevel(targetDir);
+  const repoRoot = resolveRepoRoot(git, targetDir);
   const baseBranch = values.base!;
   const started = Date.now();
 
@@ -48,9 +147,17 @@ async function main() {
     }
   }
 
+  resolveMergeBase(git, baseBranch, branch, repoRoot); // validate early, before opening the DB / running tree-sitter
+
   const db = openStore(repoRoot);
   const overrides = listOverrides(db, branch);
   const plan = await computePlan({ git, repoRoot, branch, baseBranch, overrides });
+
+  if (plan.hunks.length === 0) {
+    console.log(`No changes between ${baseBranch} and ${branch} — nothing to slice.`);
+    return;
+  }
+
   printPlan(plan);
 
   if (!plan.order) {
@@ -63,7 +170,7 @@ async function main() {
   }
 
   // verify
-  const mergeBase = git.mergeBase(baseBranch, branch, repoRoot);
+  const mergeBase = resolveMergeBase(git, baseBranch, branch, repoRoot);
   const treeResult = await verifyTreeHash({ git, repoRoot, branch, mergeBase, files: plan.files, order: plan.order!, slices: plan.slices });
   console.log(`\n${treeResult.message}`);
 
@@ -98,4 +205,10 @@ async function main() {
   if (!treeResult.pass || buildFailures.length) process.exit(1);
 }
 
-main();
+main().catch((e) => {
+  if (e instanceof DripError) {
+    console.error(`error: ${e.message}`);
+    process.exit(1);
+  }
+  throw e;
+});
