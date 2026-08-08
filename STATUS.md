@@ -38,6 +38,17 @@ Tracks reality against `BUILD-PLAN.md`. Update this, not the plan doc — the pl
 - Only top-level, right-side (`side: RIGHT`) review comments are considered; left-side (deleted-line) comments and thread replies are silently skipped rather than reconciled — see `docs/adr/0007`.
 - Build-cache skip is prefix-based, not true DAG-independence — see `docs/adr/0008`. An edit near the *start* of the stack still forces a full rebuild of everything after it, even slices with no real relationship to the edit.
 
+## Architecture review
+
+Ran `/improve-codebase-architecture` after all milestones were built. Four candidates identified, all four walked via `/grilling` and shipped:
+
+- **Unify plan/verify orchestration** (`src/workflow.ts`) — `cli.ts` and `mcp.ts` had each reimplemented the merge-base → store → computePlan → tree-hash → build-check workflow, and had already drifted (mcp.ts's override-add was missing a validation check cli.ts had). One `loadPlan`/`runVerify`, two thin formatters.
+- **Collapse a duplicate patch-builder** — `verifyTreeHash` re-derived what `buildSlicePatch` (materialize.ts) already did. Now calls it.
+- **`classifySliceStatus`** (`src/push.ts`) — pulled the five-way slice-status decision (created/updated/unchanged/squash-merged/dry-run) out of `push()`'s loop as a pure function; the loop is now a thin shell acting on the result. Unit tested.
+- **Test the orchestration paths** — not a `FakeGitBackend` as originally proposed (reframed after grilling: faking git's object model is riskier than the thing it'd test). Instead: `src/test-helpers.ts` extends the real-temp-git-repo pattern `planner.test.ts` already used, to `verify.test.ts` (build-cache prefix-skip) and `push.test.ts` (status-to-side-effect wiring, real `git push` to a local bare remote, only `github.ts`/`anchors.ts` mocked since GitHub's API is the actual untestable-with-real-git boundary). See `docs/adr/0010`.
+
+Test count: 4 → 15 across 3 files. `docs/adr/0009` and `0010` record the two decisions where the "obvious" fix (bundle an AI provider; build a FakeGitBackend) was reframed after grilling into something that fit the project's own existing conventions better.
+
 ## Gotchas hit during this build (so they don't get rediscovered)
 
 - Bun's `execFileSync` inherits stderr live by default, unlike Node's pure pipe-and-capture — every git failure double-printed raw `fatal: ...` noise until `stdio: ["ignore","pipe","pipe"]` was forced explicitly (`git-backend.ts`).
