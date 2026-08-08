@@ -48,6 +48,9 @@ A Gerrit-format `Change-Id: I<40-hex>` trailer identifying a logical change acro
 **Correspondence**:
 The durable link between a slice and its projection — `slice branch ↔ PR number/URL` — persisted in `.git/drip.db` so `drip push` updates an existing PR instead of opening a duplicate on every run. Keyed by slice signature, not the slice itself (slices are recomputed, disposable; correspondence is what survives).
 
+**--json**:
+`drip plan`'s machine-readable output mode: slices, files, symbols, hunk ranges, edges, and unmatched override selectors as a single JSON object on stdout, nothing else. The intended interface for external tools (agents, scripts) to read ambiguous-boundary/naming context and write decisions back through `drip override add` — see `docs/adr/0009-ai-integration-external-not-bundled.md` for why this replaced the plan's originally-scoped bundled `--ai` flag.
+
 **Anchor**:
 The link between a review comment and the code it refers to, used to survive force-push regeneration. M4 anchors on exact hunk hash only (`sha1` of the hunk's raw patch text) — see `docs/adr/0007-comment-anchor-scope.md` for why the plan's symbol-path and fuzzy tiers aren't built yet. A comment whose hunk hash no longer appears in the new push is orphaned with a loud reply on its thread, never silently dropped.
 _Avoid_: link, mapping, reference

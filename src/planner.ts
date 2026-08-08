@@ -308,6 +308,31 @@ export async function computePlan(opts: {
   return { hunks: allHunks, files, slices, edges, order, idToNum, ungroupedId: UNGROUPED, ignoredOverrides };
 }
 
+// Machine-readable plan output — for an external tool (agent, MCP wrapper,
+// CI script) to read ambiguous-boundary/naming context and write decisions
+// back through the existing `drip override add` CLI. See BUILD-PLAN.md §9:
+// the AI belongs upstream of the tool, not inside it.
+export function planToJson(plan: PlanResult): object {
+  if (!plan.order) {
+    return { ok: false, error: "dependency cycle in slice DAG", slices: [] };
+  }
+  return {
+    ok: true,
+    slices: plan.order.map((id) => {
+      const hunks = plan.slices.get(id)!.sort((a, b) => a.newStart - b.newStart);
+      return {
+        slice: `slice${plan.idToNum.get(id)}`,
+        ungrouped: id === plan.ungroupedId,
+        files: [...new Set(hunks.map((h) => h.file))],
+        symbols: [...new Set(hunks.map((h) => h.qualifiedSymbol).filter((s): s is string => !!s))],
+        hunks: hunks.map((h) => ({ file: h.file, startLine: h.newStart, endLine: h.newStart + Math.max(h.newLines, 1) - 1 })),
+      };
+    }),
+    edges: plan.edges.map(([from, to]) => ({ from: `slice${plan.idToNum.get(from)}`, dependsOn: `slice${plan.idToNum.get(to)}` })),
+    unmatchedOverrideSelectors: plan.ignoredOverrides,
+  };
+}
+
 export function printPlan(plan: PlanResult): void {
   if (!plan.order) {
     console.error("PLAN: FAIL — dependency cycle in slice DAG");

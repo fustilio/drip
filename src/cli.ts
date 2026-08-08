@@ -5,13 +5,13 @@ import { parseArgs } from "node:util";
 import { assignChangeIds } from "./change-id";
 import { DripError } from "./errors";
 import { ShellGitBackend, type GitBackend } from "./git-backend";
-import { computePlan, printPlan, type PlanResult } from "./planner";
+import { computePlan, planToJson, printPlan, type PlanResult } from "./planner";
 import { push } from "./push";
 import { addOverride, listOverrides, openStore, recordTiming, removeOverride, type OverrideKind } from "./store";
 import { DEFAULT_BUILD_CMD, verifyPerSliceBuild, verifyTreeHash } from "./verify";
 
 function usage(): never {
-  console.error("usage: drip plan <branch> [--repo path] [--base branch] [--timing] [--assign-ids]");
+  console.error("usage: drip plan <branch> [--repo path] [--base branch] [--timing] [--assign-ids] [--json]");
   console.error("       drip verify <branch> [--repo path] [--base branch] [--timing] [--build-cmd cmd] [--no-build-check]");
   console.error("       drip push <branch> [--repo path] [--base branch] [--build-cmd cmd] [--no-build-check] --yes | --dry-run");
   console.error(
@@ -184,6 +184,7 @@ async function main() {
       "no-build-check": { type: "boolean", default: false },
       "dry-run": { type: "boolean", default: false },
       yes: { type: "boolean", default: false },
+      json: { type: "boolean", default: false },
       kind: { type: "string" },
       "selector-a": { type: "string" },
       "selector-b": { type: "string" },
@@ -206,14 +207,18 @@ async function main() {
   const baseBranch = values.base!;
   const started = Date.now();
 
+  const jsonOut = !!values.json && command === "plan";
+
   if (command === "plan" && values["assign-ids"]) {
     const { rewritten, headSha } = assignChangeIds(git, repoRoot, branch, baseBranch);
-    if (rewritten.length) {
-      console.log(`Assigned Change-Id trailers, rewrote ${rewritten.length} commit(s):`);
-      for (const r of rewritten) console.log(`  ${r.old.slice(0, 7)} -> ${r.new.slice(0, 7)}`);
-      console.log(`${branch} now points at ${headSha.slice(0, 7)}\n`);
-    } else {
-      console.log("All commits already have Change-Id trailers.\n");
+    if (!jsonOut) {
+      if (rewritten.length) {
+        console.log(`Assigned Change-Id trailers, rewrote ${rewritten.length} commit(s):`);
+        for (const r of rewritten) console.log(`  ${r.old.slice(0, 7)} -> ${r.new.slice(0, 7)}`);
+        console.log(`${branch} now points at ${headSha.slice(0, 7)}\n`);
+      } else {
+        console.log("All commits already have Change-Id trailers.\n");
+      }
     }
   }
 
@@ -224,18 +229,20 @@ async function main() {
   const plan = await computePlan({ git, repoRoot, branch, baseBranch, overrides });
 
   if (plan.hunks.length === 0) {
-    console.log(`No changes between ${baseBranch} and ${branch} — nothing to slice.`);
+    if (jsonOut) console.log(JSON.stringify({ ok: true, slices: [], edges: [], unmatchedOverrideSelectors: [] }));
+    else console.log(`No changes between ${baseBranch} and ${branch} — nothing to slice.`);
     return;
   }
 
-  printPlan(plan);
+  if (jsonOut) console.log(JSON.stringify(planToJson(plan)));
+  else printPlan(plan);
 
   if (!plan.order) {
     process.exit(1);
   }
 
   if (command === "plan") {
-    if (values.timing) reportTiming(db, branch, "plan", plan.hunks.length, plan.slices.size, Date.now() - started);
+    if (values.timing && !jsonOut) reportTiming(db, branch, "plan", plan.hunks.length, plan.slices.size, Date.now() - started);
     return;
   }
 
