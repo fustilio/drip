@@ -5,13 +5,15 @@ import { parseArgs } from "node:util";
 import { assignChangeIds } from "./change-id";
 import { DripError } from "./errors";
 import { ShellGitBackend, type GitBackend } from "./git-backend";
-import { computePlan, printPlan } from "./planner";
+import { computePlan, printPlan, type PlanResult } from "./planner";
+import { push } from "./push";
 import { addOverride, listOverrides, openStore, recordTiming, removeOverride, type OverrideKind } from "./store";
 import { DEFAULT_BUILD_CMD, verifyPerSliceBuild, verifyTreeHash } from "./verify";
 
 function usage(): never {
   console.error("usage: drip plan <branch> [--repo path] [--base branch] [--timing] [--assign-ids]");
   console.error("       drip verify <branch> [--repo path] [--base branch] [--timing] [--build-cmd cmd] [--no-build-check]");
+  console.error("       drip push <branch> [--repo path] [--base branch] [--build-cmd cmd] [--no-build-check] --yes | --dry-run");
   console.error(
     "       drip override add <branch> --kind force_merge|force_split --selector-a file::Symbol [--selector-b file::Symbol] [--note text] [--repo path]",
   );
@@ -53,6 +55,56 @@ function reportTiming(
 ) {
   recordTiming(db, branch, command, hunkCount, sliceCount, durationMs);
   console.log(`\nTIMING: ${command} took ${durationMs}ms (${hunkCount} hunks, ${sliceCount} slices)`);
+}
+
+// Shared by `verify` and `push` — push must never skip this, per the plan's
+// own M2 scope ("refuses to push if verify fails").
+async function runVerification(opts: {
+  git: GitBackend;
+  repoRoot: string;
+  branch: string;
+  mergeBase: string;
+  plan: PlanResult;
+  buildCmdOverride: string | undefined;
+  noBuildCheck: boolean;
+}): Promise<{ pass: boolean }> {
+  const { git, repoRoot, branch, mergeBase, plan, noBuildCheck } = opts;
+  const treeResult = await verifyTreeHash({ git, repoRoot, branch, mergeBase, files: plan.files, order: plan.order!, slices: plan.slices });
+  console.log(`\n${treeResult.message}`);
+
+  let buildOk = true;
+  if (!noBuildCheck) {
+    const buildCmd = opts.buildCmdOverride ?? (existsSync(join(repoRoot, "tsconfig.json")) ? DEFAULT_BUILD_CMD : null);
+    if (buildCmd) {
+      const result = await verifyPerSliceBuild({
+        git,
+        repoRoot,
+        mergeBase,
+        files: plan.files,
+        order: plan.order!,
+        slices: plan.slices,
+        idToNum: plan.idToNum,
+        buildCmd,
+      });
+      if (result.failures.length) {
+        buildOk = false;
+        console.log(`BUILD CHECK: FAIL (\`${buildCmd}\`)`);
+        for (const f of result.failures) {
+          const lines = f.output.split("\n").filter((l) => l.trim().length > 0);
+          const shown = lines.slice(0, 8);
+          console.log(`  ${f.slice}:`);
+          for (const line of shown) console.log(`    ${line}`);
+          if (lines.length > shown.length) console.log(`    ... (${lines.length - shown.length} more lines)`);
+        }
+      } else {
+        console.log(`BUILD CHECK: PASS (\`${buildCmd}\`, ${plan.order!.length} slices)`);
+      }
+    } else {
+      console.log("BUILD CHECK: skipped (no tsconfig.json found — use --build-cmd to specify one)");
+    }
+  }
+
+  return { pass: treeResult.pass && buildOk };
 }
 
 async function runOverrideCommand(git: GitBackend, positionals: string[], values: Record<string, unknown>) {
@@ -126,6 +178,8 @@ async function main() {
       "assign-ids": { type: "boolean", default: false },
       "build-cmd": { type: "string" },
       "no-build-check": { type: "boolean", default: false },
+      "dry-run": { type: "boolean", default: false },
+      yes: { type: "boolean", default: false },
       kind: { type: "string" },
       "selector-a": { type: "string" },
       "selector-b": { type: "string" },
@@ -141,7 +195,7 @@ async function main() {
     return;
   }
 
-  if (!command || !branch || (command !== "plan" && command !== "verify")) usage();
+  if (!command || !branch || (command !== "plan" && command !== "verify" && command !== "push")) usage();
 
   const targetDir = values.repo ?? process.cwd();
   const repoRoot = resolveRepoRoot(git, targetDir);
@@ -181,46 +235,39 @@ async function main() {
     return;
   }
 
-  // verify
   const mergeBase = resolveMergeBase(git, baseBranch, branch, repoRoot);
-  const treeResult = await verifyTreeHash({ git, repoRoot, branch, mergeBase, files: plan.files, order: plan.order!, slices: plan.slices });
-  console.log(`\n${treeResult.message}`);
+  const { pass } = await runVerification({
+    git,
+    repoRoot,
+    branch,
+    mergeBase,
+    plan,
+    buildCmdOverride: values["build-cmd"],
+    noBuildCheck: !!values["no-build-check"],
+  });
 
-  let buildFailures: Array<{ slice: string; output: string }> = [];
-  if (!values["no-build-check"]) {
-    const buildCmd = values["build-cmd"] ?? (existsSync(join(repoRoot, "tsconfig.json")) ? DEFAULT_BUILD_CMD : null);
-    if (buildCmd) {
-      const result = await verifyPerSliceBuild({
-        git,
-        repoRoot,
-        mergeBase,
-        files: plan.files,
-        order: plan.order!,
-        slices: plan.slices,
-        idToNum: plan.idToNum,
-        buildCmd,
-      });
-      buildFailures = result.failures;
-      if (buildFailures.length) {
-        console.log(`BUILD CHECK: FAIL (\`${buildCmd}\`)`);
-        for (const f of buildFailures) {
-          const lines = f.output.split("\n").filter((l) => l.trim().length > 0);
-          const shown = lines.slice(0, 8);
-          console.log(`  ${f.slice}:`);
-          for (const line of shown) console.log(`    ${line}`);
-          if (lines.length > shown.length) console.log(`    ... (${lines.length - shown.length} more lines)`);
-        }
-      } else {
-        console.log(`BUILD CHECK: PASS (\`${buildCmd}\`, ${plan.order!.length} slices)`);
-      }
-    } else {
-      console.log("BUILD CHECK: skipped (no tsconfig.json found — use --build-cmd to specify one)");
-    }
+  if (command === "verify") {
+    if (values.timing) reportTiming(db, branch, "verify", plan.hunks.length, plan.slices.size, Date.now() - started);
+    if (!pass) process.exit(1);
+    return;
   }
 
-  if (values.timing) reportTiming(db, branch, "verify", plan.hunks.length, plan.slices.size, Date.now() - started);
+  // push
+  if (!pass) {
+    console.error("\npush refused: verify failed");
+    process.exit(1);
+  }
 
-  if (!treeResult.pass || buildFailures.length) process.exit(1);
+  const dryRun = !!values["dry-run"];
+  if (!dryRun && !values.yes) {
+    throw new DripError("push creates real branches and opens real PRs on GitHub — pass --yes to confirm, or --dry-run to preview first");
+  }
+
+  const results = await push({ git, db, repoRoot, branch, baseBranch, mergeBase, plan, dryRun });
+  console.log(dryRun ? "\nDRY RUN (no branches pushed, no PRs created):" : "\nPUSHED:");
+  for (const r of results) {
+    console.log(`  ${r.sliceLabel} -> ${r.branchName}${r.prUrl ? ` [${r.status}] ${r.prUrl}` : ""}`);
+  }
 }
 
 main().catch((e) => {

@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "nod
 import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GitBackend } from "./git-backend";
+import { materializeSliceCommits } from "./materialize";
 import type { FileSection, Hunk } from "./planner";
 
 export const DEFAULT_BUILD_CMD = "bunx tsc --noEmit";
@@ -58,33 +59,16 @@ export async function verifyPerSliceBuild(opts: {
   idToNum: Map<string, number>;
   buildCmd: string;
 }): Promise<{ failures: Array<{ slice: string; output: string }> }> {
-  const { git, repoRoot, mergeBase, files, order, slices, idToNum, buildCmd } = opts;
+  const { git, repoRoot, idToNum, buildCmd } = opts;
+  const commits = await materializeSliceCommits(opts);
   const tmpDir = mkdtempSync(join(tmpdir(), "drip-verify-build-"));
-  const indexFile = join(tmpDir, "index");
-  const env = { ...process.env, GIT_INDEX_FILE: indexFile };
   const failures: Array<{ slice: string; output: string }> = [];
-  let parentCommit = mergeBase;
   const nodeModulesSrc = join(repoRoot, "node_modules");
 
   try {
-    git.readTree(mergeBase, repoRoot, env);
-    for (const id of order) {
-      const sliceLabel = `slice${idToNum.get(id)}`;
-      const hunksInSlice = new Set(slices.get(id)!.map((h) => h.index));
-      for (const file of files) {
-        const selected = file.hunks.filter((h) => hunksInSlice.has(h.index));
-        if (!selected.length) continue;
-        const patch = file.header + selected.map((h) => h.raw).join("");
-        const patchFile = join(tmpDir, "patch.diff");
-        writeFileSync(patchFile, patch);
-        git.applyCached(patchFile, repoRoot, env);
-      }
-
-      const tree = git.writeTree(repoRoot, env);
-      const commit = git.commitTree(tree, [parentCommit], `drip verify: ${sliceLabel}`, repoRoot);
-      parentCommit = commit;
-
-      const worktreePath = join(tmpDir, `wt-${idToNum.get(id)}`);
+    for (const { sliceId, commit } of commits) {
+      const sliceLabel = `slice${idToNum.get(sliceId)}`;
+      const worktreePath = join(tmpDir, `wt-${idToNum.get(sliceId)}`);
       git.worktreeAdd(worktreePath, commit, repoRoot);
       try {
         if (existsSync(nodeModulesSrc)) {

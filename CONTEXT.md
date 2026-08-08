@@ -44,3 +44,9 @@ _Avoid_: exception, rule, hint
 
 **Change-Id**:
 A Gerrit-format `Change-Id: I<40-hex>` trailer identifying a logical change across amendments of a mega-branch commit. Assigned only via an explicit opt-in rewrite (`drip plan --assign-ids`), never silently — see `docs/adr/0001-change-id-trailer.md`.
+
+**Correspondence**:
+The durable link between a slice and its projection — `slice branch ↔ PR number/URL` — persisted in `.git/drip.db` so `drip push` updates an existing PR instead of opening a duplicate on every run. Keyed by slice signature, not the slice itself (slices are recomputed, disposable; correspondence is what survives).
+
+**Slice signature**:
+A slice's identity key for correspondence purposes in M2: the sorted, joined list of `file::QualifiedSymbolPath` group-keys the slice unions together. An intermediate stand-in for real content-addressing (M3) — see `docs/adr/0006-slice-correspondence-key.md`.

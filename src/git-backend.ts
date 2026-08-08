@@ -24,6 +24,7 @@ export interface GitBackend {
   worktreeRemove(path: string, cwd: string): void;
   log(range: string, cwd: string): CommitInfo[];
   updateRef(ref: string, sha: string, cwd: string): void;
+  push(remote: string, refspec: string, cwd: string, force: boolean): void;
 }
 
 function run(args: string[], cwd: string, env: Env = process.env): string {
@@ -97,5 +98,15 @@ export class ShellGitBackend implements GitBackend {
   }
   updateRef(ref: string, sha: string, cwd: string) {
     run(["update-ref", ref, sha], cwd);
+  }
+  push(remote: string, refspec: string, cwd: string, force: boolean) {
+    // Plain --force, not --force-with-lease: drip never fetches to keep a
+    // remote-tracking ref current, so lease would reject pushes to branches
+    // it itself owns and manages exclusively (the drip/<branch>/sliceN
+    // namespace) just because the local repo's view of the remote is stale.
+    const args = ["push"];
+    if (force) args.push("--force");
+    args.push(remote, refspec);
+    run(args, cwd);
   }
 }

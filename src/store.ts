@@ -36,7 +36,52 @@ export function openStore(repoRoot: string): Database {
       started_at TEXT NOT NULL DEFAULT (datetime('now'))
     )
   `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS correspondence (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      branch TEXT NOT NULL,
+      slice_signature TEXT NOT NULL,
+      slice_branch TEXT NOT NULL,
+      pr_number INTEGER,
+      pr_url TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(branch, slice_signature)
+    )
+  `);
   return db;
+}
+
+// slice_signature identifies "the same logical slice" across re-runs of
+// `drip push` — see docs/adr/0006-slice-correspondence-key.md.
+export type Correspondence = {
+  id?: number;
+  branch: string;
+  sliceSignature: string;
+  sliceBranch: string;
+  prNumber: number | null;
+  prUrl: string | null;
+};
+
+export function getCorrespondence(db: Database, branch: string, sliceSignature: string): Correspondence | null {
+  const row = db
+    .query(
+      "SELECT id, branch, slice_signature as sliceSignature, slice_branch as sliceBranch, pr_number as prNumber, pr_url as prUrl FROM correspondence WHERE branch = ? AND slice_signature = ?",
+    )
+    .get(branch, sliceSignature) as Correspondence | null;
+  return row;
+}
+
+export function upsertCorrespondence(db: Database, c: Correspondence): void {
+  db.query(
+    `INSERT INTO correspondence (branch, slice_signature, slice_branch, pr_number, pr_url, updated_at)
+     VALUES (?, ?, ?, ?, ?, datetime('now'))
+     ON CONFLICT(branch, slice_signature) DO UPDATE SET
+       slice_branch = excluded.slice_branch,
+       pr_number = excluded.pr_number,
+       pr_url = excluded.pr_url,
+       updated_at = datetime('now')`,
+  ).run(c.branch, c.sliceSignature, c.sliceBranch, c.prNumber, c.prUrl);
 }
 
 export function listOverrides(db: Database, branch: string): Override[] {
