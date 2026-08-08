@@ -8,14 +8,36 @@ import { ghCreatePr, ghPrClose, ghPrComment } from "./github";
 import { buildSlicePatch, materializeSliceCommits } from "./materialize";
 import type { PlanResult } from "./planner";
 import { computeContentHash, computeSliceSignature } from "./signature";
-import { deleteCorrespondence, getCorrespondence, upsertCorrespondence } from "./store";
+import { deleteCorrespondence, getCorrespondence, upsertCorrespondence, type Correspondence } from "./store";
+
+export type SliceStatus = "created" | "updated" | "unchanged" | "squash-merged" | "dry-run";
 
 export type PushResult = {
   sliceLabel: string;
   branchName: string;
   prUrl: string | null;
-  status: "created" | "updated" | "unchanged" | "squash-merged" | "dry-run";
+  status: SliceStatus;
 };
+
+// Pure: which of the five statuses a slice is in, given what's already known
+// about it. No I/O, no GitBackend -- the whole point of pulling this out of
+// push()'s loop is that this five-way decision is unit-testable on its own.
+//
+// Priority is squash-merged > unchanged > (dry-run ? "dry-run" : created/updated)
+// in both dry-run and real mode -- dry-run only changes whether the final
+// bucket reports "dry-run" instead of the real created/updated split.
+export function classifySliceStatus(opts: {
+  existing: Correspondence | null;
+  squashMerged: boolean;
+  contentHash: string;
+  dryRun: boolean;
+}): SliceStatus {
+  const { existing, squashMerged, contentHash, dryRun } = opts;
+  if (squashMerged) return "squash-merged";
+  if (existing && existing.contentHash === contentHash) return "unchanged";
+  if (dryRun) return "dry-run";
+  return existing ? "updated" : "created";
+}
 
 export async function push(opts: {
   git: GitBackend;
@@ -60,28 +82,30 @@ export async function push(opts: {
         squashMerged = git.applyCachedReverseCheck(patchFile, repoRoot, scratchEnv);
       }
 
+      const status = classifySliceStatus({ existing, squashMerged, contentHash, dryRun });
+
       if (dryRun) {
-        const status = squashMerged ? "squash-merged" : existing?.contentHash === contentHash ? "unchanged" : "dry-run";
         results.push({ sliceLabel, branchName, prUrl: existing?.prUrl ?? null, status });
-        if (!squashMerged) baseForNext = branchName;
+        if (status !== "squash-merged") baseForNext = branchName;
         continue;
       }
 
-      if (squashMerged) {
+      if (status === "squash-merged") {
         if (existing?.prNumber) {
           ghPrClose(repoRoot, existing.prNumber, "Closed by drip: this slice's content is already present on the base branch (squash-merge detected).");
           deleteCorrespondence(db, branch, signature);
         }
-        results.push({ sliceLabel, branchName, prUrl: existing?.prUrl ?? null, status: "squash-merged" });
+        results.push({ sliceLabel, branchName, prUrl: existing?.prUrl ?? null, status });
         continue; // dropped from the stack — baseForNext stays where it was
       }
 
-      if (existing && existing.contentHash === contentHash) {
-        results.push({ sliceLabel, branchName, prUrl: existing.prUrl, status: "unchanged" });
+      if (status === "unchanged") {
+        results.push({ sliceLabel, branchName, prUrl: existing!.prUrl, status });
         baseForNext = branchName;
         continue;
       }
 
+      // status is "created" or "updated"
       git.push("origin", `${commit}:refs/heads/${branchName}`, repoRoot, true);
 
       let prUrl = existing?.prUrl ?? null;
@@ -109,7 +133,7 @@ export async function push(opts: {
       }
 
       upsertCorrespondence(db, { branch, sliceSignature: signature, sliceBranch: branchName, prNumber, prUrl, contentHash, commitSha: commit });
-      results.push({ sliceLabel, branchName, prUrl, status: existing ? "updated" : "created" });
+      results.push({ sliceLabel, branchName, prUrl, status });
       baseForNext = branchName;
     }
   } finally {
