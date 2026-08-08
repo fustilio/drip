@@ -32,18 +32,14 @@ export async function verifyTreeHash(opts: {
   try {
     git.readTree(mergeBase, repoRoot, env);
     for (const id of order) {
-      const hunksInSlice = new Set(slices.get(id)!.map((h) => h.index));
-      for (const file of files) {
-        const selected = file.hunks.filter((h) => hunksInSlice.has(h.index));
-        if (!selected.length) continue;
-        const patch = file.header + selected.map((h) => h.raw).join("");
-        const patchFile = join(tmpDir, "patch.diff");
-        writeFileSync(patchFile, patch);
-        try {
-          git.applyCached(patchFile, repoRoot, env);
-        } catch (e) {
-          return { pass: false, message: `INVARIANT: FAIL — could not apply ${id} to ${file.path}\n${String(e)}` };
-        }
+      const patch = buildSlicePatch(files, slices, id);
+      if (!patch) continue;
+      const patchFile = join(tmpDir, "patch.diff");
+      writeFileSync(patchFile, patch);
+      try {
+        git.applyCached(patchFile, repoRoot, env);
+      } catch (e) {
+        return { pass: false, message: `INVARIANT: FAIL — could not apply ${id}\n${String(e)}` };
       }
     }
     const actual = git.writeTree(repoRoot, env);
