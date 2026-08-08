@@ -43,6 +43,18 @@ function resolveMergeBase(git: GitBackend, baseBranch: string, branch: string, r
   }
 }
 
+function reportTiming(
+  db: ReturnType<typeof openStore>,
+  branch: string,
+  command: "plan" | "verify",
+  hunkCount: number,
+  sliceCount: number,
+  durationMs: number,
+) {
+  recordTiming(db, branch, command, hunkCount, sliceCount, durationMs);
+  console.log(`\nTIMING: ${command} took ${durationMs}ms (${hunkCount} hunks, ${sliceCount} slices)`);
+}
+
 async function runOverrideCommand(git: GitBackend, positionals: string[], values: Record<string, unknown>) {
   const [, sub, arg] = positionals;
   const targetDir = (values.repo as string | undefined) ?? process.cwd();
@@ -165,7 +177,7 @@ async function main() {
   }
 
   if (command === "plan") {
-    if (values.timing) recordTiming(db, branch, "plan", plan.hunks.length, plan.slices.size, Date.now() - started);
+    if (values.timing) reportTiming(db, branch, "plan", plan.hunks.length, plan.slices.size, Date.now() - started);
     return;
   }
 
@@ -190,17 +202,23 @@ async function main() {
       });
       buildFailures = result.failures;
       if (buildFailures.length) {
-        console.log("BUILD CHECK: FAIL");
-        for (const f of buildFailures) console.log(`  ${f.slice}:\n  ${f.output.split("\n").slice(0, 5).join("\n  ")}`);
+        console.log(`BUILD CHECK: FAIL (\`${buildCmd}\`)`);
+        for (const f of buildFailures) {
+          const lines = f.output.split("\n").filter((l) => l.trim().length > 0);
+          const shown = lines.slice(0, 8);
+          console.log(`  ${f.slice}:`);
+          for (const line of shown) console.log(`    ${line}`);
+          if (lines.length > shown.length) console.log(`    ... (${lines.length - shown.length} more lines)`);
+        }
       } else {
-        console.log(`BUILD CHECK: PASS (${plan.order!.length} slices)`);
+        console.log(`BUILD CHECK: PASS (\`${buildCmd}\`, ${plan.order!.length} slices)`);
       }
     } else {
       console.log("BUILD CHECK: skipped (no tsconfig.json found — use --build-cmd to specify one)");
     }
   }
 
-  if (values.timing) recordTiming(db, branch, "verify", plan.hunks.length, plan.slices.size, Date.now() - started);
+  if (values.timing) reportTiming(db, branch, "verify", plan.hunks.length, plan.slices.size, Date.now() - started);
 
   if (!treeResult.pass || buildFailures.length) process.exit(1);
 }
