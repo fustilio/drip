@@ -18,6 +18,7 @@ export interface GitBackend {
   show(ref: string, path: string, cwd: string): string;
   readTree(treeish: string, cwd: string, env: Env): void;
   applyCached(patchFile: string, cwd: string, env: Env): void;
+  applyCachedReverseCheck(patchFile: string, cwd: string, env: Env): boolean;
   writeTree(cwd: string, env: Env): string;
   commitTree(tree: string, parents: string[], message: string, cwd: string, env?: Env): string;
   worktreeAdd(path: string, commitish: string, cwd: string): void;
@@ -57,6 +58,16 @@ export class ShellGitBackend implements GitBackend {
   }
   applyCached(patchFile: string, cwd: string, env: Env) {
     run(["apply", "--cached", "--recount", patchFile], cwd, env);
+  }
+  // Squash-merge detection: does this slice's content already exist at the
+  // scratch index's current tree? A clean reverse-apply means yes.
+  applyCachedReverseCheck(patchFile: string, cwd: string, env: Env): boolean {
+    try {
+      run(["apply", "--check", "--cached", "--reverse", "--recount", patchFile], cwd, env);
+      return true;
+    } catch {
+      return false;
+    }
   }
   writeTree(cwd: string, env: Env) {
     return run(["write-tree"], cwd, env).trim();

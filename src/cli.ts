@@ -266,7 +266,7 @@ async function main() {
   const results = await push({ git, db, repoRoot, branch, baseBranch, mergeBase, plan, dryRun });
   console.log(dryRun ? "\nDRY RUN (no branches pushed, no PRs created):" : "\nPUSHED:");
   for (const r of results) {
-    console.log(`  ${r.sliceLabel} -> ${r.branchName}${r.prUrl ? ` [${r.status}] ${r.prUrl}` : ""}`);
+    console.log(`  ${r.sliceLabel} -> ${r.branchName} [${r.status}]${r.prUrl ? ` ${r.prUrl}` : ""}`);
   }
 }
 

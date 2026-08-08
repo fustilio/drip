@@ -1,10 +1,13 @@
 import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { GitBackend } from "./git-backend";
-import { ghCreatePr } from "./github";
-import { materializeSliceCommits } from "./materialize";
+import { ghCreatePr, ghPrClose, ghPrComment } from "./github";
+import { buildSlicePatch, materializeSliceCommits } from "./materialize";
 import type { Hunk, PlanResult } from "./planner";
-import { getCorrespondence, upsertCorrespondence } from "./store";
+import { deleteCorrespondence, getCorrespondence, upsertCorrespondence } from "./store";
 
 // See docs/adr/0006-slice-correspondence-key.md.
 export function computeSliceSignature(hunks: Hunk[]): string {
@@ -12,7 +15,19 @@ export function computeSliceSignature(hunks: Hunk[]): string {
   return createHash("sha1").update(parts.join("|")).digest("hex").slice(0, 12);
 }
 
-export type PushResult = { sliceLabel: string; branchName: string; prUrl: string | null; status: "created" | "updated" | "dry-run" };
+// M3: content hash of the slice's actual patch text — distinct from the
+// symbol-signature above. Unchanged hash across runs means the diff itself
+// didn't change, so the branch/PR don't need touching.
+function computeContentHash(patch: string): string {
+  return createHash("sha1").update(patch).digest("hex").slice(0, 12);
+}
+
+export type PushResult = {
+  sliceLabel: string;
+  branchName: string;
+  prUrl: string | null;
+  status: "created" | "updated" | "unchanged" | "squash-merged" | "dry-run";
+};
 
 export async function push(opts: {
   git: GitBackend;
@@ -27,43 +42,88 @@ export async function push(opts: {
   const { git, db, repoRoot, branch, baseBranch, mergeBase, plan, dryRun } = opts;
   const commits = await materializeSliceCommits({ git, repoRoot, mergeBase, files: plan.files, order: plan.order!, slices: plan.slices });
 
+  // Squash-merge check: does this slice's patch already exist in baseBranch's
+  // current tip? A clean --reverse --check apply means yes. One scratch index,
+  // rebuilt fresh per slice from the tip (--check never mutates it, but
+  // read-tree is cheap and keeps each check independent of the others).
+  const baseTip = git.revParse(baseBranch, repoRoot);
+  const tmpDir = mkdtempSync(join(tmpdir(), "drip-reconcile-"));
+  const indexFile = join(tmpDir, "index");
+  const scratchEnv = { ...process.env, GIT_INDEX_FILE: indexFile };
+
   const results: PushResult[] = [];
   let baseForNext = baseBranch;
 
-  for (const { sliceId, commit } of commits) {
-    const sliceLabel = `slice${plan.idToNum.get(sliceId)}`;
-    const branchName = `drip/${branch}/${sliceLabel}`;
-    const hunks = plan.slices.get(sliceId)!;
-    const signature = computeSliceSignature(hunks);
-    const existing = getCorrespondence(db, branch, signature);
+  try {
+    for (const { sliceId, commit } of commits) {
+      const sliceLabel = `slice${plan.idToNum.get(sliceId)}`;
+      const branchName = `drip/${branch}/${sliceLabel}`;
+      const hunks = plan.slices.get(sliceId)!;
+      const signature = computeSliceSignature(hunks);
+      const patch = buildSlicePatch(plan.files, plan.slices, sliceId);
+      const contentHash = computeContentHash(patch);
+      const existing = getCorrespondence(db, branch, signature);
 
-    if (dryRun) {
-      results.push({ sliceLabel, branchName, prUrl: existing?.prUrl ?? null, status: "dry-run" });
+      let squashMerged = false;
+      if (patch) {
+        git.readTree(baseTip, repoRoot, scratchEnv);
+        const patchFile = join(tmpDir, "check.diff");
+        writeFileSync(patchFile, patch);
+        squashMerged = git.applyCachedReverseCheck(patchFile, repoRoot, scratchEnv);
+      }
+
+      if (dryRun) {
+        const status = squashMerged ? "squash-merged" : existing?.contentHash === contentHash ? "unchanged" : "dry-run";
+        results.push({ sliceLabel, branchName, prUrl: existing?.prUrl ?? null, status });
+        if (!squashMerged) baseForNext = branchName;
+        continue;
+      }
+
+      if (squashMerged) {
+        if (existing?.prNumber) {
+          ghPrClose(repoRoot, existing.prNumber, "Closed by drip: this slice's content is already present on the base branch (squash-merge detected).");
+          deleteCorrespondence(db, branch, signature);
+        }
+        results.push({ sliceLabel, branchName, prUrl: existing?.prUrl ?? null, status: "squash-merged" });
+        continue; // dropped from the stack — baseForNext stays where it was
+      }
+
+      if (existing && existing.contentHash === contentHash) {
+        results.push({ sliceLabel, branchName, prUrl: existing.prUrl, status: "unchanged" });
+        baseForNext = branchName;
+        continue;
+      }
+
+      git.push("origin", `${commit}:refs/heads/${branchName}`, repoRoot, true);
+
+      let prUrl = existing?.prUrl ?? null;
+      let prNumber = existing?.prNumber ?? null;
+
+      if (!existing) {
+        const files = [...new Set(hunks.map((h) => h.file))];
+        const title = `drip: ${sliceLabel} — ${files[0]}${files.length > 1 ? ` +${files.length - 1} more` : ""}`;
+        const body = [`Auto-generated by \`drip push\` for mega branch \`${branch}\`.`, "", "Files touched:", ...files.map((f) => `- ${f}`)].join(
+          "\n",
+        );
+        const pr = ghCreatePr({ repoRoot, base: baseForNext, head: branchName, title, body });
+        prUrl = pr.url;
+        prNumber = pr.number;
+      } else if (existing.commitSha && existing.contentHash && existing.contentHash !== contentHash && prNumber) {
+        // Content changed under an existing PR — GitHub won't render a
+        // force-push diff natively, so post the interdiff as a comment.
+        const interdiff = git.diff(existing.commitSha, commit, repoRoot);
+        if (interdiff.trim()) {
+          const body = ["Interdiff (previous force-push → this one):", "", "```diff", interdiff.slice(0, 60000), "```"].join("\n");
+          ghPrComment(repoRoot, prNumber, body);
+        }
+      }
+
+      upsertCorrespondence(db, { branch, sliceSignature: signature, sliceBranch: branchName, prNumber, prUrl, contentHash, commitSha: commit });
+      results.push({ sliceLabel, branchName, prUrl, status: existing ? "updated" : "created" });
       baseForNext = branchName;
-      continue;
     }
-
-    // Always (re-)push the branch — cheap, and covers content drift that the
-    // symbol-signature key alone wouldn't catch (same symbols, edited lines).
-    git.push("origin", `${commit}:refs/heads/${branchName}`, repoRoot, true);
-
-    let prUrl = existing?.prUrl ?? null;
-    let prNumber = existing?.prNumber ?? null;
-
-    if (!existing) {
-      const files = [...new Set(hunks.map((h) => h.file))];
-      const title = `drip: ${sliceLabel} — ${files[0]}${files.length > 1 ? ` +${files.length - 1} more` : ""}`;
-      const body = [`Auto-generated by \`drip push\` for mega branch \`${branch}\`.`, "", "Files touched:", ...files.map((f) => `- ${f}`)].join(
-        "\n",
-      );
-      const pr = ghCreatePr({ repoRoot, base: baseForNext, head: branchName, title, body });
-      prUrl = pr.url;
-      prNumber = pr.number;
-    }
-
-    upsertCorrespondence(db, { branch, sliceSignature: signature, sliceBranch: branchName, prNumber, prUrl });
-    results.push({ sliceLabel, branchName, prUrl, status: existing ? "updated" : "created" });
-    baseForNext = branchName;
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true });
   }
 
   return results;

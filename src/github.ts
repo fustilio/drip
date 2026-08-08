@@ -21,6 +21,22 @@ export function ghCreatePr(opts: { repoRoot: string; base: string; head: string;
   return { number: match ? Number(match[1]) : 0, url };
 }
 
+export function ghPrComment(repoRoot: string, prNumber: number, body: string): void {
+  try {
+    execFileSync("gh", ["pr", "comment", String(prNumber), "--body", body], { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] });
+  } catch (e: any) {
+    throw new DripError(`gh pr comment failed for #${prNumber}: ${String(e.stderr ?? e.message ?? "").trim()}`);
+  }
+}
+
+export function ghPrClose(repoRoot: string, prNumber: number, comment: string): void {
+  try {
+    execFileSync("gh", ["pr", "close", String(prNumber), "--comment", comment], { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] });
+  } catch (e: any) {
+    throw new DripError(`gh pr close failed for #${prNumber}: ${String(e.stderr ?? e.message ?? "").trim()}`);
+  }
+}
+
 export function ghPrState(repoRoot: string, prNumber: number): "OPEN" | "CLOSED" | "MERGED" | "UNKNOWN" {
   try {
     const out = execFileSync("gh", ["pr", "view", String(prNumber), "--json", "state", "--jq", ".state"], {
