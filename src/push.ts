@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,21 +6,9 @@ import { reconcileComments } from "./anchors";
 import type { GitBackend } from "./git-backend";
 import { ghCreatePr, ghPrClose, ghPrComment } from "./github";
 import { buildSlicePatch, materializeSliceCommits } from "./materialize";
-import type { Hunk, PlanResult } from "./planner";
+import type { PlanResult } from "./planner";
+import { computeContentHash, computeSliceSignature } from "./signature";
 import { deleteCorrespondence, getCorrespondence, upsertCorrespondence } from "./store";
-
-// See docs/adr/0006-slice-correspondence-key.md.
-export function computeSliceSignature(hunks: Hunk[]): string {
-  const parts = hunks.map((h) => `${h.file}::${h.qualifiedSymbol ?? "?"}`).sort();
-  return createHash("sha1").update(parts.join("|")).digest("hex").slice(0, 12);
-}
-
-// M3: content hash of the slice's actual patch text — distinct from the
-// symbol-signature above. Unchanged hash across runs means the diff itself
-// didn't change, so the branch/PR don't need touching.
-function computeContentHash(patch: string): string {
-  return createHash("sha1").update(patch).digest("hex").slice(0, 12);
-}
 
 export type PushResult = {
   sliceLabel: string;

@@ -2,9 +2,12 @@ import { execSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Database } from "bun:sqlite";
 import type { GitBackend } from "./git-backend";
-import { materializeSliceCommits } from "./materialize";
+import { buildSlicePatch, materializeSliceCommits } from "./materialize";
 import type { FileSection, Hunk } from "./planner";
+import { computeContentHash, computeSliceSignature } from "./signature";
+import { getBuildCache, upsertBuildCache } from "./store";
 
 export const DEFAULT_BUILD_CMD = "bunx tsc --noEmit";
 
@@ -49,8 +52,41 @@ export async function verifyTreeHash(opts: {
   }
 }
 
+function runSliceBuild(opts: {
+  git: GitBackend;
+  repoRoot: string;
+  tmpDir: string;
+  sliceLabel: string;
+  sliceNum: number;
+  commit: string;
+  buildCmd: string;
+}): { slice: string; output: string } | null {
+  const { git, repoRoot, tmpDir, sliceLabel, sliceNum, commit, buildCmd } = opts;
+  const worktreePath = join(tmpDir, `wt-${sliceNum}`);
+  const nodeModulesSrc = join(repoRoot, "node_modules");
+  git.worktreeAdd(worktreePath, commit, repoRoot);
+  try {
+    if (existsSync(nodeModulesSrc)) {
+      // Junctions don't require elevated privileges on Windows; plain
+      // symlinks do. Elsewhere a normal dir symlink is fine.
+      symlinkSync(nodeModulesSrc, join(worktreePath, "node_modules"), platform() === "win32" ? "junction" : "dir");
+    }
+    try {
+      execSync(buildCmd, { cwd: worktreePath, stdio: "pipe" });
+      return null;
+    } catch (e: any) {
+      const output = (e.stdout?.toString() ?? "") + (e.stderr?.toString() ?? "") || e.message;
+      return { slice: sliceLabel, output };
+    }
+  } finally {
+    git.worktreeRemove(worktreePath, repoRoot);
+  }
+}
+
 export async function verifyPerSliceBuild(opts: {
   git: GitBackend;
+  db: Database;
+  branch: string;
   repoRoot: string;
   mergeBase: string;
   files: FileSection[];
@@ -58,36 +94,50 @@ export async function verifyPerSliceBuild(opts: {
   slices: Map<string, Hunk[]>;
   idToNum: Map<string, number>;
   buildCmd: string;
-}): Promise<{ failures: Array<{ slice: string; output: string }> }> {
-  const { git, repoRoot, idToNum, buildCmd } = opts;
+}): Promise<{ failures: Array<{ slice: string; output: string }>; skipped: number }> {
+  const { git, db, branch, files, order, slices, repoRoot, idToNum, buildCmd } = opts;
   const commits = await materializeSliceCommits(opts);
   const tmpDir = mkdtempSync(join(tmpdir(), "drip-verify-build-"));
   const failures: Array<{ slice: string; output: string }> = [];
-  const nodeModulesSrc = join(repoRoot, "node_modules");
+
+  // M5: a slice's build result is reused from cache only while every slice
+  // before it in the stack (inclusive) is also unchanged -- our materialized
+  // commits form a single linear stack (docs/adr/0006), so a slice's build
+  // genuinely depends on everything ahead of it, not just its DAG edges. See
+  // docs/adr/0008-build-cache-scope.md for why this is prefix-based rather
+  // than true graph-independence.
+  let prefixUnchanged = true;
+  const toBuild: Array<{ sliceLabel: string; sliceNum: number; commit: string; signature: string; contentHash: string }> = [];
 
   try {
     for (const { sliceId, commit } of commits) {
       const sliceLabel = `slice${idToNum.get(sliceId)}`;
-      const worktreePath = join(tmpDir, `wt-${idToNum.get(sliceId)}`);
-      git.worktreeAdd(worktreePath, commit, repoRoot);
-      try {
-        if (existsSync(nodeModulesSrc)) {
-          // Junctions don't require elevated privileges on Windows; plain
-          // symlinks do. Elsewhere a normal dir symlink is fine.
-          symlinkSync(nodeModulesSrc, join(worktreePath, "node_modules"), platform() === "win32" ? "junction" : "dir");
-        }
-        try {
-          execSync(buildCmd, { cwd: worktreePath, stdio: "pipe" });
-        } catch (e: any) {
-          const output = (e.stdout?.toString() ?? "") + (e.stderr?.toString() ?? "") || e.message;
-          failures.push({ slice: sliceLabel, output });
-        }
-      } finally {
-        git.worktreeRemove(worktreePath, repoRoot);
+      const sliceNum = idToNum.get(sliceId)!;
+      const hunks = slices.get(sliceId)!;
+      const signature = computeSliceSignature(hunks);
+      const contentHash = computeContentHash(buildSlicePatch(files, slices, sliceId));
+      const cached = getBuildCache(db, branch, signature);
+
+      if (prefixUnchanged && cached && cached.contentHash === contentHash && cached.passed) {
+        continue; // reuse: this slice, and everything before it, hasn't changed since it last passed
       }
+      prefixUnchanged = false;
+      toBuild.push({ sliceLabel, sliceNum, commit, signature, contentHash });
     }
+
+    // Each slice's worktree is an independent filesystem checkout of an
+    // already-materialized commit, so running the builds concurrently is
+    // safe regardless of stack order.
+    const results = await Promise.all(
+      toBuild.map(async (s) => {
+        const failure = runSliceBuild({ git, repoRoot, tmpDir, sliceLabel: s.sliceLabel, sliceNum: s.sliceNum, commit: s.commit, buildCmd });
+        upsertBuildCache(db, branch, s.signature, { contentHash: s.contentHash, passed: !failure, output: failure?.output ?? null });
+        return failure;
+      }),
+    );
+    for (const f of results) if (f) failures.push(f);
   } finally {
     rmSync(tmpDir, { recursive: true, force: true });
   }
-  return { failures };
+  return { failures, skipped: commits.length - toBuild.length };
 }

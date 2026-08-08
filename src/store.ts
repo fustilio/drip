@@ -66,6 +66,20 @@ export function openStore(repoRoot: string): Database {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     )
   `);
+  // M5: per-slice build-check cache, keyed the same way as correspondence.
+  // A cached PASS is reused only for an unbroken unchanged prefix of the
+  // stack (see verify.ts) -- see docs/adr/0008-build-cache-scope.md.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS build_cache (
+      branch TEXT NOT NULL,
+      slice_signature TEXT NOT NULL,
+      content_hash TEXT NOT NULL,
+      passed INTEGER NOT NULL,
+      output TEXT,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(branch, slice_signature)
+    )
+  `);
   return db;
 }
 
@@ -146,6 +160,24 @@ export function markCommentProcessed(db: Database, prCommentId: number, branch: 
   db.query(
     "INSERT OR IGNORE INTO comment_anchors (pr_comment_id, branch, slice_signature, status) VALUES (?, ?, ?, ?)",
   ).run(prCommentId, branch, sliceSignature, status);
+}
+
+export type BuildCacheEntry = { contentHash: string; passed: boolean; output: string | null };
+
+export function getBuildCache(db: Database, branch: string, sliceSignature: string): BuildCacheEntry | null {
+  const row = db
+    .query("SELECT content_hash as contentHash, passed, output FROM build_cache WHERE branch = ? AND slice_signature = ?")
+    .get(branch, sliceSignature) as { contentHash: string; passed: number; output: string | null } | null;
+  return row ? { contentHash: row.contentHash, passed: !!row.passed, output: row.output } : null;
+}
+
+export function upsertBuildCache(db: Database, branch: string, sliceSignature: string, entry: BuildCacheEntry): void {
+  db.query(
+    `INSERT INTO build_cache (branch, slice_signature, content_hash, passed, output, updated_at)
+     VALUES (?, ?, ?, ?, ?, datetime('now'))
+     ON CONFLICT(branch, slice_signature) DO UPDATE SET
+       content_hash = excluded.content_hash, passed = excluded.passed, output = excluded.output, updated_at = datetime('now')`,
+  ).run(branch, sliceSignature, entry.contentHash, entry.passed ? 1 : 0, entry.output);
 }
 
 export function recordTiming(

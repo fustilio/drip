@@ -61,6 +61,7 @@ function reportTiming(
 // own M2 scope ("refuses to push if verify fails").
 async function runVerification(opts: {
   git: GitBackend;
+  db: ReturnType<typeof openStore>;
   repoRoot: string;
   branch: string;
   mergeBase: string;
@@ -68,7 +69,7 @@ async function runVerification(opts: {
   buildCmdOverride: string | undefined;
   noBuildCheck: boolean;
 }): Promise<{ pass: boolean }> {
-  const { git, repoRoot, branch, mergeBase, plan, noBuildCheck } = opts;
+  const { git, db, repoRoot, branch, mergeBase, plan, noBuildCheck } = opts;
   const treeResult = await verifyTreeHash({ git, repoRoot, branch, mergeBase, files: plan.files, order: plan.order!, slices: plan.slices });
   console.log(`\n${treeResult.message}`);
 
@@ -78,6 +79,8 @@ async function runVerification(opts: {
     if (buildCmd) {
       const result = await verifyPerSliceBuild({
         git,
+        db,
+        branch,
         repoRoot,
         mergeBase,
         files: plan.files,
@@ -86,9 +89,10 @@ async function runVerification(opts: {
         idToNum: plan.idToNum,
         buildCmd,
       });
+      const skipNote = result.skipped ? `, ${result.skipped} cached` : "";
       if (result.failures.length) {
         buildOk = false;
-        console.log(`BUILD CHECK: FAIL (\`${buildCmd}\`)`);
+        console.log(`BUILD CHECK: FAIL (\`${buildCmd}\`${skipNote})`);
         for (const f of result.failures) {
           const lines = f.output.split("\n").filter((l) => l.trim().length > 0);
           const shown = lines.slice(0, 8);
@@ -97,7 +101,7 @@ async function runVerification(opts: {
           if (lines.length > shown.length) console.log(`    ... (${lines.length - shown.length} more lines)`);
         }
       } else {
-        console.log(`BUILD CHECK: PASS (\`${buildCmd}\`, ${plan.order!.length} slices)`);
+        console.log(`BUILD CHECK: PASS (\`${buildCmd}\`, ${plan.order!.length} slices${skipNote})`);
       }
     } else {
       console.log("BUILD CHECK: skipped (no tsconfig.json found — use --build-cmd to specify one)");
@@ -238,6 +242,7 @@ async function main() {
   const mergeBase = resolveMergeBase(git, baseBranch, branch, repoRoot);
   const { pass } = await runVerification({
     git,
+    db,
     repoRoot,
     branch,
     mergeBase,
