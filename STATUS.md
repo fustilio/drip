@@ -49,6 +49,11 @@ Ran `/improve-codebase-architecture` after all milestones were built. Four candi
 
 Test count: 4 → 15 across 3 files. `docs/adr/0009` and `0010` record the two decisions where the "obvious" fix (bundle an AI provider; build a FakeGitBackend) was reframed after grilling into something that fit the project's own existing conventions better.
 
+## Bugs found via real usage (GitHub issues #1, #2), fixed
+
+- **Worktree support** (issue #1) — `openStore` hardcoded `<repoRoot>/.git/drip.db`, which broke in linked worktrees (`.git` is a pointer file there, not a directory). Fixed via `git rev-parse --git-path drip.db`, which resolves to the worktree's private gitdir — see `docs/adr/0011-drip-db-location.md`. Regression test: `src/store.test.ts`.
+- **Global-install WASM resolution** (issue #2) — grammar `.wasm` paths were resolved relative to CWD (the target repo being planned), so a globally-installed `drip` only worked if the target repo happened to have drip's own tree-sitter deps installed. Fixed via `createRequire(import.meta.url).resolve(...)`, resolving relative to drip's own install location instead — see `docs/adr/0012-wasm-asset-resolution.md`. Not yet covered: a `bun build --compile` single-binary distribution (no `node_modules` to resolve into at all) — flagged, not fixed, out of scope for this pass.
+
 ## Gotchas hit during this build (so they don't get rediscovered)
 
 - Bun's `execFileSync` inherits stderr live by default, unlike Node's pure pipe-and-capture — every git failure double-printed raw `fatal: ...` noise until `stdio: ["ignore","pipe","pipe"]` was forced explicitly (`git-backend.ts`).

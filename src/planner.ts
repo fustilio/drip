@@ -1,6 +1,12 @@
 import { Parser, Language, type Node } from "web-tree-sitter";
+import { createRequire } from "node:module";
 import type { GitBackend } from "./git-backend";
 import type { Override } from "./store";
+
+// Resolve relative to this installed module, not the caller's CWD — a global
+// install of drip must not depend on the target repo having these grammar
+// packages in its own node_modules. See docs/adr/0012-wasm-asset-resolution.md.
+const requireFromHere = createRequire(import.meta.url);
 
 const DEF_TYPES = new Set([
   "function_declaration",
@@ -84,14 +90,14 @@ export function parseDiff(diffText: string): FileSection[] {
 
 async function loadLanguageFor(path: string): Promise<Language | null> {
   const wasm = path.endsWith(".tsx")
-    ? "node_modules/tree-sitter-typescript/tree-sitter-tsx.wasm"
+    ? "tree-sitter-typescript/tree-sitter-tsx.wasm"
     : path.endsWith(".ts")
-      ? "node_modules/tree-sitter-typescript/tree-sitter-typescript.wasm"
+      ? "tree-sitter-typescript/tree-sitter-typescript.wasm"
       : /\.(js|jsx|mjs|cjs)$/.test(path)
-        ? "node_modules/tree-sitter-javascript/tree-sitter-javascript.wasm"
+        ? "tree-sitter-javascript/tree-sitter-javascript.wasm"
         : null;
   if (!wasm) return null;
-  return Language.load(wasm);
+  return Language.load(requireFromHere.resolve(wasm));
 }
 
 function isDefinition(n: Node): boolean {

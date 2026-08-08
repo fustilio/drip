@@ -1,0 +1,7 @@
+# Resolve tree-sitter grammar WASM relative to the installed module, not CWD
+
+`loadLanguageFor` (`planner.ts`) loaded grammar files via bare relative paths like `node_modules/tree-sitter-typescript/tree-sitter-typescript.wasm`, resolved against the process's current working directory. That's the directory drip is invoked *from* — normally the target repo being planned. A globally-installed `drip` therefore only worked if the target repo happened to have `tree-sitter-typescript`/`tree-sitter-javascript` in its own `node_modules`, which is drip's dependency, not the target repo's (GitHub issue #2).
+
+Fixed with `createRequire(import.meta.url)` and `require.resolve("tree-sitter-typescript/tree-sitter-tsx.wasm")` etc. — this resolves from `planner.ts`'s own location, i.e. drip's install directory, regardless of CWD or what the target repo has installed. Confirmed both packages ship their `.wasm` files as resolvable subpaths (no `exports` restriction blocking it).
+
+Not yet covered: a `bun build --compile` single-binary distribution, where there's no `node_modules` at all to resolve into. Flagged in the original issue as needing the same fix but out of scope here — this ADR covers the `bun add --global` / npm-install case.
