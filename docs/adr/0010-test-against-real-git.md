@@ -1,0 +1,13 @@
+# Test git-plumbing code against real git, not a fake GitBackend
+
+`GitBackend` (ADR 0005) has one adapter, `ShellGitBackend`. The obvious way to "prove the seam" per the usual rule (one adapter is hypothetical, two is real) is a second, in-memory `FakeGitBackend`. We didn't build one.
+
+Most of `GitBackend`'s 14 methods are git plumbing — `readTree`, `applyCached`, `writeTree`, `commitTree`, `worktreeAdd`, `diff`, `show`, `log`, `revParse`, `mergeBase`, `applyCachedReverseCheck`. Faithfully faking these means reimplementing a slice of git's own object model: index staging, patch application semantics, tree hashing. That's a bigger and riskier undertaking than the modules it would be testing, and a fake that's subtly wrong about git's actual behavior (fuzzy-context patch application, tree-hash computation, worktree isolation) gives false confidence — worse than no test at all, because it looks like coverage.
+
+`planner.test.ts` already established the alternative, before this was ever framed as an architecture question: run real `git` against a disposable temp-directory repo. It's fast (milliseconds), it's exactly as correct as git itself, and there's nothing to keep in sync with git's own semantics as they evolve. Every milestone in this project was also verified this same way — against a real fixture repo (`drip-dummy`), never a fake. This ADR just names the practice and extends it into the test suite via `src/test-helpers.ts` (`makeTempRepo`, `makeBareRemote`, `git`, `commit`, `gitOutput`).
+
+The one operation in `GitBackend` that isn't plumbing is `push` — a real network call to a remote. Even that doesn't need faking: a local **bare** git repo works as a real git remote. `git push` to it is fully real git, no network involved. `makeBareRemote` in `test-helpers.ts` exists for exactly this.
+
+What genuinely can't be exercised with real git is GitHub's own API — `github.ts`'s `gh` CLI calls (`ghCreatePr`, `ghPrClose`, `ghPrComment`, `ghListReviewComments`, `ghReplyToReviewComment`). Those are mocked with `bun:test`'s `mock.module`, scoped to individual test files (`push.test.ts`), not a production-code interface. Introducing a `GitHubClient`-style DI seam parallel to `GitBackend` was considered and rejected for this pass — it would be a production architecture change riding on a testing task, not itself required to make the tests possible.
+
+Net effect: `GitBackend` stays a one-adapter interface, and that's fine — its seam is proven a different way, by testing everything behind it against the real thing it abstracts over rather than a hypothetical stand-in for it.

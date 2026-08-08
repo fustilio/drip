@@ -1,27 +1,16 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ShellGitBackend } from "./git-backend";
 import { computePlan } from "./planner";
-
-function git(args: string[], cwd: string) {
-  execFileSync("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
-}
-
-function commit(cwd: string, message: string) {
-  git(["add", "-A"], cwd);
-  git(["-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "-q", "-m", message], cwd);
-}
+import { commit, git, makeTempRepo } from "./test-helpers";
 
 const backend = new ShellGitBackend();
 let repoRoot: string;
+let cleanupRepo: () => void;
 
 beforeAll(() => {
-  repoRoot = mkdtempSync(join(tmpdir(), "drip-planner-test-"));
-  git(["init", "-q"], repoRoot);
-  git(["symbolic-ref", "HEAD", "refs/heads/main"], repoRoot);
+  ({ repoRoot, cleanup: cleanupRepo } = makeTempRepo("drip-planner-test-"));
   mkdirSync(join(repoRoot, "src"), { recursive: true });
 
   writeFileSync(join(repoRoot, "src", "helper.ts"), `export function shared(x: number) {\n  return x + 1;\n}\n`);
@@ -35,7 +24,7 @@ beforeAll(() => {
 });
 
 afterAll(() => {
-  rmSync(repoRoot, { recursive: true, force: true });
+  cleanupRepo();
 });
 
 function sliceContaining(plan: Awaited<ReturnType<typeof computePlan>>, file: string): string {
@@ -86,10 +75,8 @@ test("unmatched override selector is reported in ignoredOverrides, not silently 
 });
 
 test("mutually-recursive cross-file def-use forms a cycle — reported as unresolvable, not silently mis-ordered", async () => {
-  const cycleRoot = mkdtempSync(join(tmpdir(), "drip-planner-test-cycle-"));
+  const { repoRoot: cycleRoot, cleanup } = makeTempRepo("drip-planner-test-cycle-");
   try {
-    git(["init", "-q"], cycleRoot);
-    git(["symbolic-ref", "HEAD", "refs/heads/main"], cycleRoot);
     writeFileSync(join(cycleRoot, "README.md"), "cycle fixture\n");
     commit(cycleRoot, "init");
 
@@ -107,6 +94,6 @@ test("mutually-recursive cross-file def-use forms a cycle — reported as unreso
     const plan = await computePlan({ git: backend, repoRoot: cycleRoot, branch: "feature", baseBranch: "main" });
     expect(plan.order).toBeNull();
   } finally {
-    rmSync(cycleRoot, { recursive: true, force: true });
+    cleanup();
   }
 });
