@@ -26,5 +26,6 @@ bun src/cli.ts verify <branch> [--repo path] [--base branch] [--timing] [--build
 
 ```bash
 git clone https://github.com/fustilio/drip-dummy dummy-repo
+cd dummy-repo && git checkout feature && cd ..  # branches other than the clone's default aren't checked out locally yet
 bun src/cli.ts verify feature --repo dummy-repo
 ```
