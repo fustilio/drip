@@ -1,15 +1,13 @@
 #!/usr/bin/env bun
-import { existsSync } from "node:fs";
-import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { assignChangeIds } from "./change-id";
 import { DripError } from "./errors";
 import { ShellGitBackend, type GitBackend } from "./git-backend";
-import { computePlan, planToJson, printPlan, type PlanResult } from "./planner";
+import { planToJson, printPlan } from "./planner";
 import { push } from "./push";
-import { resolveMergeBase, resolveRepoRoot } from "./repo";
-import { addOverride, listOverrides, openStore, recordTiming, removeOverride, type OverrideKind } from "./store";
-import { DEFAULT_BUILD_CMD, verifyPerSliceBuild, verifyTreeHash } from "./verify";
+import { resolveRepoRoot } from "./repo";
+import { addOverride, listOverrides, openStore, recordTiming, removeOverride } from "./store";
+import { loadPlan, runVerify } from "./workflow";
 
 function usage(): never {
   console.error("usage: drip plan <branch> [--repo path] [--base branch] [--timing] [--assign-ids] [--json]");
@@ -36,58 +34,32 @@ function reportTiming(
   console.log(`\nTIMING: ${command} took ${durationMs}ms (${hunkCount} hunks, ${sliceCount} slices)`);
 }
 
-// Shared by `verify` and `push` — push must never skip this, per the plan's
+// Formats runVerify's structured result as the CLI's text output. Shared by
+// `verify` and `push` — push must never skip verification, per the plan's
 // own M2 scope ("refuses to push if verify fails").
-async function runVerification(opts: {
-  git: GitBackend;
-  db: ReturnType<typeof openStore>;
-  repoRoot: string;
-  branch: string;
-  mergeBase: string;
-  plan: PlanResult;
-  buildCmdOverride: string | undefined;
-  noBuildCheck: boolean;
-}): Promise<{ pass: boolean }> {
-  const { git, db, repoRoot, branch, mergeBase, plan, noBuildCheck } = opts;
-  const treeResult = await verifyTreeHash({ git, repoRoot, branch, mergeBase, files: plan.files, order: plan.order!, slices: plan.slices });
-  console.log(`\n${treeResult.message}`);
+function printVerifyResult(result: Awaited<ReturnType<typeof runVerify>>, sliceCount: number): void {
+  console.log(`\n${result.tree.message}`);
 
-  let buildOk = true;
-  if (!noBuildCheck) {
-    const buildCmd = opts.buildCmdOverride ?? (existsSync(join(repoRoot, "tsconfig.json")) ? DEFAULT_BUILD_CMD : null);
-    if (buildCmd) {
-      const result = await verifyPerSliceBuild({
-        git,
-        db,
-        branch,
-        repoRoot,
-        mergeBase,
-        files: plan.files,
-        order: plan.order!,
-        slices: plan.slices,
-        idToNum: plan.idToNum,
-        buildCmd,
-      });
-      const skipNote = result.skipped ? `, ${result.skipped} cached` : "";
-      if (result.failures.length) {
-        buildOk = false;
-        console.log(`BUILD CHECK: FAIL (\`${buildCmd}\`${skipNote})`);
-        for (const f of result.failures) {
-          const lines = f.output.split("\n").filter((l) => l.trim().length > 0);
-          const shown = lines.slice(0, 8);
-          console.log(`  ${f.slice}:`);
-          for (const line of shown) console.log(`    ${line}`);
-          if (lines.length > shown.length) console.log(`    ... (${lines.length - shown.length} more lines)`);
-        }
-      } else {
-        console.log(`BUILD CHECK: PASS (\`${buildCmd}\`, ${plan.order!.length} slices${skipNote})`);
-      }
-    } else {
-      console.log("BUILD CHECK: skipped (no tsconfig.json found — use --build-cmd to specify one)");
-    }
+  const { build } = result;
+  if (build.kind === "disabled") return;
+  if (build.kind === "no-command") {
+    console.log("BUILD CHECK: skipped (no tsconfig.json found — use --build-cmd to specify one)");
+    return;
   }
 
-  return { pass: treeResult.pass && buildOk };
+  const skipNote = build.result.skipped ? `, ${build.result.skipped} cached` : "";
+  if (build.result.failures.length) {
+    console.log(`BUILD CHECK: FAIL (\`${build.buildCmd}\`${skipNote})`);
+    for (const f of build.result.failures) {
+      const lines = f.output.split("\n").filter((l) => l.trim().length > 0);
+      const shown = lines.slice(0, 8);
+      console.log(`  ${f.slice}:`);
+      for (const line of shown) console.log(`    ${line}`);
+      if (lines.length > shown.length) console.log(`    ... (${lines.length - shown.length} more lines)`);
+    }
+  } else {
+    console.log(`BUILD CHECK: PASS (\`${build.buildCmd}\`, ${sliceCount} slices${skipNote})`);
+  }
 }
 
 async function runOverrideCommand(git: GitBackend, positionals: string[], values: Record<string, unknown>) {
@@ -99,26 +71,13 @@ async function runOverrideCommand(git: GitBackend, positionals: string[], values
   if (sub === "add") {
     const branch = arg;
     if (!branch) throw new DripError("override add requires a branch: drip override add <branch> --kind ... --selector-a ...");
-    const kind = values.kind as string | undefined;
-    if (kind !== "force_merge" && kind !== "force_split") {
-      throw new DripError("--kind must be 'force_merge' or 'force_split'");
-    }
+    const kind = (values.kind as string | undefined) ?? "";
     const selectorA = values["selector-a"] as string | undefined;
     if (!selectorA) throw new DripError("--selector-a is required (format: file::QualifiedSymbolPath)");
-    if (!selectorA.includes("::")) {
-      throw new DripError(`--selector-a '${selectorA}' doesn't look like 'file::QualifiedSymbolPath' — missing '::'`);
-    }
-    const selectorB = values["selector-b"] as string | undefined;
-    if (kind === "force_merge" && !selectorB) {
-      throw new DripError("force_merge requires --selector-b as well");
-    }
-    if (kind === "force_split" && selectorB) {
-      throw new DripError("force_split takes only --selector-a, not --selector-b");
-    }
-    if (selectorB && !selectorB.includes("::")) {
-      throw new DripError(`--selector-b '${selectorB}' doesn't look like 'file::QualifiedSymbolPath' — missing '::'`);
-    }
-    addOverride(db, branch, kind as OverrideKind, selectorA, kind === "force_merge" ? selectorB! : null, (values.note as string) ?? null);
+    const selectorB = (values["selector-b"] as string | undefined) ?? null;
+    // addOverride validates kind/selector format/selectorB presence rules and
+    // throws DripError — one place, not duplicated per caller.
+    addOverride(db, branch, kind, selectorA, selectorB, (values.note as string) ?? null);
     console.log(`added ${kind} override for ${branch}`);
     return;
   }
@@ -207,11 +166,7 @@ async function main() {
     }
   }
 
-  resolveMergeBase(git, baseBranch, branch, repoRoot); // validate early, before opening the DB / running tree-sitter
-
-  const db = openStore(repoRoot);
-  const overrides = listOverrides(db, branch);
-  const plan = await computePlan({ git, repoRoot, branch, baseBranch, overrides });
+  const { db, mergeBase, plan } = await loadPlan({ git, repoRoot, branch, baseBranch });
 
   if (plan.hunks.length === 0) {
     if (jsonOut) console.log(JSON.stringify({ ok: true, slices: [], edges: [], unmatchedOverrideSelectors: [] }));
@@ -231,17 +186,18 @@ async function main() {
     return;
   }
 
-  const mergeBase = resolveMergeBase(git, baseBranch, branch, repoRoot);
-  const { pass } = await runVerification({
+  const verifyResult = await runVerify({
     git,
     db,
-    repoRoot,
     branch,
+    repoRoot,
     mergeBase,
     plan,
     buildCmdOverride: values["build-cmd"],
     noBuildCheck: !!values["no-build-check"],
   });
+  printVerifyResult(verifyResult, plan.order.length);
+  const pass = verifyResult.pass;
 
   if (command === "verify") {
     if (values.timing) reportTiming(db, branch, "verify", plan.hunks.length, plan.slices.size, Date.now() - started);

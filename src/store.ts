@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { join } from "node:path";
+import { DripError } from "./errors";
 
 export type OverrideKind = "force_merge" | "force_split";
 
@@ -130,14 +131,29 @@ export function listOverrides(db: Database, branch: string): Override[] {
   return rows;
 }
 
+// Selector format is "file::QualifiedSymbolPath" (docs/adr/0004-override-selector.md).
+// Validated here, at the durable-write boundary, so every caller gets it —
+// not just whichever ones remembered to check first.
+function validateSelector(label: string, selector: string): void {
+  if (!selector.includes("::")) {
+    throw new DripError(`${label} '${selector}' doesn't look like 'file::QualifiedSymbolPath' — missing '::'`);
+  }
+}
+
 export function addOverride(
   db: Database,
   branch: string,
-  kind: OverrideKind,
+  kind: string,
   selectorA: string,
   selectorB: string | null,
   note: string | null,
 ): void {
+  if (kind !== "force_merge" && kind !== "force_split") throw new DripError("kind must be 'force_merge' or 'force_split'");
+  validateSelector("selectorA", selectorA);
+  if (kind === "force_merge" && !selectorB) throw new DripError("force_merge requires selectorB");
+  if (kind === "force_split" && selectorB) throw new DripError("force_split takes only selectorA, not selectorB");
+  if (selectorB) validateSelector("selectorB", selectorB);
+
   db.query("INSERT INTO overrides (branch, kind, selector_a, selector_b, note) VALUES (?, ?, ?, ?, ?)").run(
     branch,
     kind,

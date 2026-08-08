@@ -1,15 +1,13 @@
 #!/usr/bin/env bun
-import { existsSync } from "node:fs";
-import { join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { DripError } from "./errors";
 import { ShellGitBackend } from "./git-backend";
-import { computePlan, planToJson } from "./planner";
-import { resolveMergeBase, resolveRepoRoot } from "./repo";
-import { addOverride, listOverrides, openStore, removeOverride, type OverrideKind } from "./store";
-import { DEFAULT_BUILD_CMD, verifyPerSliceBuild, verifyTreeHash } from "./verify";
+import { planToJson } from "./planner";
+import { resolveRepoRoot } from "./repo";
+import { addOverride, listOverrides, openStore, removeOverride } from "./store";
+import { loadPlan, runVerify } from "./workflow";
 
 // Exposes the same read/write surface as the CLI's plan/verify/override
 // commands to an MCP client — no push (real side effects, needs --yes) and
@@ -35,10 +33,7 @@ server.tool(
   async ({ repo, branch, base }) => {
     try {
       const repoRoot = resolveRepoRoot(git, repo);
-      resolveMergeBase(git, base, branch, repoRoot);
-      const db = openStore(repoRoot);
-      const overrides = listOverrides(db, branch);
-      const plan = await computePlan({ git, repoRoot, branch, baseBranch: base, overrides });
+      const { plan } = await loadPlan({ git, repoRoot, branch, baseBranch: base });
       return textResult(plan.hunks.length === 0 ? { ok: true, slices: [], edges: [], unmatchedOverrideSelectors: [] } : planToJson(plan));
     } catch (e) {
       return errorResult(e);
@@ -59,36 +54,20 @@ server.tool(
   async ({ repo, branch, base, buildCmd, noBuildCheck }) => {
     try {
       const repoRoot = resolveRepoRoot(git, repo);
-      const mergeBase = resolveMergeBase(git, base, branch, repoRoot);
-      const db = openStore(repoRoot);
-      const overrides = listOverrides(db, branch);
-      const plan = await computePlan({ git, repoRoot, branch, baseBranch: base, overrides });
+      const { db, mergeBase, plan } = await loadPlan({ git, repoRoot, branch, baseBranch: base });
       if (plan.hunks.length === 0) return textResult({ ok: true, message: "no changes — nothing to verify" });
       if (!plan.order) return textResult({ ok: false, error: "dependency cycle in slice DAG" });
 
-      const treeResult = await verifyTreeHash({ git, repoRoot, branch, mergeBase, files: plan.files, order: plan.order, slices: plan.slices });
-      if (noBuildCheck) return textResult({ ok: treeResult.pass, tree: treeResult.message });
-
-      const cmd = buildCmd ?? (existsSync(join(repoRoot, "tsconfig.json")) ? DEFAULT_BUILD_CMD : null);
-      if (!cmd) return textResult({ ok: treeResult.pass, tree: treeResult.message, build: "skipped (no tsconfig.json, no buildCmd)" });
-
-      const buildResult = await verifyPerSliceBuild({
-        git,
-        db,
-        branch,
-        repoRoot,
-        mergeBase,
-        files: plan.files,
-        order: plan.order,
-        slices: plan.slices,
-        idToNum: plan.idToNum,
-        buildCmd: cmd,
-      });
-      return textResult({
-        ok: treeResult.pass && buildResult.failures.length === 0,
-        tree: treeResult.message,
-        build: buildResult.failures.length ? { pass: false, failures: buildResult.failures } : { pass: true, skipped: buildResult.skipped },
-      });
+      const result = await runVerify({ git, db, branch, repoRoot, mergeBase, plan, buildCmdOverride: buildCmd, noBuildCheck });
+      const build =
+        result.build.kind === "disabled"
+          ? "disabled"
+          : result.build.kind === "no-command"
+            ? "skipped (no tsconfig.json, no buildCmd)"
+            : result.build.result.failures.length
+              ? { pass: false, failures: result.build.result.failures }
+              : { pass: true, skipped: result.build.result.skipped };
+      return textResult({ ok: result.pass, tree: result.tree.message, build });
     } catch (e) {
       return errorResult(e);
     }
@@ -125,11 +104,11 @@ server.tool(
   },
   async ({ repo, branch, kind, selectorA, selectorB, note }) => {
     try {
-      if (kind === "force_merge" && !selectorB) throw new DripError("force_merge requires selectorB");
-      if (kind === "force_split" && selectorB) throw new DripError("force_split takes only selectorA, not selectorB");
       const repoRoot = resolveRepoRoot(git, repo);
       const db = openStore(repoRoot);
-      addOverride(db, branch, kind as OverrideKind, selectorA, kind === "force_merge" ? selectorB! : null, note ?? null);
+      // addOverride validates kind/selector format/selectorB presence rules
+      // and throws DripError — same validation cli.ts's `override add` gets.
+      addOverride(db, branch, kind, selectorA, selectorB ?? null, note ?? null);
       return textResult({ ok: true });
     } catch (e) {
       return errorResult(e);

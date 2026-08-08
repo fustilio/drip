@@ -11,6 +11,9 @@ import { getBuildCache, upsertBuildCache } from "./store";
 
 export const DEFAULT_BUILD_CMD = "bunx tsc --noEmit";
 
+export type TreeHashResult = { pass: boolean; message: string };
+export type BuildCheckResult = { failures: Array<{ slice: string; output: string }>; skipped: number };
+
 export async function verifyTreeHash(opts: {
   git: GitBackend;
   repoRoot: string;
@@ -19,7 +22,7 @@ export async function verifyTreeHash(opts: {
   files: FileSection[];
   order: string[];
   slices: Map<string, Hunk[]>;
-}): Promise<{ pass: boolean; message: string }> {
+}): Promise<TreeHashResult> {
   const { git, repoRoot, branch, mergeBase, files, order, slices } = opts;
   const expected = git.revParse(`${branch}^{tree}`, repoRoot);
   const tmpDir = mkdtempSync(join(tmpdir(), "drip-verify-tree-"));
@@ -94,7 +97,7 @@ export async function verifyPerSliceBuild(opts: {
   slices: Map<string, Hunk[]>;
   idToNum: Map<string, number>;
   buildCmd: string;
-}): Promise<{ failures: Array<{ slice: string; output: string }>; skipped: number }> {
+}): Promise<BuildCheckResult> {
   const { git, db, branch, files, order, slices, repoRoot, idToNum, buildCmd } = opts;
   const commits = await materializeSliceCommits(opts);
   const tmpDir = mkdtempSync(join(tmpdir(), "drip-verify-build-"));
