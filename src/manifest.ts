@@ -477,6 +477,8 @@ export async function validateManifestAgainstGit(opts: {
   mergeBase: string;
   plan: PlanResult;
   resolved: ResolvedManifest;
+  /** tree-ish the projections must reconstruct; defaults to `branch` (see src/source.ts) */
+  sourceRef?: string;
   /** omit to skip executing verification commands (`--no-manifest-check`) */
   db?: Database;
   runVerification?: boolean;
@@ -523,7 +525,19 @@ export async function validateManifestAgainstGit(opts: {
   // anything and downgrading the one check that actually proves nothing is
   // lost; verifying with the deferred remainder appended keeps it a hard check.
   const units = verificationUnits(resolved);
-  const tree = await verifyTreeHash({ git, repoRoot, branch, mergeBase, files: plan.files, order: units.order, slices: units.slices });
+  const tree = await verifyTreeHash({
+    git,
+    repoRoot,
+    branch,
+    mergeBase,
+    files: plan.files,
+    order: units.order,
+    slices: units.slices,
+    // A worktree plan's projections reconstruct the working tree, not the
+    // branch tip — same claim, different tip (docs/adr/0021).
+    sourceRef: opts.sourceRef,
+    excluded: plan.excluded,
+  });
   if (!tree.pass) {
     findings.push({
       severity: "error",

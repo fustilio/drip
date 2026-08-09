@@ -27,6 +27,14 @@ export type PushResult = {
   status: SliceStatus;
   base: string; // the ref this slice's PR targets
   note: string | null; // why it's blocked, or that a generated integration base was used
+  /**
+   * The draft state this run *sets*, which only ever happens when drip opens
+   * the PR: true = opened as a draft, false = opened ready for review, null =
+   * no PR is being opened, so whatever state the PR already has is left alone.
+   * Reported in dry-run too — "would open five drafts" is exactly the thing a
+   * preview has to say before `--yes`.
+   */
+  draft: boolean | null;
 };
 
 // Pure: which of the five statuses a slice is in, given what's already known
@@ -94,6 +102,8 @@ export async function push(opts: {
   dryRun: boolean;
   projection?: ProjectionMode;
   units?: PushUnits;
+  /** open drip-owned PRs as drafts; never changes an existing PR's state */
+  draft?: boolean;
 }): Promise<PushResult[]> {
   const { git, db, repoRoot, branch, baseBranch, mergeBase, plan, dryRun } = opts;
   const projection = opts.projection ?? "stacked";
@@ -176,9 +186,16 @@ export async function push(opts: {
           status: "blocked",
           base: baseBranch,
           note: `${flat?.applyError ?? "could not be materialized"} — re-run with --projection stacked to include this slice`,
+          draft: null,
         });
         continue;
       }
+
+      // Draft is a property of *opening* a PR. An existing one — drip's own or
+      // an adopted human's — keeps whatever state it has: there is no `gh pr
+      // edit --draft`, and "someone marked this ready for review" is a review
+      // decision, not something a re-run should undo.
+      let draft: boolean | null = existing ? null : !!opts.draft;
 
       // The chosen base. Stacked: whatever the previous surviving slice was.
       // Flat-first: the base branch for a root, the single prerequisite's
@@ -229,8 +246,20 @@ export async function push(opts: {
       const effectiveHash = atThisTree && existing!.contentHash ? existing!.contentHash : contentHash;
       const status = classifySliceStatus({ existing, squashMerged, contentHash: effectiveHash, dryRun });
 
+      // Asked for drafts and there's nothing to open: say so rather than let
+      // the flag look like it did something.
+      if (opts.draft && existing?.prNumber && status !== "squash-merged") {
+        note = [
+          note,
+          `--draft applies only when opening a PR; ${existing.adopted ? "adopted " : ""}#${existing.prNumber} already exists and keeps its current draft/ready state`,
+        ]
+          .filter(Boolean)
+          .join("; ");
+      }
+      if (status === "squash-merged") draft = null;
+
       if (dryRun) {
-        results.push({ sliceLabel, branchName, prUrl: existing?.prUrl ?? null, status, base, note });
+        results.push({ sliceLabel, branchName, prUrl: existing?.prUrl ?? null, status, base, note, draft });
         if (status !== "squash-merged") baseForNext = branchName;
         else droppedToBase.add(sliceId);
         continue;
@@ -242,14 +271,14 @@ export async function push(opts: {
           deleteCorrespondence(db, branch, signature);
         }
         droppedToBase.add(sliceId);
-        results.push({ sliceLabel, branchName, prUrl: existing?.prUrl ?? null, status, base, note });
+        results.push({ sliceLabel, branchName, prUrl: existing?.prUrl ?? null, status, base, note, draft });
         continue; // dropped from the stack — baseForNext stays where it was
       }
 
       if (status === "unchanged") {
         // Nothing to do: the hash above already covers the branch's tree and
         // its target ref, so "unchanged" really means the PR is already right.
-        results.push({ sliceLabel, branchName, prUrl: existing!.prUrl, status, base, note });
+        results.push({ sliceLabel, branchName, prUrl: existing!.prUrl, status, base, note, draft });
         baseForNext = branchName;
         continue;
       }
@@ -275,6 +304,7 @@ export async function push(opts: {
           note:
             `the adopted branch has moved on the remote since drip recorded ${existing!.commitSha!.slice(0, 7)} — ` +
             "force-with-lease refused rather than discard those commits. Review them, then re-run `drip manifest adopt` to re-bind.",
+          draft: null,
         });
         continue;
       }
@@ -283,7 +313,7 @@ export async function push(opts: {
       let prNumber = existing?.prNumber ?? null;
 
       if (!existing) {
-        const pr = ghCreatePr({ repoRoot, base, head: branchName, title: units.title(sliceId), body: units.body(sliceId) });
+        const pr = ghCreatePr({ repoRoot, base, head: branchName, title: units.title(sliceId), body: units.body(sliceId), draft: !!opts.draft });
         prUrl = pr.url;
         prNumber = pr.number;
       } else if (existing.commitSha && existing.contentHash && existing.contentHash !== contentHash && prNumber) {
@@ -325,7 +355,7 @@ export async function push(opts: {
         baseRef,
         adopted: !!existing?.adopted,
       });
-      results.push({ sliceLabel, branchName, prUrl, status, base, note });
+      results.push({ sliceLabel, branchName, prUrl, status, base, note, draft });
       baseForNext = branchName;
     }
   } finally {

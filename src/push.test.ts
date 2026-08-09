@@ -97,12 +97,12 @@ afterEach(() => {
   cleanupRemote();
 });
 
-async function runPush(dryRun = false) {
+async function runPush(dryRun = false, draft = false) {
   const { push } = await import("./push");
   using db = openStore(repoRoot);
   const plan = await computePlan({ git: backend, repoRoot, branch: "feature", baseBranch: "main" });
   const mergeBase = backend.mergeBase("main", "feature", repoRoot);
-  const results = await push({ git: backend, db, repoRoot, branch: "feature", baseBranch: "main", mergeBase, plan, dryRun });
+  const results = await push({ git: backend, db, repoRoot, branch: "feature", baseBranch: "main", mergeBase, plan, dryRun, draft });
   return { results, db, plan };
 }
 
@@ -138,6 +138,43 @@ test("updated: content change on an existing PR posts an interdiff and reconcile
   expect(ghCreatePr).not.toHaveBeenCalled();
   expect(ghPrComment).toHaveBeenCalledTimes(1);
   expect(reconcileComments).toHaveBeenCalledTimes(1);
+});
+
+// --- issue #13: draft PRs ----------------------------------------------------
+
+test("draft: a PR drip opens is created as a draft, and the result says so", async () => {
+  const { results } = await runPush(false, true);
+  expect(results[0]!.status).toBe("created");
+  expect(results[0]!.draft).toBe(true);
+  expect(ghCreatePr.mock.calls[0]![0]).toMatchObject({ draft: true });
+});
+
+test("draft: off by default — a PR is opened ready for review", async () => {
+  const { results } = await runPush();
+  expect(results[0]!.draft).toBe(false);
+  expect(ghCreatePr.mock.calls[0]![0]).toMatchObject({ draft: false });
+});
+
+test("draft: dry-run reports the state it would open with, without opening anything", async () => {
+  const { results } = await runPush(true, true);
+  expect(results[0]!.status).toBe("dry-run");
+  expect(results[0]!.draft).toBe(true);
+  expect(ghCreatePr).not.toHaveBeenCalled();
+});
+
+test("draft: an existing PR keeps its own state — nothing is set, and the flag says why", async () => {
+  await runPush(); // opens #42 ready for review
+  ghCreatePr.mockClear();
+
+  writeFileSync(join(repoRoot, "a.ts"), `export function a() {\n  return 3;\n}\n`);
+  commit(repoRoot, "feature edit");
+
+  const { results } = await runPush(false, true);
+  expect(results[0]!.status).toBe("updated");
+  // No second create, so no draft state was set: the PR is what it already is.
+  expect(ghCreatePr).not.toHaveBeenCalled();
+  expect(results[0]!.draft).toBeNull();
+  expect(results[0]!.note).toContain("--draft applies only when opening a PR");
 });
 
 // --- issue #6: flat-first projection ----------------------------------------

@@ -23,15 +23,18 @@ import {
   validateManifestAgainstGit,
   verificationUnits,
   writeManifest,
+  type Finding,
 } from "./manifest";
+import { materializeProjections, materializeToJson, printMaterializeReport } from "./materialize-local";
 import { DripError } from "./errors";
 import { ShellGitBackend, type GitBackend } from "./git-backend";
 import { ghPrView } from "./github";
-import { planToJson, printPlan } from "./planner";
+import { planToJson, printPlan, type PlanResult } from "./planner";
 import { push, type PushUnits } from "./push";
 import { resolveRepoRoot } from "./repo";
 import { describeSource, sourceToJson } from "./source";
 import { addOverride, deleteCorrespondence, listOverrides, openStore, recordTiming, removeOverride } from "./store";
+import type { VerificationRun } from "./verification";
 import { loadPlan, runVerify } from "./workflow";
 
 function usage(): never {
@@ -41,7 +44,10 @@ function usage(): never {
   console.error("       drip verify <branch>|--worktree [--repo path] [--base branch] [--timing] [--coarsen] [--target-slices n] [--build-cmd cmd] [--no-build-check]");
   console.error("       drip validate-plan <branch> [--manifest path] [--repo path] [--base branch] [--json] [--no-manifest-check] [--strict]");
   console.error(
-    "       drip push <branch> [--repo path] [--base branch] [--projection stacked|flat-first] [--manifest path] [--no-manifest-check] [--strict] [--build-cmd cmd] [--no-build-check] --yes | --dry-run",
+    "       drip materialize <branch> [--manifest path] [--repo path] [--base branch] [--projection flat-first|stacked] [--only id[,id]] [--output dir] [--force] [--json] [--no-manifest-check] [--strict]",
+  );
+  console.error(
+    "       drip push <branch> [--repo path] [--base branch] [--projection stacked|flat-first] [--manifest path] [--no-manifest-check] [--strict] [--draft] [--build-cmd cmd] [--no-build-check] --yes | --dry-run",
   );
   console.error(
     "       drip override add <branch> --kind force_merge|force_split --selector-a file::Symbol [--selector-b file::Symbol] [--note text] [--repo path]",
@@ -167,6 +173,30 @@ function resolveManifestPath(repoRoot: string, branch: string, explicit: string 
   return path;
 }
 
+// Resolve a manifest against the plan and run the git-backed checks — the step
+// `validate-plan`, `materialize` and `push --manifest` all share. The git
+// checks only run once the manifest is structurally coherent; on a broken graph
+// they just produce noise blaming the same upstream cause repeatedly.
+async function checkManifest(opts: {
+  git: GitBackend;
+  repoRoot: string;
+  branch: string;
+  mergeBase: string;
+  plan: PlanResult;
+  db: ReturnType<typeof openStore>;
+  manifestPath: string;
+  runVerification: boolean;
+  /** what the projections must reconstruct — the working tree under --worktree */
+  sourceRef?: string;
+}) {
+  const { git, repoRoot, branch, mergeBase, plan, db, sourceRef } = opts;
+  const resolved = resolveManifest(plan, loadManifest(opts.manifestPath), { branch });
+  const checked = resolved.ok
+    ? await validateManifestAgainstGit({ git, repoRoot, branch, mergeBase, plan, resolved, db, sourceRef, runVerification: opts.runVerification })
+    : { findings: [] as Finding[], verification: [] as VerificationRun[] };
+  return { resolved, checked };
+}
+
 // `drip manifest adopt|list|forget` — binding a semantic projection to a PR
 // that already exists, rather than opening a new one. See docs/adr/0020.
 async function runManifestCommand(git: GitBackend, positionals: string[], values: Record<string, unknown>) {
@@ -267,15 +297,21 @@ async function main() {
       "assign-ids": { type: "boolean", default: false },
       "build-cmd": { type: "string" },
       "no-build-check": { type: "boolean", default: false },
-      // On `push` this is the base-selection mode and defaults to "stacked"
-      // there; on `manifest adopt` it names the projection being bound. No
-      // default, so adopt can tell "not given" from "given".
+      // On `push` and `materialize` this is the base-selection mode — default
+      // "stacked" there, "flat-first" here (docs/adr/0022); on `manifest adopt`
+      // it names the projection being bound. No default, so adopt can tell
+      // "not given" from "given".
       projection: { type: "string" },
       pr: { type: "string" },
       head: { type: "string" },
       remote: { type: "string" },
       "dry-run": { type: "boolean", default: false },
       yes: { type: "boolean", default: false },
+      draft: { type: "boolean", default: false },
+      // `materialize` only: which projections to write, and where to check
+      // them out. Repeatable and comma-separated both work.
+      only: { type: "string", multiple: true },
+      output: { type: "string" },
       json: { type: "boolean", default: false },
       coarsen: { type: "boolean", default: false },
       worktree: { type: "boolean", default: false },
@@ -311,7 +347,8 @@ async function main() {
     return;
   }
 
-  const isCommand = command === "plan" || command === "verify" || command === "push" || command === "validate-plan";
+  const isCommand =
+    command === "plan" || command === "verify" || command === "push" || command === "validate-plan" || command === "materialize";
   const worktree = !!values.worktree;
   if (!command || !isCommand || (!branchArg && !worktree)) usage();
 
@@ -320,7 +357,7 @@ async function main() {
   const baseBranch = values.base!;
   const started = Date.now();
 
-  const jsonOut = !!values.json && (command === "plan" || command === "validate-plan");
+  const jsonOut = !!values.json && (command === "plan" || command === "validate-plan" || command === "materialize");
 
   // Worktree mode is a *planning* source: it describes work that isn't
   // committed yet, so anything that rewrites history or publishes to GitHub
@@ -360,24 +397,79 @@ async function main() {
     return;
   }
 
-  // --- validate-plan: the manifest's own command, no push, no side effects ---
-  if (command === "validate-plan") {
-    // Read-only, so discovering the conventional location is safe and saves
-    // typing the same path every run.
+  // --- validate-plan / materialize: manifest commands with no remote effects ---
+  // Both read the manifest, so discovering the conventional location is safe
+  // and saves typing the same path every run — unlike `push`, where discovery
+  // would decide what gets sent to GitHub.
+  if (command === "validate-plan" || command === "materialize") {
     const manifestPath = resolveManifestPath(repoRoot, branch, values.manifest, jsonOut);
     if (!plan.order) {
       printPlan(plan);
-      throw new DripError("cannot validate a manifest against a cyclic slice DAG — resolve the cycle first");
+      throw new DripError(`cannot ${command === "materialize" ? "materialize" : "validate"} against a cyclic slice DAG — resolve the cycle first`);
     }
-    const resolved = resolveManifest(plan, loadManifest(manifestPath), { branch });
-    // The git-backed checks only make sense once the manifest is structurally
-    // coherent; running them on a broken graph just produces noise.
-    const checked = resolved.ok
-      ? await validateManifestAgainstGit({ git, repoRoot, branch, mergeBase, plan, resolved, db, runVerification: !values["no-manifest-check"] })
-      : { findings: [], verification: [] };
-    if (jsonOut) console.log(JSON.stringify(manifestReportToJson(resolved, checked.findings, checked.verification)));
-    else printManifestReport(resolved, checked.findings, checked.verification, !!values.strict);
-    if (manifestFailed(resolved, checked.findings, !!values.strict)) process.exit(1);
+    const { resolved, checked } = await checkManifest({
+      git,
+      repoRoot,
+      branch,
+      mergeBase,
+      plan,
+      db,
+      manifestPath,
+      sourceRef: source.ref,
+      runVerification: !values["no-manifest-check"],
+    });
+    const failed = manifestFailed(resolved, checked.findings, !!values.strict);
+
+    if (command === "validate-plan") {
+      if (jsonOut) console.log(JSON.stringify(manifestReportToJson(resolved, checked.findings, checked.verification)));
+      else printManifestReport(resolved, checked.findings, checked.verification, !!values.strict);
+      if (failed) process.exit(1);
+      return;
+    }
+
+    // Materializing a manifest that doesn't hold together would produce refs
+    // for projections drip has just said are wrong.
+    const manifestJson = manifestReportToJson(resolved, checked.findings, checked.verification);
+    if (failed) {
+      if (jsonOut) console.log(JSON.stringify({ ok: false, manifest: manifestJson, materialize: null }));
+      else {
+        printManifestReport(resolved, checked.findings, checked.verification, !!values.strict);
+        console.error("\nmaterialize refused: manifest validation failed");
+      }
+      process.exit(1);
+    }
+    if (!jsonOut) {
+      printManifestReport(resolved, checked.findings, checked.verification, !!values.strict);
+      console.log("");
+    }
+
+    // Flat-first by default, unlike `push`: a manifest's dependsOn graph *is*
+    // the flat-first base selection, and it's what validation and `manifest
+    // adopt` both materialize. Stacked stays available for previewing what
+    // `push` (whose own default is stacked) would send.
+    const mode = values.projection ?? "flat-first";
+    if (mode !== "stacked" && mode !== "flat-first") {
+      throw new DripError(`--projection must be 'stacked' or 'flat-first', got '${mode}'`);
+    }
+    const only = ((values.only as string[] | undefined) ?? []).flatMap((s) => s.split(",")).map((s) => s.trim()).filter(Boolean);
+
+    const result = await materializeProjections({
+      git,
+      db,
+      repoRoot,
+      branch,
+      baseBranch,
+      mergeBase,
+      plan,
+      resolved,
+      mode,
+      only,
+      outputDir: values.output ?? null,
+      force: !!values.force,
+    });
+    if (jsonOut) console.log(JSON.stringify({ ok: result.ok, manifest: manifestJson, materialize: materializeToJson(result) }));
+    else printMaterializeReport(result);
+    if (!result.ok) process.exit(1);
     return;
   }
 
@@ -434,10 +526,17 @@ async function main() {
     if (found) console.log(`\nnote: a manifest exists at ${found}, but --manifest was not passed — pushing atomic slices.`);
   }
   if (values.manifest) {
-    const resolved = resolveManifest(plan, loadManifest(values.manifest), { branch });
-    const checked = resolved.ok
-      ? await validateManifestAgainstGit({ git, repoRoot, branch, mergeBase, plan, resolved, db, runVerification: !values["no-manifest-check"] })
-      : { findings: [], verification: [] };
+    const { resolved, checked } = await checkManifest({
+      git,
+      repoRoot,
+      branch,
+      mergeBase,
+      plan,
+      db,
+      manifestPath: values.manifest,
+      sourceRef: source.ref,
+      runVerification: !values["no-manifest-check"],
+    });
     printManifestReport(resolved, checked.findings, checked.verification, !!values.strict);
     if (manifestFailed(resolved, checked.findings, !!values.strict)) {
       console.error("\npush refused: manifest validation failed");
@@ -487,11 +586,16 @@ async function main() {
     throw new DripError(`--projection must be 'stacked' or 'flat-first', got '${projection}'`);
   }
 
-  const results = await push({ git, db, repoRoot, branch, baseBranch, mergeBase, plan, dryRun, projection, units: manifestUnits });
-  const mode = `${projection}${manifestUnits ? ", manifest" : ""}`;
+  const draft = !!values.draft;
+  const results = await push({ git, db, repoRoot, branch, baseBranch, mergeBase, plan, dryRun, projection, units: manifestUnits, draft });
+  const mode = `${projection}${manifestUnits ? ", manifest" : ""}${draft ? ", draft" : ""}`;
   console.log(dryRun ? `\nDRY RUN (${mode}, no branches pushed, no PRs created):` : `\nPUSHED (${mode}):`);
   for (const r of results) {
-    console.log(`  ${r.sliceLabel} -> ${r.branchName} [${r.status}] base: ${r.base}${r.prUrl ? ` ${r.prUrl}` : ""}`);
+    // The draft state is only ever printed for a PR this run opens, so a
+    // dry-run says "would open a draft" and a re-run over an existing PR
+    // says nothing rather than implying it changed anything.
+    const state = r.draft === null ? "" : r.draft ? " (draft)" : " (ready for review)";
+    console.log(`  ${r.sliceLabel} -> ${r.branchName} [${r.status}]${state} base: ${r.base}${r.prUrl ? ` ${r.prUrl}` : ""}`);
     if (r.note) console.log(`      ${r.note}`);
   }
   const blocked = results.filter((r) => r.status === "blocked");

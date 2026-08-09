@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ShellGitBackend } from "./git-backend";
+import { ManifestSchema, resolveManifest, validateManifestAgainstGit } from "./manifest";
 import { parseDiff } from "./planner";
 import { describeSource, resolveDiffSource, worktreeTree } from "./source";
 import { commit, git, gitOutput, makeTempRepo } from "./test-helpers";
@@ -184,4 +185,30 @@ test("a rename with no content change is reported by path, not silently lost", (
   );
   expect(files).toEqual([]);
   expect(excluded).toEqual([{ path: "old.ts", reason: "rename-only", detail: "similarity index 100% / rename from old.ts / rename to new.ts" }]);
+});
+
+// issue #13 exposed this one: a manifest validated against a worktree plan
+// compared the projections' tree against the *branch tip*, so a dirty tree
+// always failed the invariant. Worktree mode substitutes the diff source and
+// nothing else (docs/adr/0021), and that has to hold here too.
+test("a manifest validates against the working tree, not the branch tip", async () => {
+  writeFileSync(join(repoRoot, "helper.ts"), `export function shared(x: number) {\n  return x + 2;\n}\n`);
+
+  const { db, plan: worktreePlan, mergeBase, source } = await plan(true);
+  const manifest = ManifestSchema.parse({
+    version: 1,
+    sourceBranch: "feature",
+    projections: [
+      { id: "helper", atomicSlices: ["helper.ts::shared"], verificationReason: "fixture" },
+      { id: "committed", atomicSlices: ["committed.ts::committedWork"], verificationReason: "fixture" },
+    ],
+  });
+  const resolved = resolveManifest(worktreePlan, manifest, { branch: source.label });
+  expect(resolved.findings).toEqual([]);
+
+  const args = { git: backend, repoRoot, branch: source.label, mergeBase, plan: worktreePlan, resolved, db, runVerification: false };
+  expect((await validateManifestAgainstGit({ ...args, sourceRef: source.ref })).findings).toEqual([]);
+  // Without the working tree as the source it's a bare tree-hash mismatch
+  // against content the branch doesn't have yet.
+  expect((await validateManifestAgainstGit(args)).findings.map((f) => f.code)).toEqual(["tree-hash-mismatch"]);
 });

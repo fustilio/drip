@@ -4,12 +4,16 @@ import { DripError } from "./errors";
 // `gh pr create` prints just the created PR's URL on stdout on success —
 // verified against `gh pr create --help` before writing this, no --json flag
 // exists for `create` (only for `view`/`list`).
-export function ghCreatePr(opts: { repoRoot: string; base: string; head: string; title: string; body: string }): { number: number; url: string } {
+//
+// `draft` is a *creation* option and nothing else: there is no `gh pr edit
+// --draft`, and flipping an existing PR's state is a review decision drip has
+// no business making (docs/adr/0022).
+export function ghCreatePr(opts: { repoRoot: string; base: string; head: string; title: string; body: string; draft?: boolean }): { number: number; url: string } {
   let out: string;
   try {
     out = execFileSync(
       "gh",
-      ["pr", "create", "--base", opts.base, "--head", opts.head, "--title", opts.title, "--body", opts.body],
+      ["pr", "create", "--base", opts.base, "--head", opts.head, "--title", opts.title, "--body", opts.body, ...(opts.draft ? ["--draft"] : [])],
       { cwd: opts.repoRoot, stdio: ["ignore", "pipe", "pipe"] },
     ).toString();
   } catch (e: any) {

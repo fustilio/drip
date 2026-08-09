@@ -78,6 +78,10 @@ The durable link between a slice and its projection — `slice branch ↔ PR num
 The link between a review comment and the code it refers to, used to survive force-push regeneration. M4 anchors on exact hunk hash only (`sha1` of the hunk's raw patch text) — see `docs/adr/0007-comment-anchor-scope.md` for why the plan's symbol-path and fuzzy tiers aren't built yet. A comment whose hunk hash no longer appears in the new push is orphaned with a loud reply on its thread, never silently dropped.
 _Avoid_: link, mapping, reference
 
+**Materialization**:
+Turning a slice or projection into real git objects: applying its hunks onto a parent tree in a scratch index and committing the result. Always the same code, wherever it's needed — the tree-hash check, the per-slice build check, `manifest adopt`'s comparison, `push`, and `drip materialize` all call it rather than each having a notion of what a projection's commit is. *Local* materialization (`drip materialize`) stops there: refs under `drip/<branch>/<id>` and optional worktrees, no remote ref, no PR, no correspondence recorded. See docs/adr/0022.
+_Avoid_: build, generate, export
+
 **Adoption**:
 Binding a semantic projection to a PR and branch that already existed — handwritten, with its own reviewers, comments and name — instead of opening a drip-owned one. Explicit and evidence-based: `drip manifest adopt` takes the projection id, PR number and head branch, and records correspondence only after the branch's effective diff, replayed onto the mega branch's merge base, produces exactly the projection's materialized tree. Never inferred from titles or similarity, never pushes anything, and leaves an adopted branch under lease afterwards — drip doesn't own it. See docs/adr/0020.
 _Avoid_: import, claim, takeover
