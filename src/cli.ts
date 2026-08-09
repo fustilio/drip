@@ -1,5 +1,13 @@
 #!/usr/bin/env bun
 import { parseArgs } from "node:util";
+import {
+  adoptionToJson,
+  checkAdoption,
+  fetchAdoptedHead,
+  listProjectionCorrespondence,
+  printAdoptionReport,
+  recordAdoption,
+} from "./adopt";
 import { assignChangeIds } from "./change-id";
 import { computeProjections, printProjections, projectionsToJson } from "./coarsen";
 import {
@@ -8,6 +16,7 @@ import {
   loadManifest,
   manifestCandidates,
   manifestReportToJson,
+  manifestSignature,
   printManifestReport,
   resolveManifest,
   unitsFromManifest,
@@ -17,10 +26,11 @@ import {
 } from "./manifest";
 import { DripError } from "./errors";
 import { ShellGitBackend, type GitBackend } from "./git-backend";
+import { ghPrView } from "./github";
 import { planToJson, printPlan } from "./planner";
 import { push, type PushUnits } from "./push";
 import { resolveRepoRoot } from "./repo";
-import { addOverride, listOverrides, openStore, recordTiming, removeOverride } from "./store";
+import { addOverride, deleteCorrespondence, listOverrides, openStore, recordTiming, removeOverride } from "./store";
 import { loadPlan, runVerify } from "./workflow";
 
 function usage(): never {
@@ -37,6 +47,11 @@ function usage(): never {
   );
   console.error("       drip override list <branch> [--repo path]");
   console.error("       drip override remove <id> [--repo path]");
+  console.error(
+    "       drip manifest adopt <branch> --projection id --pr n --head branch [--manifest path] [--repo path] [--base branch] [--remote name] [--json] [--yes]",
+  );
+  console.error("       drip manifest list <branch> [--repo path]");
+  console.error("       drip manifest forget <branch> --projection id [--repo path]");
   console.error("       drip mcp   (starts an MCP stdio server exposing plan/verify/override as tools)");
   process.exit(2);
 }
@@ -136,6 +151,110 @@ async function runOverrideCommand(git: GitBackend, positionals: string[], values
   usage();
 }
 
+// Resolves the manifest for a command that reads one: an explicit --manifest,
+// else the conventional location. Same rule as validate-plan — discovery is
+// for reading, never for deciding what `push --yes` sends to GitHub.
+function resolveManifestPath(repoRoot: string, branch: string, explicit: string | undefined, quiet: boolean): string {
+  const path = explicit ?? findManifest(repoRoot, branch);
+  if (!path) {
+    throw new DripError(
+      `no manifest found for '${branch}' — pass --manifest <path>, or create one at ${manifestCandidates(repoRoot, branch)[0]} ` +
+        `(\`drip plan ${branch} --coarsen --emit-manifest\` writes a starting point)`,
+    );
+  }
+  if (!explicit && !quiet) console.log(`using ${path}\n`);
+  return path;
+}
+
+// `drip manifest adopt|list|forget` — binding a semantic projection to a PR
+// that already exists, rather than opening a new one. See docs/adr/0020.
+async function runManifestCommand(git: GitBackend, positionals: string[], values: Record<string, unknown>) {
+  const [, sub, branch] = positionals;
+  if (sub !== "adopt" && sub !== "list" && sub !== "forget") usage();
+  if (!branch) throw new DripError(`drip manifest ${sub} requires the mega branch: drip manifest ${sub} <branch> ...`);
+
+  const repoRoot = resolveRepoRoot(git, (values.repo as string | undefined) ?? process.cwd());
+
+  if (sub === "list") {
+    const rows = listProjectionCorrespondence(openStore(repoRoot), branch);
+    if (!rows.length) {
+      console.log(`no projection PRs recorded for ${branch}`);
+      return;
+    }
+    console.log(`PROJECTION PRs (${branch}):`);
+    for (const r of rows) {
+      console.log(`  ${r.projectionId} -> ${r.branch}${r.prNumber ? ` #${r.prNumber}` : ""} [${r.adopted ? "adopted" : "drip"}] base: ${r.baseRef ?? "?"}${r.prUrl ? ` ${r.prUrl}` : ""}`);
+    }
+    return;
+  }
+
+  const projectionId = values.projection as string | undefined;
+  if (!projectionId) throw new DripError(`drip manifest ${sub} requires --projection <id> — the semantic projection this PR corresponds to`);
+
+  if (sub === "forget") {
+    deleteCorrespondence(openStore(repoRoot), branch, manifestSignature(projectionId));
+    console.log(`forgot the correspondence for '${projectionId}' on ${branch} — the PR and its branch are untouched`);
+    return;
+  }
+
+  // --- adopt ----------------------------------------------------------------
+  const prNumber = Number(values.pr);
+  if (values.pr === undefined || !Number.isInteger(prNumber) || prNumber <= 0) {
+    throw new DripError("--pr must be the existing pull request's number");
+  }
+  const head = values.head as string | undefined;
+  if (!head) throw new DripError("--head must name the branch the PR is on — adoption never infers which branch belongs to a projection");
+
+  const baseBranch = values.base as string;
+  const jsonOut = !!values.json;
+  const { db, mergeBase, plan } = await loadPlan({ git, repoRoot, branch, baseBranch });
+  if (!plan.hunks.length) throw new DripError(`no changes between ${baseBranch} and ${branch} — there is no projection to adopt a PR into`);
+  if (!plan.order) {
+    if (!jsonOut) printPlan(plan);
+    throw new DripError("cannot adopt against a cyclic slice DAG — resolve the cycle first");
+  }
+
+  const resolved = resolveManifest(plan, loadManifest(resolveManifestPath(repoRoot, branch, values.manifest as string | undefined, jsonOut)), { branch });
+  if (!resolved.ok) {
+    // Adoption binds a real PR to a projection, so the manifest that defines
+    // that projection has to hold together first — otherwise the thing being
+    // bound isn't well-defined.
+    if (!jsonOut) printManifestReport(resolved);
+    throw new DripError("manifest validation failed — fix it before binding a PR to one of its projections");
+  }
+  if (!resolved.projections.some((p) => p.id === projectionId)) {
+    throw new DripError(`no projection '${projectionId}' in this manifest — known ids: ${resolved.projections.map((p) => p.id).join(", ")}`);
+  }
+
+  const check = await checkAdoption({
+    git,
+    db,
+    repoRoot,
+    branch,
+    baseBranch,
+    mergeBase,
+    plan,
+    resolved,
+    projectionId,
+    head,
+    headSha: fetchAdoptedHead(git, repoRoot, (values.remote as string | undefined) ?? "origin", head),
+    pr: ghPrView(repoRoot, prNumber),
+  });
+
+  if (jsonOut) console.log(JSON.stringify(adoptionToJson(check)));
+  else printAdoptionReport(check);
+  if (!check.ok) process.exit(1);
+
+  // The check is read-only; recording the correspondence is what makes a later
+  // `push --manifest` treat someone else's branch as this projection's own.
+  if (!values.yes) {
+    if (!jsonOut) console.log("\nnot recorded: re-run with --yes to bind this projection to the PR.");
+    return;
+  }
+  recordAdoption(db, branch, check);
+  if (!jsonOut) console.log(`\nadopted: '${projectionId}' now corresponds to #${check.pr.number} on ${check.head} — nothing was pushed.`);
+}
+
 async function main() {
   const { values, positionals } = parseArgs({
     args: process.argv.slice(2),
@@ -147,7 +266,13 @@ async function main() {
       "assign-ids": { type: "boolean", default: false },
       "build-cmd": { type: "string" },
       "no-build-check": { type: "boolean", default: false },
-      projection: { type: "string", default: "stacked" },
+      // On `push` this is the base-selection mode and defaults to "stacked"
+      // there; on `manifest adopt` it names the projection being bound. No
+      // default, so adopt can tell "not given" from "given".
+      projection: { type: "string" },
+      pr: { type: "string" },
+      head: { type: "string" },
+      remote: { type: "string" },
       "dry-run": { type: "boolean", default: false },
       yes: { type: "boolean", default: false },
       json: { type: "boolean", default: false },
@@ -176,6 +301,11 @@ async function main() {
 
   if (command === "override") {
     await runOverrideCommand(git, positionals, values);
+    return;
+  }
+
+  if (command === "manifest") {
+    await runManifestCommand(git, positionals, values);
     return;
   }
 
@@ -214,14 +344,7 @@ async function main() {
   if (command === "validate-plan") {
     // Read-only, so discovering the conventional location is safe and saves
     // typing the same path every run.
-    const manifestPath = values.manifest ?? findManifest(repoRoot, branch);
-    if (!manifestPath) {
-      throw new DripError(
-        `no manifest found for '${branch}' — pass --manifest <path>, or create one at ${manifestCandidates(repoRoot, branch)[0]} ` +
-          `(\`drip plan ${branch} --coarsen --emit-manifest\` writes a starting point)`,
-      );
-    }
-    if (!values.manifest && !jsonOut) console.log(`using ${manifestPath}\n`);
+    const manifestPath = resolveManifestPath(repoRoot, branch, values.manifest, jsonOut);
     if (!plan.order) {
       printPlan(plan);
       throw new DripError("cannot validate a manifest against a cyclic slice DAG — resolve the cycle first");
@@ -338,7 +461,7 @@ async function main() {
     throw new DripError("push creates real branches and opens real PRs on GitHub — pass --yes to confirm, or --dry-run to preview first");
   }
 
-  const projection = values.projection!;
+  const projection = values.projection ?? "stacked";
   if (projection !== "stacked" && projection !== "flat-first") {
     throw new DripError(`--projection must be 'stacked' or 'flat-first', got '${projection}'`);
   }

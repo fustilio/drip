@@ -10,9 +10,15 @@ import type { Hunk, PlanResult } from "./planner";
 import { computeContentHash, computeSliceSignature } from "./signature";
 import { deleteCorrespondence, getCorrespondence, upsertCorrespondence, type Correspondence } from "./store";
 
-// "blocked" is flat-first-only: the slice's hunks wouldn't apply on its
-// prerequisites alone, so there is no branch to push. Never silently skipped.
+// "blocked" means there was nothing safe to push and drip said so instead of
+// skipping quietly: the slice's hunks wouldn't apply on its prerequisites
+// alone (flat-first), or an adopted branch moved on the remote and the lease
+// refused (docs/adr/0020).
 export type SliceStatus = "created" | "updated" | "unchanged" | "squash-merged" | "dry-run" | "blocked";
+
+// The branch drip mints for a unit it owns. Adopted units keep their own
+// branch name instead — see branchNameOf in push() and docs/adr/0020.
+export const dripBranchName = (branch: string, label: string) => `drip/${branch}/${label}`;
 
 export type PushResult = {
   sliceLabel: string;
@@ -93,7 +99,27 @@ export async function push(opts: {
   const projection = opts.projection ?? "stacked";
   const units = opts.units ?? unitsFromPlan(plan, branch);
   const label = units.label;
-  const sliceBranch = (id: string) => `drip/${branch}/${label(id)}`;
+
+  // Where a unit's branch lives. Normally the drip-owned name, but an adopted
+  // projection (docs/adr/0020) keeps the handcrafted branch its PR is already
+  // on — including when a *dependent's* base is computed from it, which is why
+  // this is resolved through correspondence rather than recomputed per call.
+  const branchCache = new Map<string, string>();
+  const sliceBranch = (id: string) => {
+    let name = branchCache.get(id);
+    if (name === undefined) {
+      name = getCorrespondence(db, branch, units.signature(id))?.sliceBranch ?? dripBranchName(branch, label(id));
+      branchCache.set(id, name);
+    }
+    return name;
+  };
+  const treeOf = (commitish: string): string | null => {
+    try {
+      return git.revParse(`${commitish}^{tree}`, repoRoot);
+    } catch {
+      return null;
+    }
+  };
 
   // Both modes materialize the same slice content; they differ only in what
   // each slice's branch is built on, and therefore what its PR can target.
@@ -194,7 +220,14 @@ export async function push(opts: {
         squashMerged = git.applyCachedReverseCheck(patchFile, repoRoot, scratchEnv);
       }
 
-      const status = classifySliceStatus({ existing, squashMerged, contentHash, dryRun });
+      // An adopted branch is someone else's history. "The branch already shows
+      // exactly this tree" is the right skip condition there, rather than the
+      // content hash alone: the hash also moves when the *chosen base string*
+      // does, and rewriting a reviewer-visible branch to change nothing but
+      // its commit graph is pure loss (docs/adr/0020).
+      const atThisTree = !!existing?.adopted && !!existing.commitSha && treeOf(existing.commitSha) === treeOf(commit);
+      const effectiveHash = atThisTree && existing!.contentHash ? existing!.contentHash : contentHash;
+      const status = classifySliceStatus({ existing, squashMerged, contentHash: effectiveHash, dryRun });
 
       if (dryRun) {
         results.push({ sliceLabel, branchName, prUrl: existing?.prUrl ?? null, status, base, note });
@@ -225,7 +258,26 @@ export async function push(opts: {
       if (integrationBranch && flat!.integrationCommit) {
         git.push("origin", `${flat!.integrationCommit}:refs/heads/${integrationBranch}`, repoRoot, true);
       }
-      git.push("origin", `${commit}:refs/heads/${branchName}`, repoRoot, true);
+      const lease = existing?.adopted && existing.commitSha ? { ref: branchName, expect: existing.commitSha } : undefined;
+      try {
+        git.push("origin", `${commit}:refs/heads/${branchName}`, repoRoot, true, lease);
+      } catch (e) {
+        if (!lease) throw e;
+        // The lease did its job: someone pushed to the adopted branch after
+        // drip last saw it. Refusing loudly and leaving that commit alone is
+        // the whole reason adopted branches aren't force-pushed blind.
+        results.push({
+          sliceLabel,
+          branchName,
+          prUrl: existing!.prUrl,
+          status: "blocked",
+          base,
+          note:
+            `the adopted branch has moved on the remote since drip recorded ${existing!.commitSha!.slice(0, 7)} — ` +
+            "force-with-lease refused rather than discard those commits. Review them, then re-run `drip manifest adopt` to re-bind.",
+        });
+        continue;
+      }
 
       let prUrl = existing?.prUrl ?? null;
       let prNumber = existing?.prNumber ?? null;
@@ -246,9 +298,33 @@ export async function push(opts: {
         await reconcileComments({ git, db, repoRoot, branch, sliceSignature: signature, mergeBase, oldCommitSha: existing.commitSha, newHunks: hunks, prNumber });
       }
 
-      if (existing?.prNumber && existing.baseRef && existing.baseRef !== base) ghPrSetBase(repoRoot, existing.prNumber, base);
+      // Retargeting is drip's to do on a PR it opened. On an adopted one the
+      // base is a review decision someone else made, so a disagreement with
+      // the manifest graph is reported and left alone — changing it is an
+      // explicit act (change it on the PR, then re-run `manifest adopt`).
+      let baseRef = base;
+      if (existing?.prNumber && existing.baseRef && existing.baseRef !== base) {
+        if (existing.adopted) {
+          baseRef = existing.baseRef;
+          note = [note, `PR #${existing.prNumber} targets ${existing.baseRef}, but the manifest implies ${base} — drip does not retarget an adopted PR`]
+            .filter(Boolean)
+            .join("; ");
+        } else {
+          ghPrSetBase(repoRoot, existing.prNumber, base);
+        }
+      }
 
-      upsertCorrespondence(db, { branch, sliceSignature: signature, sliceBranch: branchName, prNumber, prUrl, contentHash, commitSha: commit, baseRef: base });
+      upsertCorrespondence(db, {
+        branch,
+        sliceSignature: signature,
+        sliceBranch: branchName,
+        prNumber,
+        prUrl,
+        contentHash,
+        commitSha: commit,
+        baseRef,
+        adopted: !!existing?.adopted,
+      });
       results.push({ sliceLabel, branchName, prUrl, status, base, note });
       baseForNext = branchName;
     }

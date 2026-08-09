@@ -49,6 +49,41 @@ export function ghPrClose(repoRoot: string, prNumber: number, comment: string): 
   }
 }
 
+export type PrRef = {
+  number: number;
+  url: string;
+  state: "OPEN" | "CLOSED" | "MERGED" | "UNKNOWN";
+  headRefName: string;
+  baseRefName: string;
+  title: string;
+};
+
+// Everything adoption needs to know about an existing PR (issue #11): is it
+// still open, which branch is it on, and what does it currently target. Read
+// live on every adopt run rather than cached, since the base is the one field
+// a human is expected to change out-of-band between runs.
+export function ghPrView(repoRoot: string, prNumber: number): PrRef {
+  let out: string;
+  try {
+    out = execFileSync("gh", ["pr", "view", String(prNumber), "--json", "number,url,state,headRefName,baseRefName,title"], {
+      cwd: repoRoot,
+      stdio: ["ignore", "pipe", "pipe"],
+    }).toString();
+  } catch (e: any) {
+    throw new DripError(`gh pr view failed for #${prNumber}: ${String(e.stderr ?? e.message ?? "").trim()}`);
+  }
+  const raw = JSON.parse(out) as Record<string, unknown>;
+  const state = String(raw.state ?? "");
+  return {
+    number: Number(raw.number ?? prNumber),
+    url: String(raw.url ?? ""),
+    state: state === "OPEN" || state === "CLOSED" || state === "MERGED" ? state : "UNKNOWN",
+    headRefName: String(raw.headRefName ?? ""),
+    baseRefName: String(raw.baseRefName ?? ""),
+    title: String(raw.title ?? ""),
+  };
+}
+
 export type ReviewComment = {
   id: number;
   path: string;

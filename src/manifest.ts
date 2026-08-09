@@ -77,7 +77,14 @@ export type Finding = {
     | "no-verification"
     | "verification-failed"
     | "ordinal-selector"
-    | "branch-mismatch";
+    | "branch-mismatch"
+    // adoption of a pre-existing PR — see adopt.ts / docs/adr/0020
+    | "adopt-mismatch"
+    | "adopt-replay-failed"
+    | "adopt-pr-state"
+    | "adopt-head-mismatch"
+    | "adopt-conflict"
+    | "base-disagreement";
   projection: string | null;
   message: string;
 };

@@ -57,7 +57,13 @@ export function openStore(repoRoot: string): Database {
   // costing a `gh pr view` per slice on every run. ALTER TABLE ADD COLUMN has
   // no IF NOT EXISTS — swallow the "duplicate column" error on repos that
   // already have this table.
-  for (const col of ["content_hash TEXT", "commit_sha TEXT", "base_ref TEXT"]) {
+  //
+  // adopted marks a row drip did not create: a pre-existing PR bound to a
+  // manifest projection by `drip manifest adopt` (issue #11). Push treats
+  // those branches as someone else's property — leased force-push, no silent
+  // retargeting — so the flag has to survive in the durable record, not be
+  // re-derived from the branch name.
+  for (const col of ["content_hash TEXT", "commit_sha TEXT", "base_ref TEXT", "adopted INTEGER NOT NULL DEFAULT 0"]) {
     try {
       db.run(`ALTER TABLE correspondence ADD COLUMN ${col}`);
     } catch {}
@@ -139,21 +145,34 @@ export type Correspondence = {
   contentHash: string | null;
   commitSha: string | null;
   baseRef: string | null;
+  /** true when the PR/branch pre-existed drip and was bound by `manifest adopt` */
+  adopted: boolean;
 };
+
+const CORRESPONDENCE_COLUMNS =
+  "id, branch, slice_signature as sliceSignature, slice_branch as sliceBranch, pr_number as prNumber, pr_url as prUrl, content_hash as contentHash, commit_sha as commitSha, base_ref as baseRef, adopted";
+
+type CorrespondenceRow = Omit<Correspondence, "adopted"> & { adopted: number | null };
+const toCorrespondence = (row: CorrespondenceRow): Correspondence => ({ ...row, adopted: !!row.adopted });
 
 export function getCorrespondence(db: Database, branch: string, sliceSignature: string): Correspondence | null {
   const row = db
-    .query(
-      "SELECT id, branch, slice_signature as sliceSignature, slice_branch as sliceBranch, pr_number as prNumber, pr_url as prUrl, content_hash as contentHash, commit_sha as commitSha, base_ref as baseRef FROM correspondence WHERE branch = ? AND slice_signature = ?",
-    )
-    .get(branch, sliceSignature) as Correspondence | null;
-  return row;
+    .query(`SELECT ${CORRESPONDENCE_COLUMNS} FROM correspondence WHERE branch = ? AND slice_signature = ?`)
+    .get(branch, sliceSignature) as CorrespondenceRow | null;
+  return row ? toCorrespondence(row) : null;
+}
+
+export function listCorrespondence(db: Database, branch: string): Correspondence[] {
+  const rows = db
+    .query(`SELECT ${CORRESPONDENCE_COLUMNS} FROM correspondence WHERE branch = ? ORDER BY slice_signature`)
+    .all(branch) as CorrespondenceRow[];
+  return rows.map(toCorrespondence);
 }
 
 export function upsertCorrespondence(db: Database, c: Correspondence): void {
   db.query(
-    `INSERT INTO correspondence (branch, slice_signature, slice_branch, pr_number, pr_url, content_hash, commit_sha, base_ref, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+    `INSERT INTO correspondence (branch, slice_signature, slice_branch, pr_number, pr_url, content_hash, commit_sha, base_ref, adopted, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
      ON CONFLICT(branch, slice_signature) DO UPDATE SET
        slice_branch = excluded.slice_branch,
        pr_number = excluded.pr_number,
@@ -161,8 +180,9 @@ export function upsertCorrespondence(db: Database, c: Correspondence): void {
        content_hash = excluded.content_hash,
        commit_sha = excluded.commit_sha,
        base_ref = excluded.base_ref,
+       adopted = excluded.adopted,
        updated_at = datetime('now')`,
-  ).run(c.branch, c.sliceSignature, c.sliceBranch, c.prNumber, c.prUrl, c.contentHash, c.commitSha, c.baseRef);
+  ).run(c.branch, c.sliceSignature, c.sliceBranch, c.prNumber, c.prUrl, c.contentHash, c.commitSha, c.baseRef, c.adopted ? 1 : 0);
 }
 
 export function deleteCorrespondence(db: Database, branch: string, sliceSignature: string): void {

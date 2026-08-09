@@ -70,5 +70,9 @@ The durable link between a slice and its projection — `slice branch ↔ PR num
 The link between a review comment and the code it refers to, used to survive force-push regeneration. M4 anchors on exact hunk hash only (`sha1` of the hunk's raw patch text) — see `docs/adr/0007-comment-anchor-scope.md` for why the plan's symbol-path and fuzzy tiers aren't built yet. A comment whose hunk hash no longer appears in the new push is orphaned with a loud reply on its thread, never silently dropped.
 _Avoid_: link, mapping, reference
 
+**Adoption**:
+Binding a semantic projection to a PR and branch that already existed — handwritten, with its own reviewers, comments and name — instead of opening a drip-owned one. Explicit and evidence-based: `drip manifest adopt` takes the projection id, PR number and head branch, and records correspondence only after the branch's effective diff, replayed onto the mega branch's merge base, produces exactly the projection's materialized tree. Never inferred from titles or similarity, never pushes anything, and leaves an adopted branch under lease afterwards — drip doesn't own it. See docs/adr/0020.
+_Avoid_: import, claim, takeover
+
 **Slice signature**:
 A slice's identity key for correspondence purposes in M2: the sorted, joined list of group keys the slice unions together — `file::QualifiedSymbolPath` for symbol groups, the fallback selector for fallback groups. An intermediate stand-in for real content-addressing (M3) — see `docs/adr/0006-slice-correspondence-key.md`.

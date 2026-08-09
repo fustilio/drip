@@ -17,6 +17,7 @@ function correspondence(contentHash: string): Correspondence {
     contentHash,
     commitSha: "deadbeef",
     baseRef: "main",
+    adopted: false,
   };
 }
 

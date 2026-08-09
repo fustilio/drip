@@ -25,8 +25,12 @@ export interface GitBackend {
   worktreeRemove(path: string, cwd: string): void;
   log(range: string, cwd: string): CommitInfo[];
   updateRef(ref: string, sha: string, cwd: string): void;
-  push(remote: string, refspec: string, cwd: string, force: boolean): void;
+  fetch(remote: string, ref: string, cwd: string): void;
+  push(remote: string, refspec: string, cwd: string, force: boolean, lease?: Lease): void;
 }
+
+/** `--force-with-lease=<ref>:<expect>` — see ShellGitBackend.push. */
+export type Lease = { ref: string; expect: string };
 
 function run(args: string[], cwd: string, env: Env = process.env): string {
   // Bun's execFileSync inherits stderr live by default (unlike Node's pure
@@ -110,13 +114,25 @@ export class ShellGitBackend implements GitBackend {
   updateRef(ref: string, sha: string, cwd: string) {
     run(["update-ref", ref, sha], cwd);
   }
-  push(remote: string, refspec: string, cwd: string, force: boolean) {
+  // Fetches one ref by name into FETCH_HEAD. Used to read an adopted branch
+  // that lives on the remote and may have no local ref at all (issue #11).
+  fetch(remote: string, ref: string, cwd: string) {
+    run(["fetch", remote, ref], cwd);
+  }
+  push(remote: string, refspec: string, cwd: string, force: boolean, lease?: Lease) {
     // Plain --force, not --force-with-lease: drip never fetches to keep a
     // remote-tracking ref current, so lease would reject pushes to branches
     // it itself owns and manages exclusively (the drip/<branch>/sliceN
     // namespace) just because the local repo's view of the remote is stale.
+    //
+    // An adopted branch (docs/adr/0020) is the exception, and the reasoning
+    // inverts: drip does not own it, someone may have pushed a review fix onto
+    // it, and the sha drip last saw is a real expectation rather than a stale
+    // guess. There a lease is exactly right — the push fails instead of
+    // discarding a commit drip never saw.
     const args = ["push"];
-    if (force) args.push("--force");
+    if (lease) args.push(`--force-with-lease=${lease.ref}:${lease.expect}`);
+    else if (force) args.push("--force");
     args.push(remote, refspec);
     run(args, cwd);
   }
