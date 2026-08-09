@@ -28,9 +28,9 @@ function usage(): never {
     "usage: drip plan <branch> [--repo path] [--base branch] [--timing] [--assign-ids] [--json] [--coarsen] [--target-slices n] [--emit-manifest [--manifest path] [--force]]",
   );
   console.error("       drip verify <branch> [--repo path] [--base branch] [--timing] [--coarsen] [--target-slices n] [--build-cmd cmd] [--no-build-check]");
-  console.error("       drip validate-plan <branch> [--manifest path] [--repo path] [--base branch] [--json]");
+  console.error("       drip validate-plan <branch> [--manifest path] [--repo path] [--base branch] [--json] [--no-manifest-check] [--strict]");
   console.error(
-    "       drip push <branch> [--repo path] [--base branch] [--projection stacked|flat-first] [--manifest path] [--build-cmd cmd] [--no-build-check] --yes | --dry-run",
+    "       drip push <branch> [--repo path] [--base branch] [--projection stacked|flat-first] [--manifest path] [--no-manifest-check] [--strict] [--build-cmd cmd] [--no-build-check] --yes | --dry-run",
   );
   console.error(
     "       drip override add <branch> --kind force_merge|force_split --selector-a file::Symbol [--selector-b file::Symbol] [--note text] [--repo path]",
@@ -79,6 +79,14 @@ function printVerifyResult(result: Awaited<ReturnType<typeof runVerify>>, sliceC
   } else {
     console.log(`BUILD CHECK: PASS (\`${build.buildCmd}\`, ${sliceCount} slices${skipNote})`);
   }
+}
+
+// --strict promotes every manifest warning to a failure. Useful in CI, where
+// "declares no verification commands" or "uses an ordinal selector" are things
+// you want to block on rather than read past.
+function manifestFailed(resolved: { findings: { severity: string }[] }, extra: { severity: string }[], strict: boolean): boolean {
+  const all = [...resolved.findings, ...extra];
+  return all.some((f) => f.severity === "error" || (strict && f.severity === "warning"));
 }
 
 async function runOverrideCommand(git: GitBackend, positionals: string[], values: Record<string, unknown>) {
@@ -146,6 +154,8 @@ async function main() {
       coarsen: { type: "boolean", default: false },
       "target-slices": { type: "string" },
       manifest: { type: "string" },
+      "no-manifest-check": { type: "boolean", default: false },
+      strict: { type: "boolean", default: false },
       "emit-manifest": { type: "boolean", default: false },
       force: { type: "boolean", default: false },
       kind: { type: "string" },
@@ -219,13 +229,12 @@ async function main() {
     const resolved = resolveManifest(plan, loadManifest(manifestPath), { branch });
     // The git-backed checks only make sense once the manifest is structurally
     // coherent; running them on a broken graph just produces noise.
-    const gitFindings = resolved.ok
-      ? await validateManifestAgainstGit({ git, repoRoot, branch, mergeBase, plan, resolved })
-      : [];
-    if (jsonOut) console.log(JSON.stringify(manifestReportToJson(resolved, gitFindings)));
-    else printManifestReport(resolved, gitFindings);
-    const failed = [...resolved.findings, ...gitFindings].some((f) => f.severity === "error");
-    if (failed) process.exit(1);
+    const checked = resolved.ok
+      ? await validateManifestAgainstGit({ git, repoRoot, branch, mergeBase, plan, resolved, db, runVerification: !values["no-manifest-check"] })
+      : { findings: [], verification: [] };
+    if (jsonOut) console.log(JSON.stringify(manifestReportToJson(resolved, checked.findings, checked.verification)));
+    else printManifestReport(resolved, checked.findings, checked.verification, !!values.strict);
+    if (manifestFailed(resolved, checked.findings, !!values.strict)) process.exit(1);
     return;
   }
 
@@ -283,9 +292,11 @@ async function main() {
   }
   if (values.manifest) {
     const resolved = resolveManifest(plan, loadManifest(values.manifest), { branch });
-    const gitFindings = resolved.ok ? await validateManifestAgainstGit({ git, repoRoot, branch, mergeBase, plan, resolved }) : [];
-    printManifestReport(resolved, gitFindings);
-    if ([...resolved.findings, ...gitFindings].some((f) => f.severity === "error")) {
+    const checked = resolved.ok
+      ? await validateManifestAgainstGit({ git, repoRoot, branch, mergeBase, plan, resolved, db, runVerification: !values["no-manifest-check"] })
+      : { findings: [], verification: [] };
+    printManifestReport(resolved, checked.findings, checked.verification, !!values.strict);
+    if (manifestFailed(resolved, checked.findings, !!values.strict)) {
       console.error("\npush refused: manifest validation failed");
       process.exit(1);
     }

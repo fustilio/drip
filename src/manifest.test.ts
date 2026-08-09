@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { computeProjections } from "./coarsen";
 import { ShellGitBackend } from "./git-backend";
@@ -16,6 +16,7 @@ import {
   type Manifest,
 } from "./manifest";
 import { computePlan, type PlanResult } from "./planner";
+import { openStore } from "./store";
 import { commit, git, makeTempRepo } from "./test-helpers";
 import { verifyTreeHash } from "./verify";
 
@@ -60,18 +61,23 @@ const manifest = (overrides: Partial<Manifest> = {}): Manifest =>
     version: 1,
     sourceBranch: "feature",
     projections: [
-      { id: "formatter", atomicSlices: ["src/appeals/format.ts::formatAppeal"] },
+      { id: "formatter", atomicSlices: ["src/appeals/format.ts::formatAppeal"], verificationReason: NO_CHECKS },
       {
         id: "report",
         atomicSlices: ["src/appeals/report.ts::renderReport"],
         glue: ["src/appeals/report.ts::(file)"],
         dependsOn: ["formatter"],
+        verificationReason: NO_CHECKS,
       },
-      { id: "inbox", atomicSlices: ["src/inbox/columns.ts::columns"] },
-      { id: "docs", atomicSlices: ["README.md::(file)"] },
+      { id: "inbox", atomicSlices: ["src/inbox/columns.ts::columns"], verificationReason: NO_CHECKS },
+      { id: "docs", atomicSlices: ["README.md::(file)"], verificationReason: NO_CHECKS },
     ],
     ...overrides,
   });
+
+// The fixture opts out of executable checks by default so each test exercises
+// one thing; the execution tests below opt back in explicitly.
+const NO_CHECKS = "fixture: covered by the suite that owns this file";
 
 const codes = (r: { findings: { code: string }[] }) => r.findings.map((f) => f.code);
 
@@ -193,12 +199,15 @@ test("an emitted skeleton is a valid manifest that validates clean against the p
   expect(() => ManifestSchema.parse(JSON.parse(JSON.stringify(emitted)))).not.toThrow();
 
   const resolved = resolveManifest(p, emitted, { branch: "feature" });
-  expect(resolved.findings).toEqual([]);
+  // A skeleton legitimately has no verification commands yet — that's the one
+  // thing it can't invent, and the warning is how the author is told to.
+  expect(resolved.findings.every((f) => f.code === "no-verification" && f.severity === "warning")).toBe(true);
+  expect(resolved.ok).toBe(true);
   // Every atomic slice accounted for — a skeleton that dropped one would be a
   // trap, since the author would have to notice the omission themselves.
   expect(resolved.projections.flatMap((x) => x.sliceIds).sort()).toEqual([...p.slices.keys()].sort());
 
-  const findings = await validateManifestAgainstGit({ git: backend, repoRoot, branch: "feature", mergeBase, plan: p, resolved });
+  const { findings } = await validateManifestAgainstGit({ git: backend, repoRoot, branch: "feature", mergeBase, plan: p, resolved });
   expect(findings).toEqual([]);
 });
 
@@ -235,7 +244,7 @@ test("the conventional manifest location is discovered, and prefers the committa
 test("the manifest's projections reconstruct the mega-branch tree", async () => {
   const p = await plan();
   const resolved = resolveManifest(p, manifest(), { branch: "feature" });
-  const findings = await validateManifestAgainstGit({ git: backend, repoRoot, branch: "feature", mergeBase, plan: p, resolved });
+  const { findings } = await validateManifestAgainstGit({ git: backend, repoRoot, branch: "feature", mergeBase, plan: p, resolved });
   expect(findings).toEqual([]);
 });
 
@@ -252,7 +261,7 @@ test("deferred slices are still covered by the tree check, so nothing can be qui
   const units = verificationUnits(resolved);
   expect(units.order).toContain("(deferred)");
 
-  const findings = await validateManifestAgainstGit({ git: backend, repoRoot, branch: "feature", mergeBase, plan: p, resolved });
+  const { findings } = await validateManifestAgainstGit({ git: backend, repoRoot, branch: "feature", mergeBase, plan: p, resolved });
   expect(findings).toEqual([]);
 
   // And the projections alone genuinely do *not* reconstruct it — which is why
@@ -267,4 +276,101 @@ test("deferred slices are still covered by the tree check, so nothing can be qui
     slices: resolved.units,
   });
   expect(withoutDeferred.pass).toBe(false);
+});
+
+// --- issue #10: verification commands are executed, not just documented ------
+
+test("a projection's commands run against its own tree, not the mega branch", async () => {
+  const p = await plan();
+  const m = manifest();
+  // `report`'s change is `toUpperCase`. Asserting it is *absent* from the
+  // formatter projection's tree is the check that proves isolation: this
+  // command passes only if the command ran against formatter's prerequisite
+  // closure rather than against the branch or the working tree.
+  m.projections.find((x) => x.id === "formatter")!.verification = ["! grep -q toUpperCase src/appeals/report.ts"];
+  m.projections.find((x) => x.id === "report")!.verification = ["grep -q toUpperCase src/appeals/report.ts"];
+
+  using db = openStore(repoRoot);
+  const resolved = resolveManifest(p, m, { branch: "feature" });
+  const { findings, verification } = await validateManifestAgainstGit({
+    git: backend,
+    repoRoot,
+    branch: "feature",
+    mergeBase,
+    plan: p,
+    resolved,
+    db,
+    runVerification: true,
+  });
+  expect(findings).toEqual([]);
+  expect(verification.map((r) => [r.projection, r.passed])).toEqual([
+    ["formatter", true],
+    ["report", true],
+  ]);
+});
+
+test("a failing command fails validation for exactly the affected projection", async () => {
+  const p = await plan();
+  const m = manifest();
+  m.projections.find((x) => x.id === "inbox")!.verification = ["exit 3"];
+  m.projections.find((x) => x.id === "docs")!.verification = ["true"];
+
+  using db = openStore(repoRoot);
+  const resolved = resolveManifest(p, m, { branch: "feature" });
+  const { findings, verification } = await validateManifestAgainstGit({
+    git: backend,
+    repoRoot,
+    branch: "feature",
+    mergeBase,
+    plan: p,
+    resolved,
+    db,
+    runVerification: true,
+  });
+
+  const failed = findings.filter((f) => f.code === "verification-failed");
+  expect(failed).toHaveLength(1);
+  expect(failed[0]!.projection).toBe("inbox");
+  expect(failed[0]!.severity).toBe("error");
+  // The unrelated projection still ran and still passed.
+  expect(verification.find((r) => r.projection === "docs")!.passed).toBe(true);
+
+  // Captured output is on disk, referenced by path rather than inlined.
+  const run = verification.find((r) => r.projection === "inbox")!;
+  expect(run.exitCode).toBe(3);
+  expect(existsSync(run.outputPath!)).toBe(true);
+  expect(readFileSync(run.outputPath!, "utf8")).toContain("exit 3");
+});
+
+test("a passing command is cached by tree, and skipping is explicit", async () => {
+  const p = await plan();
+  const m = manifest();
+  // Distinct from any command another test in this file runs: the cache is
+  // keyed by (branch, projection, command) in the repo's shared drip.db, so a
+  // reused command would arrive already warm and prove nothing.
+  m.projections.find((x) => x.id === "docs")!.verification = ["echo cache-probe"];
+  using db = openStore(repoRoot);
+  const resolved = resolveManifest(p, m, { branch: "feature" });
+  const run = () =>
+    validateManifestAgainstGit({ git: backend, repoRoot, branch: "feature", mergeBase, plan: p, resolved, db, runVerification: true });
+
+  const first = await run();
+  expect(first.verification.find((r) => r.projection === "docs")!.cached).toBe(false);
+  const second = await run();
+  expect(second.verification.find((r) => r.projection === "docs")!.cached).toBe(true);
+
+  // Opting out runs nothing at all — no partial credit, no silent pass.
+  const skipped = await validateManifestAgainstGit({ git: backend, repoRoot, branch: "feature", mergeBase, plan: p, resolved, db, runVerification: false });
+  expect(skipped.verification).toEqual([]);
+});
+
+test("declaring no checks warns, and --strict turns that warning into a failure", async () => {
+  const m = manifest();
+  m.projections.find((x) => x.id === "docs")!.verificationReason = null;
+  const resolved = resolveManifest(await plan(), m, { branch: "feature" });
+  const warning = resolved.findings.find((f) => f.code === "no-verification");
+  expect(warning).toBeDefined();
+  expect(warning!.severity).toBe("warning");
+  expect(warning!.projection).toBe("docs");
+  expect(resolved.ok).toBe(true); // a warning alone doesn't fail a normal run
 });

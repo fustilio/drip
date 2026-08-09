@@ -85,7 +85,46 @@ export function openStore(repoRoot: string): Database {
       UNIQUE(branch, slice_signature)
     )
   `);
+  // Issue #10: manifest verification commands are real process runs, often a
+  // package typecheck or a targeted test suite. Keyed by the tree the command
+  // ran against, so an independent projection isn't re-verified because some
+  // unrelated projection changed.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS manifest_verification (
+      branch TEXT NOT NULL,
+      projection_id TEXT NOT NULL,
+      command TEXT NOT NULL,
+      tree_hash TEXT NOT NULL,
+      passed INTEGER NOT NULL,
+      exit_code INTEGER,
+      output_path TEXT,
+      duration_ms INTEGER,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(branch, projection_id, command)
+    )
+  `);
   return db;
+}
+
+export type VerificationCacheEntry = { treeHash: string; passed: boolean; exitCode: number | null; outputPath: string | null; durationMs: number | null };
+
+export function getVerificationCache(db: Database, branch: string, projectionId: string, command: string): VerificationCacheEntry | null {
+  const row = db
+    .query(
+      "SELECT tree_hash as treeHash, passed, exit_code as exitCode, output_path as outputPath, duration_ms as durationMs FROM manifest_verification WHERE branch = ? AND projection_id = ? AND command = ?",
+    )
+    .get(branch, projectionId, command) as { treeHash: string; passed: number; exitCode: number | null; outputPath: string | null; durationMs: number | null } | null;
+  return row ? { ...row, passed: !!row.passed } : null;
+}
+
+export function upsertVerificationCache(db: Database, branch: string, projectionId: string, command: string, entry: VerificationCacheEntry): void {
+  db.query(
+    `INSERT INTO manifest_verification (branch, projection_id, command, tree_hash, passed, exit_code, output_path, duration_ms, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+     ON CONFLICT(branch, projection_id, command) DO UPDATE SET
+       tree_hash = excluded.tree_hash, passed = excluded.passed, exit_code = excluded.exit_code,
+       output_path = excluded.output_path, duration_ms = excluded.duration_ms, updated_at = datetime('now')`,
+  ).run(branch, projectionId, command, entry.treeHash, entry.passed ? 1 : 0, entry.exitCode, entry.outputPath, entry.durationMs);
 }
 
 // slice_signature identifies "the same logical slice" across re-runs of

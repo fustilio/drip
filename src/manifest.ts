@@ -3,12 +3,14 @@ import { dirname, join } from "node:path";
 import { z } from "zod";
 import type { CoarsenResult } from "./coarsen";
 import { DripError } from "./errors";
+import type { Database } from "bun:sqlite";
 import type { GitBackend } from "./git-backend";
 import { materializeFlatFirst } from "./materialize";
 import { groupKeyOf, topoSort, type Hunk, type PlanResult } from "./planner";
 import type { PushUnits } from "./push";
 import { gitPath } from "./repo";
 import { verifyTreeHash } from "./verify";
+import { runManifestVerification, type VerificationRun } from "./verification";
 
 // Semantic projection manifest (issue #9).
 //
@@ -35,6 +37,9 @@ const ProjectionEntry = z.object({
   glue: z.array(z.string()).default([]),
   dependsOn: z.array(z.string()).default([]),
   verification: z.array(z.string()).default([]),
+  // Declaring no checks is allowed, but it has to be a decision someone made
+  // rather than a field nobody filled in (issue #10).
+  verificationReason: z.string().nullable().optional(),
   oversizeReason: z.string().nullable().optional(),
 });
 
@@ -69,6 +74,8 @@ export type Finding = {
     | "oversize"
     | "apply-failure"
     | "tree-hash-mismatch"
+    | "no-verification"
+    | "verification-failed"
     | "ordinal-selector"
     | "branch-mismatch";
   projection: string | null;
@@ -86,6 +93,7 @@ export type ResolvedProjection = {
   hunkCount: number;
   changedLines: number;
   verification: string[];
+  verificationReason: string | null;
   oversizeReason: string | null;
 };
 
@@ -396,6 +404,12 @@ export function resolveManifest(plan: PlanResult, manifest: Manifest, opts: { br
     if (over.length && !entry.oversizeReason) {
       add("error", "oversize", id, `exceeds the review budget (${over.join(", ")}) — shrink it or set oversizeReason`);
     }
+    // "This PR is independently reviewable" is a claim about it being runnable,
+    // and an empty `verification` makes that claim untested. Allowed, but only
+    // as a stated decision — a warning by default, an error under --strict.
+    if (!entry.verification.length && !entry.verificationReason) {
+      add("warning", "no-verification", id, "declares no verification commands — add some, or set verificationReason to say why none apply");
+    }
 
     projections.push({
       id,
@@ -408,6 +422,7 @@ export function resolveManifest(plan: PlanResult, manifest: Manifest, opts: { br
       hunkCount: hunks.length,
       changedLines,
       verification: entry.verification,
+      verificationReason: entry.verificationReason ?? null,
       oversizeReason: entry.oversizeReason ?? null,
     });
   }
@@ -455,10 +470,14 @@ export async function validateManifestAgainstGit(opts: {
   mergeBase: string;
   plan: PlanResult;
   resolved: ResolvedManifest;
-}): Promise<Finding[]> {
+  /** omit to skip executing verification commands (`--no-manifest-check`) */
+  db?: Database;
+  runVerification?: boolean;
+}): Promise<{ findings: Finding[]; verification: VerificationRun[] }> {
   const { git, repoRoot, branch, mergeBase, plan, resolved } = opts;
   const findings: Finding[] = [];
-  if (!resolved.units.size) return findings;
+  const verification: VerificationRun[] = [];
+  if (!resolved.units.size) return { findings, verification };
 
   const materialized = await materializeFlatFirst({
     git,
@@ -506,7 +525,34 @@ export async function validateManifestAgainstGit(opts: {
       message: `${tree.message}${resolved.deferred.length ? " (checked with the deferred slices appended, so this is a real loss, not the deferral)" : ""}`,
     });
   }
-  return findings;
+
+  // Only worth running commands once the projections are structurally sound and
+  // each one actually applies — otherwise every command fails for the same
+  // upstream reason and the report buries the real cause.
+  const applied = new Map(materialized.filter((m) => m.commit).map((m) => [m.sliceId, m.commit!]));
+  if (opts.runVerification && opts.db && !findings.some((f) => f.severity === "error")) {
+    const byId = new Map(resolved.projections.map((p) => [p.id, p]));
+    verification.push(
+      ...runManifestVerification({
+        git,
+        db: opts.db,
+        repoRoot,
+        branch,
+        commits: resolved.order
+          .filter((id) => applied.has(id))
+          .map((id) => ({ projection: id, commit: applied.get(id)!, commands: byId.get(id)?.verification ?? [] })),
+      }),
+    );
+    for (const run of verification.filter((r) => !r.passed)) {
+      findings.push({
+        severity: "error",
+        code: "verification-failed",
+        projection: run.projection,
+        message: `\`${run.command}\` failed (exit ${run.exitCode ?? "?"}) against this projection's own tree — output: ${run.outputPath}`,
+      });
+    }
+  }
+  return { findings, verification };
 }
 
 // Correspondence identity for a manifest projection is the *approved semantic
@@ -542,7 +588,7 @@ export function unitsFromManifest(resolved: ResolvedManifest, branch: string): P
   };
 }
 
-export function manifestReportToJson(resolved: ResolvedManifest, extra: Finding[] = []): object {
+export function manifestReportToJson(resolved: ResolvedManifest, extra: Finding[] = [], verification: VerificationRun[] = []): object {
   const findings = [...resolved.findings, ...extra];
   return {
     ok: !findings.some((f) => f.severity === "error"),
@@ -559,13 +605,23 @@ export function manifestReportToJson(resolved: ResolvedManifest, extra: Finding[
       hunks: p.hunkCount,
       changedLines: p.changedLines,
       verification: p.verification,
+      verificationReason: p.verificationReason,
       oversizeReason: p.oversizeReason,
+    })),
+    verificationRuns: verification.map((r) => ({
+      projection: r.projection,
+      command: r.command,
+      passed: r.passed,
+      exitCode: r.exitCode,
+      outputPath: r.outputPath,
+      durationMs: r.durationMs,
+      cached: r.cached,
     })),
     findings,
   };
 }
 
-export function printManifestReport(resolved: ResolvedManifest, extra: Finding[] = []): void {
+export function printManifestReport(resolved: ResolvedManifest, extra: Finding[] = [], verification: VerificationRun[] = [], strict = false): void {
   const findings = [...resolved.findings, ...extra];
   console.log(`MANIFEST (${resolved.projections.length} projections):`);
   for (const p of resolved.projections) {
@@ -582,6 +638,15 @@ export function printManifestReport(resolved: ResolvedManifest, extra: Finding[]
     for (const d of resolved.deferred) console.log(`  ${d.label}: ${d.reason}`);
   }
 
+  if (verification.length) {
+    console.log("\nVERIFICATION:");
+    for (const r of verification) {
+      const status = r.passed ? (r.cached ? "PASS (cached)" : "PASS") : `FAIL (exit ${r.exitCode ?? "?"})`;
+      console.log(`  ${r.projection}: \`${r.command}\` — ${status}${r.cached ? "" : ` in ${r.durationMs}ms`}`);
+      if (!r.passed && r.outputPath) console.log(`    output: ${r.outputPath}`);
+    }
+  }
+
   const errors = findings.filter((f) => f.severity === "error");
   const warnings = findings.filter((f) => f.severity === "warning");
   for (const [title, list] of [
@@ -593,7 +658,11 @@ export function printManifestReport(resolved: ResolvedManifest, extra: Finding[]
     for (const f of list) console.log(`  [${f.code}]${f.projection ? ` ${f.projection}:` : ""} ${f.message}`);
   }
 
-  console.log(errors.length ? `\nMANIFEST: FAIL (${errors.length} error(s), ${warnings.length} warning(s))` : `\nMANIFEST: PASS (${warnings.length} warning(s))`);
+  // Under --strict a warning is a failure, so the summary must say FAIL —
+  // printing PASS next to a non-zero exit is worse than no summary at all.
+  const failed = errors.length > 0 || (strict && warnings.length > 0);
+  const counts = `${errors.length} error(s), ${warnings.length} warning(s)${strict ? ", --strict" : ""}`;
+  console.log(failed ? `\nMANIFEST: FAIL (${counts})` : `\nMANIFEST: PASS (${warnings.length} warning(s))`);
 }
 
 export function writeManifest(path: string, manifest: Manifest, opts: { force?: boolean } = {}): void {

@@ -51,6 +51,27 @@ export async function verifyTreeHash(opts: {
   }
 }
 
+// A disposable checkout of one materialized commit, with the repo's
+// node_modules linked in so commands can actually run. Shared by the per-slice
+// build check and by manifest verification (src/verification.ts) — both need
+// "run something against exactly this tree", and one of them having its own
+// copy of the worktree/symlink/cleanup dance is how the two quietly diverge.
+export function withWorktree<T>(opts: { git: GitBackend; repoRoot: string; worktreePath: string; commit: string }, fn: (dir: string) => T): T {
+  const { git, repoRoot, worktreePath, commit } = opts;
+  const nodeModulesSrc = join(repoRoot, "node_modules");
+  git.worktreeAdd(worktreePath, commit, repoRoot);
+  try {
+    if (existsSync(nodeModulesSrc)) {
+      // Junctions don't require elevated privileges on Windows; plain
+      // symlinks do. Elsewhere a normal dir symlink is fine.
+      symlinkSync(nodeModulesSrc, join(worktreePath, "node_modules"), platform() === "win32" ? "junction" : "dir");
+    }
+    return fn(worktreePath);
+  } finally {
+    git.worktreeRemove(worktreePath, repoRoot);
+  }
+}
+
 function runSliceBuild(opts: {
   git: GitBackend;
   repoRoot: string;
@@ -61,25 +82,15 @@ function runSliceBuild(opts: {
   buildCmd: string;
 }): { slice: string; output: string } | null {
   const { git, repoRoot, tmpDir, sliceLabel, sliceNum, commit, buildCmd } = opts;
-  const worktreePath = join(tmpDir, `wt-${sliceNum}`);
-  const nodeModulesSrc = join(repoRoot, "node_modules");
-  git.worktreeAdd(worktreePath, commit, repoRoot);
-  try {
-    if (existsSync(nodeModulesSrc)) {
-      // Junctions don't require elevated privileges on Windows; plain
-      // symlinks do. Elsewhere a normal dir symlink is fine.
-      symlinkSync(nodeModulesSrc, join(worktreePath, "node_modules"), platform() === "win32" ? "junction" : "dir");
-    }
+  return withWorktree({ git, repoRoot, worktreePath: join(tmpDir, `wt-${sliceNum}`), commit }, (dir) => {
     try {
-      execSync(buildCmd, { cwd: worktreePath, stdio: "pipe" });
+      execSync(buildCmd, { cwd: dir, stdio: "pipe" });
       return null;
     } catch (e: any) {
       const output = (e.stdout?.toString() ?? "") + (e.stderr?.toString() ?? "") || e.message;
       return { slice: sliceLabel, output };
     }
-  } finally {
-    git.worktreeRemove(worktreePath, repoRoot);
-  }
+  });
 }
 
 export async function verifyPerSliceBuild(opts: {

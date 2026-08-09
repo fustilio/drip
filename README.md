@@ -10,8 +10,8 @@ A tool for drip-feeding a mega branch back into main as thin, reviewable PRs. Sl
 bun install
 bun src/cli.ts plan <branch> [--repo path] [--base branch] [--timing] [--assign-ids] [--json] [--coarsen] [--target-slices n] [--emit-manifest [--manifest path] [--force]]
 bun src/cli.ts verify <branch> [--repo path] [--base branch] [--timing] [--coarsen] [--target-slices n] [--build-cmd cmd] [--no-build-check]
-bun src/cli.ts push <branch> [--repo path] [--base branch] [--projection stacked|flat-first] [--manifest path] [--build-cmd cmd] [--no-build-check] --yes | --dry-run
-bun src/cli.ts validate-plan <branch> [--manifest path] [--repo path] [--base branch] [--json]
+bun src/cli.ts push <branch> [--repo path] [--base branch] [--projection stacked|flat-first] [--manifest path] [--no-manifest-check] [--strict] [--build-cmd cmd] [--no-build-check] --yes | --dry-run
+bun src/cli.ts validate-plan <branch> [--manifest path] [--repo path] [--base branch] [--json] [--no-manifest-check] [--strict]
 bun src/cli.ts mcp
 ```
 
@@ -45,12 +45,14 @@ bun src/cli.ts mcp
         "atomicSlices": ["src/appeals/report.ts::renderReport"],
         "glue": ["src/appeals/report.ts::(file)"],
         "dependsOn": ["appeals-dto"],
-        "verification": ["bun test"]
+        "verification": ["bun run typecheck", "bun test src/appeals"]
       }
     ],
     "defer": [{ "slice": "README.md::(file)", "reason": "ships with the release notes" }]
   }
   ```
+
+  **`verification` is executed, not documented.** Each projection's commands run against *its own materialized tree* — the prerequisite closure its PR would show — so a projection that applies cleanly and reconstructs the final tree, but isn't actually runnable because it's missing a fixture, an export or a route registration, fails here rather than in review. A failure blocks `validate-plan` and refuses `push`. Results are cached by the tree they ran against, so independent projections aren't re-checked when something unrelated moves, and captured output is written to `<gitdir>/drip/verification/<branch>/` and reported by path. A projection with no commands warns unless it sets `verificationReason`; `--strict` turns every warning into a failure (useful in CI), and `--no-manifest-check` skips execution entirely for local experimentation. See `docs/adr/0019-executable-verification.md`.
 
   **Where it lives.** With no `--manifest`, `validate-plan` looks in `.drip/projections/<branch>.json` (in the working tree, committable — an approved review plan is a document a team argues about and keeps) and then `<gitdir>/drip/projections/<branch>.json` (private to the clone). `drip plan <branch> --coarsen --emit-manifest` writes a valid starting skeleton there — every slice assigned, real selectors filled in — for you or an agent to give real ids, titles and intents; it refuses to overwrite without `--force`. `push` deliberately does **not** auto-discover: a manifest left lying around must never silently change what `push --yes` sends to GitHub, so it says one exists and pushes atomic slices unless you pass `--manifest`.
 

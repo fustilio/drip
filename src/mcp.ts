@@ -91,23 +91,29 @@ server.tool(
 
 server.tool(
   "drip_validate_plan",
-  "Validate a semantic projection manifest against the current atomic slice plan. This is the write-back step for a proposed review plan: an agent reads drip_plan, groups the atomic slices into behaviourally coherent projections with intent/glue/dependsOn, and drip checks it deterministically — every slice assigned exactly once or explicitly deferred with a reason, no dependency dropped, each projection applies on its declared prerequisites, review budgets respected, and the whole graph still reconstructs the mega-branch tree. Read-only; the manifest is advisory until passed to push.",
+  "Validate a semantic projection manifest against the current atomic slice plan. This is the write-back step for a proposed review plan: an agent reads drip_plan, groups the atomic slices into behaviourally coherent projections with intent/glue/dependsOn, and drip checks it deterministically — every slice assigned exactly once or explicitly deferred with a reason, no dependency dropped, each projection applies on its declared prerequisites, review budgets respected, and the whole graph still reconstructs the mega-branch tree. Also executes each projection's declared verification commands against its own materialized tree, so a projection that applies cleanly but isn't actually runnable fails here. Read-only with respect to git and GitHub, but it does run the manifest's commands; the manifest is advisory until passed to push.",
   {
     repo: z.string(),
     branch: z.string(),
     base: z.string().default("main"),
     manifestPath: z.string().describe("path to the projections manifest JSON"),
+    runVerification: z
+      .boolean()
+      .default(true)
+      .describe("execute each projection's declared verification commands against its own materialized tree; set false to skip"),
   },
-  async ({ repo, branch, base, manifestPath }) => {
+  async ({ repo, branch, base, manifestPath, runVerification }) => {
     try {
       const repoRoot = resolveRepoRoot(git, repo);
-      const { mergeBase, plan } = await loadPlan({ git, repoRoot, branch, baseBranch: base });
+      const { db, mergeBase, plan } = await loadPlan({ git, repoRoot, branch, baseBranch: base });
       if (plan.hunks.length === 0) return textResult({ ok: true, message: "no changes — nothing to validate" });
       if (!plan.order) return textResult(planToJson(plan));
 
       const resolved = resolveManifest(plan, loadManifest(manifestPath), { branch });
-      const gitFindings = resolved.ok ? await validateManifestAgainstGit({ git, repoRoot, branch, mergeBase, plan, resolved }) : [];
-      return textResult(manifestReportToJson(resolved, gitFindings));
+      const checked = resolved.ok
+        ? await validateManifestAgainstGit({ git, repoRoot, branch, mergeBase, plan, resolved, db, runVerification })
+        : { findings: [], verification: [] };
+      return textResult(manifestReportToJson(resolved, checked.findings, checked.verification));
     } catch (e) {
       return errorResult(e);
     }
