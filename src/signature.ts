@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
-import type { Hunk } from "./planner";
+import { groupKeyOf, type Hunk } from "./planner";
 
-// See docs/adr/0006-slice-correspondence-key.md.
+// See docs/adr/0006-slice-correspondence-key.md. Uses the planner's own group
+// key so a fallback group's identity is its deterministic per-file selector,
+// not a `file::?` placeholder shared by everything tree-sitter missed.
 export function computeSliceSignature(hunks: Hunk[]): string {
-  const parts = hunks.map((h) => `${h.file}::${h.qualifiedSymbol ?? "?"}`).sort();
+  const parts = [...new Set(hunks.map(groupKeyOf))].sort();
   return createHash("sha1").update(parts.join("|")).digest("hex").slice(0, 12);
 }
 

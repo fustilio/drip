@@ -18,6 +18,15 @@ const DEF_TYPES = new Set([
   "variable_declarator",
 ]);
 
+// Why a hunk ended up in a fallback group instead of a symbol group. Reported
+// per hunk and per group so the fallback bucket is an actionable diagnostics
+// list, not a silent catch-all — see docs/adr/0015-fallback-grouping.md.
+export type FallbackReason =
+  | "dependency-manifest" // package.json / lockfile — grouped with its sibling manifest
+  | "unsupported-language" // no tree-sitter grammar for this extension (md, json, yml, ...)
+  | "unparseable" // grammar exists but the file couldn't be read or parsed
+  | "no-enclosing-symbol"; // parsed fine, but the hunk isn't inside any definition (imports, top-level statements)
+
 export type Hunk = {
   index: number;
   file: string;
@@ -29,6 +38,11 @@ export type Hunk = {
   changedText: string;
   qualifiedSymbol: string | null; // e.g. "UserService.getUser" — see docs/adr/0004-override-selector.md
   exported: boolean; // is the top-level declaration in qualifiedSymbol's chain exported? see docs/adr/0014-def-use-edge-precision.md
+  // Set only when qualifiedSymbol is null: the group key this hunk falls back
+  // to, in the same `path::selector` shape overrides already use, so a
+  // fallback group can be force_merge/force_split'd like any symbol group.
+  fallbackSelector: string | null;
+  fallbackReason: FallbackReason | null;
 };
 
 export type FileSection = { header: string; path: string; hunks: Hunk[] };
@@ -44,6 +58,15 @@ export type EdgeEvidence = {
   definitionHunk: { startLine: number; endLine: number };
 };
 
+// A slice made entirely of hunks tree-sitter couldn't map to a symbol. There
+// is no longer one global one of these — see docs/adr/0015-fallback-grouping.md.
+export type FallbackGroup = {
+  selectors: string[]; // usually one; more only if an override merged two fallback groups
+  reasons: FallbackReason[];
+  files: string[];
+  hunkCount: number;
+};
+
 export type PlanResult = {
   hunks: Hunk[];
   files: FileSection[];
@@ -52,12 +75,39 @@ export type PlanResult = {
   edgeEvidence: Map<string, EdgeEvidence[]>; // key: `${from} ${to}`
   order: string[] | null;
   idToNum: Map<string, number>;
-  ungroupedId: string;
+  fallbackGroups: Map<string, FallbackGroup>; // keyed by slice id
   ignoredOverrides: string[];
   overrides: Override[];
 };
 
-const UNGROUPED = "ungrouped";
+// The sentinel "symbol" part of a fallback group's selector. Not a real
+// symbol path — the `::` shape is what makes these selectors usable with the
+// existing `drip override add` mechanism unchanged.
+const FALLBACK_FILE = "(file)";
+const FALLBACK_DEPS = "(deps)";
+
+const LOCKFILES = new Set(["bun.lock", "bun.lockb", "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml"]);
+const MANIFESTS = new Set(["package.json"]);
+
+// Deterministic fallback group key for a non-symbol hunk: one group per file,
+// except that a package manifest and its lockfile share a group (a lockfile
+// churn is never independently reviewable from the manifest change that
+// caused it). Depends only on the path, so it survives replanning.
+function fallbackSelectorFor(path: string): { selector: string; manifest: boolean } {
+  const slash = path.lastIndexOf("/");
+  const dir = slash === -1 ? "" : path.slice(0, slash + 1);
+  const name = path.slice(slash + 1);
+  if (LOCKFILES.has(name) || MANIFESTS.has(name)) return { selector: `${dir}package.json::${FALLBACK_DEPS}`, manifest: true };
+  return { selector: `${path}::${FALLBACK_FILE}`, manifest: false };
+}
+
+// The clustering/override key for any hunk, symbol-grouped or not. One
+// definition, used by the planner's union-find and by the slice signature —
+// they must agree or correspondence drifts from the grouping it names.
+export function groupKeyOf(h: Hunk): string {
+  if (h.qualifiedSymbol) return `${h.file}::${h.qualifiedSymbol}`;
+  return h.fallbackSelector ?? `${h.file}::${FALLBACK_FILE}`;
+}
 
 export function parseDiff(diffText: string): FileSection[] {
   const sections = diffText.split(/^diff --git /m).slice(1);
@@ -96,6 +146,8 @@ export function parseDiff(diffText: string): FileSection[] {
         changedText,
         qualifiedSymbol: null,
         exported: false,
+        fallbackSelector: null,
+        fallbackReason: null,
       });
     }
     if (hunks.length) files.push({ header, path, hunks });
@@ -246,7 +298,7 @@ export async function computePlan(opts: {
       edgeEvidence: new Map(),
       order: [],
       idToNum: new Map(),
-      ungroupedId: UNGROUPED,
+      fallbackGroups: new Map(),
       ignoredOverrides: [],
       overrides,
     };
@@ -256,11 +308,18 @@ export async function computePlan(opts: {
   const langCache = new Map<string, Language | null>();
   const parser = new Parser();
 
+  // Why each file yielded no symbol for a hunk — the input to the fallback
+  // reason each unassigned hunk is reported with.
+  const fileState = new Map<string, "parsed" | "unsupported-language" | "unparseable">();
+
   for (const file of files) {
     const ext = file.path.slice(file.path.lastIndexOf("."));
     if (!langCache.has(ext)) langCache.set(ext, await loadLanguageFor(file.path));
     const lang = langCache.get(ext)!;
-    if (!lang) continue;
+    if (!lang) {
+      fileState.set(file.path, "unsupported-language");
+      continue;
+    }
 
     let content: string;
     try {
@@ -269,13 +328,18 @@ export async function computePlan(opts: {
       try {
         content = git.show(mergeBase, file.path, repoRoot);
       } catch {
+        fileState.set(file.path, "unparseable");
         continue;
       }
     }
 
     parser.setLanguage(lang);
     const tree = parser.parse(content);
-    if (!tree) continue;
+    if (!tree) {
+      fileState.set(file.path, "unparseable");
+      continue;
+    }
+    fileState.set(file.path, "parsed");
 
     for (const hunk of file.hunks) {
       const start = hunk.newLines > 0 ? hunk.newStart : hunk.oldStart;
@@ -291,19 +355,28 @@ export async function computePlan(opts: {
     }
   }
 
-  const groupKey = (h: Hunk) => `${h.file}::${h.qualifiedSymbol}`;
+  // Every hunk tree-sitter couldn't place gets a deterministic fallback group
+  // key instead of being swept into one global `ungrouped` slice (issue #7).
+  for (const h of allHunks) {
+    if (h.qualifiedSymbol) continue;
+    const { selector, manifest } = fallbackSelectorFor(h.file);
+    const state = fileState.get(h.file) ?? "unsupported-language";
+    h.fallbackSelector = selector;
+    h.fallbackReason = manifest ? "dependency-manifest" : state === "parsed" ? "no-enclosing-symbol" : state;
+  }
 
   const forceSplit = new Set(overrides.filter((o) => o.kind === "force_split").map((o) => o.selectorA));
   const forceMerge = overrides.filter((o) => o.kind === "force_merge" && o.selectorB);
   const matchedSelectors = new Set<string>();
 
-  // Co-modification clustering: same file + same qualified symbol unions hunks,
-  // unless pinned apart by a force_split override.
+  // Co-modification clustering: same group key (same file + same qualified
+  // symbol, or same fallback group) unions hunks, unless pinned apart by a
+  // force_split override. Fallback groups go through the same union-find as
+  // symbol groups, so overrides work on them without a second mechanism.
   const uf = new UnionFind(allHunks.length);
   const byGroup = new Map<string, number[]>();
   for (const h of allHunks) {
-    if (!h.qualifiedSymbol) continue;
-    const key = groupKey(h);
+    const key = groupKeyOf(h);
     if (forceSplit.has(key)) {
       matchedSelectors.add(key);
       continue; // never unions with siblings — stays its own slice
@@ -316,8 +389,8 @@ export async function computePlan(opts: {
 
   // force_merge overrides: union whichever hunks match either selector.
   for (const o of forceMerge) {
-    const a = allHunks.filter((h) => h.qualifiedSymbol && groupKey(h) === o.selectorA);
-    const b = allHunks.filter((h) => h.qualifiedSymbol && groupKey(h) === o.selectorB);
+    const a = allHunks.filter((h) => groupKeyOf(h) === o.selectorA);
+    const b = allHunks.filter((h) => groupKeyOf(h) === o.selectorB);
     if (a.length) matchedSelectors.add(o.selectorA);
     if (b.length) matchedSelectors.add(o.selectorB!);
     if (a.length && b.length) uf.union(a[0]!.index, b[0]!.index);
@@ -340,7 +413,7 @@ export async function computePlan(opts: {
     definersByName.set(key, list);
   }
 
-  const sliceOf = (h: Hunk) => (h.qualifiedSymbol ? String(uf.find(h.index)) : UNGROUPED);
+  const sliceOf = (h: Hunk) => String(uf.find(h.index));
 
   const sliceEdges = new Map<string, EdgeEvidence[]>();
   const hunkLoc = (h: Hunk) => ({ startLine: h.newStart, endLine: h.newStart + Math.max(h.newLines, 1) - 1 });
@@ -388,7 +461,21 @@ export async function computePlan(opts: {
   const numberingOrder = order ?? [...slices.keys()];
   const idToNum = new Map(numberingOrder.map((id, i) => [id, i]));
 
-  return { hunks: allHunks, files, slices, edges, edgeEvidence: sliceEdges, order, idToNum, ungroupedId: UNGROUPED, ignoredOverrides, overrides };
+  // A slice is a fallback group only if *every* hunk in it is unassigned — an
+  // override that merges a fallback group into a symbol slice makes it an
+  // ordinary slice, not a fallback one.
+  const fallbackGroups = new Map<string, FallbackGroup>();
+  for (const [id, hunks] of slices) {
+    if (hunks.some((h) => h.qualifiedSymbol)) continue;
+    fallbackGroups.set(id, {
+      selectors: [...new Set(hunks.map((h) => groupKeyOf(h)))].sort(),
+      reasons: [...new Set(hunks.map((h) => h.fallbackReason!))].sort(),
+      files: [...new Set(hunks.map((h) => h.file))].sort(),
+      hunkCount: hunks.length,
+    });
+  }
+
+  return { hunks: allHunks, files, slices, edges, edgeEvidence: sliceEdges, order, idToNum, fallbackGroups, ignoredOverrides, overrides };
 }
 
 // Strongly-connected components (Tarjan) restricted to components with more
@@ -477,33 +564,68 @@ export function planToJson(plan: PlanResult): object {
   const order = displayOrder(plan);
   const slices = order.map((id) => {
     const hunks = plan.slices.get(id)!.sort((a, b) => a.newStart - b.newStart);
+    const fallback = plan.fallbackGroups.get(id);
     return {
       slice: `slice${plan.idToNum.get(id)}`,
-      ungrouped: id === plan.ungroupedId,
+      fallback: fallback ? { selectors: fallback.selectors, reasons: fallback.reasons } : null,
       files: [...new Set(hunks.map((h) => h.file))],
       symbols: [...new Set(hunks.map((h) => h.qualifiedSymbol).filter((s): s is string => !!s))],
-      hunks: hunks.map((h) => ({ file: h.file, startLine: h.newStart, endLine: h.newStart + Math.max(h.newLines, 1) - 1 })),
+      hunks: hunks.map((h) => ({
+        file: h.file,
+        startLine: h.newStart,
+        endLine: h.newStart + Math.max(h.newLines, 1) - 1,
+        ...(h.qualifiedSymbol ? {} : { fallbackReason: h.fallbackReason, fallbackSelector: h.fallbackSelector }),
+      })),
     };
   });
   const edges = plan.edges.map(([from, to]) => ({ from: `slice${plan.idToNum.get(from)}`, dependsOn: `slice${plan.idToNum.get(to)}` }));
 
+  // Actionable diagnostics list, not a silent catch-all (issue #7): every
+  // unassigned hunk is accounted for here with the reason it landed in a
+  // fallback group and the selector that can override it.
+  const fallbackGroups = order
+    .filter((id) => plan.fallbackGroups.has(id))
+    .map((id) => ({ slice: `slice${plan.idToNum.get(id)}`, ...plan.fallbackGroups.get(id)! }));
+
   if (!plan.order) {
-    return { ok: false, error: "dependency cycle in slice DAG", slices, edges, cycles: computeCycleDiagnostics(plan), unmatchedOverrideSelectors: plan.ignoredOverrides };
+    return {
+      ok: false,
+      error: "dependency cycle in slice DAG",
+      slices,
+      edges,
+      fallbackGroups,
+      cycles: computeCycleDiagnostics(plan),
+      unmatchedOverrideSelectors: plan.ignoredOverrides,
+    };
   }
-  return { ok: true, slices, edges, unmatchedOverrideSelectors: plan.ignoredOverrides };
+  return { ok: true, slices, edges, fallbackGroups, unmatchedOverrideSelectors: plan.ignoredOverrides };
 }
 
 export function printPlan(plan: PlanResult): void {
   const order = displayOrder(plan);
   console.log("SLICES:");
   for (const id of order) {
-    console.log(`  slice${plan.idToNum.get(id)}${id === plan.ungroupedId ? " (ungrouped)" : ""}:`);
+    const fallback = plan.fallbackGroups.get(id);
+    console.log(`  slice${plan.idToNum.get(id)}${fallback ? ` (fallback: ${fallback.reasons.join(", ")})` : ""}:`);
     for (const h of plan.slices.get(id)!.sort((a, b) => a.newStart - b.newStart)) {
       console.log(`    ${h.file}:${h.newStart}-${h.newStart + Math.max(h.newLines, 1) - 1}`);
     }
   }
   console.log("\nEDGES:");
   for (const [from, to] of plan.edges) console.log(`  slice${plan.idToNum.get(from)} depends-on slice${plan.idToNum.get(to)}`);
+
+  if (plan.fallbackGroups.size) {
+    console.log("\nFALLBACK GROUPS (no enclosing symbol — override with these selectors):");
+    for (const id of order) {
+      const fallback = plan.fallbackGroups.get(id);
+      if (!fallback) continue;
+      console.log(
+        `  slice${plan.idToNum.get(id)}: ${fallback.hunkCount} hunk(s), ${fallback.files.length} file(s) — ${fallback.reasons.join(", ")}`,
+      );
+      for (const s of fallback.selectors) console.log(`    ${s}`);
+    }
+  }
+
   if (plan.ignoredOverrides.length) {
     console.log("\nWARNINGS:");
     for (const s of plan.ignoredOverrides) console.log(`  override selector matched nothing in this diff: ${s}`);

@@ -37,8 +37,8 @@ test("shared helper falls out as its own slice; both callers depend on it indepe
   const plan = await computePlan({ git: backend, repoRoot, branch: "feature", baseBranch: "main" });
   expect(plan.order).not.toBeNull();
 
-  const nonUngrouped = [...plan.slices.keys()].filter((id) => id !== plan.ungroupedId);
-  expect(nonUngrouped.length).toBe(3);
+  const symbolSlices = [...plan.slices.keys()].filter((id) => !plan.fallbackGroups.has(id));
+  expect(symbolSlices.length).toBe(3);
 
   const helperSlice = sliceContaining(plan, "src/helper.ts");
   const aSlice = sliceContaining(plan, "src/a.ts");
@@ -166,6 +166,89 @@ test("issue #5: same-named unexported local helpers in different files don't cre
     const twoSlice = sliceContaining(plan, "two.test.ts");
     expect(plan.edges).not.toContainEqual([oneSlice, twoSlice]);
     expect(plan.edges).not.toContainEqual([twoSlice, oneSlice]);
+  } finally {
+    cleanup();
+  }
+});
+
+test("issue #7: non-symbol hunks form per-file fallback groups, not one global ungrouped bucket", async () => {
+  const { repoRoot: fbRoot, cleanup } = makeTempRepo("drip-planner-test-fallback-");
+  try {
+    writeFileSync(join(fbRoot, "package.json"), `{\n  "name": "x",\n  "version": "1.0.0"\n}\n`);
+    writeFileSync(join(fbRoot, "bun.lock"), `lockfileVersion: 1\ndeps: []\n`);
+    writeFileSync(join(fbRoot, "README.md"), `# x\n\nsome docs\n`);
+    writeFileSync(join(fbRoot, ".gitignore"), `node_modules\n`);
+    writeFileSync(
+      join(fbRoot, "app.ts"),
+      // The import sits far enough from the function that git emits two
+      // separate hunks — one top-level, one inside the symbol.
+      `import { readFile } from "node:fs";\n\nconst PAD1 = 1;\nconst PAD2 = 2;\nconst PAD3 = 3;\nconst PAD4 = 4;\nconst PAD5 = 5;\nconst PAD6 = 6;\n\nexport function load() {\n  return readFile;\n}\n`,
+    );
+    commit(fbRoot, "init");
+
+    git(["checkout", "-q", "-b", "feature"], fbRoot);
+    writeFileSync(join(fbRoot, "package.json"), `{\n  "name": "x",\n  "version": "1.1.0"\n}\n`);
+    writeFileSync(join(fbRoot, "bun.lock"), `lockfileVersion: 1\ndeps: ["a"]\n`);
+    writeFileSync(join(fbRoot, "README.md"), `# x\n\nsome other docs\n`);
+    writeFileSync(join(fbRoot, ".gitignore"), `node_modules\ndist\n`);
+    writeFileSync(
+      join(fbRoot, "app.ts"),
+      `import { writeFile } from "node:fs";\n\nconst PAD1 = 1;\nconst PAD2 = 2;\nconst PAD3 = 3;\nconst PAD4 = 4;\nconst PAD5 = 5;\nconst PAD6 = 6;\n\nexport function load() {\n  return writeFile;\n}\n`,
+    );
+    commit(fbRoot, "unrelated non-symbol changes");
+
+    const plan = await computePlan({ git: backend, repoRoot: fbRoot, branch: "feature", baseBranch: "main" });
+    expect(plan.order).not.toBeNull();
+
+    const groups = [...plan.fallbackGroups.values()];
+    const filesOf = (selector: string) => groups.find((g) => g.selectors.includes(selector))?.files;
+
+    // The core of the issue: unrelated fallback material is not one slice.
+    expect(groups.length).toBe(4);
+
+    // Manifest + lockfile share a group; nothing else joins them.
+    expect(filesOf("package.json::(deps)")).toEqual(["bun.lock", "package.json"]);
+    // Docs, gitignore and the top-level import hunk are each their own group.
+    expect(filesOf("README.md::(file)")).toEqual(["README.md"]);
+    expect(filesOf(".gitignore::(file)")).toEqual([".gitignore"]);
+    expect(filesOf("app.ts::(file)")).toEqual(["app.ts"]);
+
+    const reasonFor = (selector: string) => groups.find((g) => g.selectors.includes(selector))?.reasons;
+    expect(reasonFor("package.json::(deps)")).toEqual(["dependency-manifest"]);
+    expect(reasonFor("README.md::(file)")).toEqual(["unsupported-language"]);
+    expect(reasonFor("app.ts::(file)")).toEqual(["no-enclosing-symbol"]);
+
+    // Fallback identity is derived from the path alone, so it survives a replan.
+    const replanned = await computePlan({ git: backend, repoRoot: fbRoot, branch: "feature", baseBranch: "main" });
+    expect([...replanned.fallbackGroups.values()].map((g) => g.selectors).sort()).toEqual(groups.map((g) => g.selectors).sort());
+  } finally {
+    cleanup();
+  }
+});
+
+test("issue #7: a fallback group can be force_merged into the symbol slice it belongs with", async () => {
+  const { repoRoot: mergeRoot, cleanup } = makeTempRepo("drip-planner-test-fallback-override-");
+  try {
+    writeFileSync(join(mergeRoot, "README.md"), `# x\n`);
+    writeFileSync(join(mergeRoot, "app.ts"), `export function load() {\n  return 1;\n}\n`);
+    commit(mergeRoot, "init");
+
+    git(["checkout", "-q", "-b", "feature"], mergeRoot);
+    writeFileSync(join(mergeRoot, "README.md"), `# x\n\ndocumented\n`);
+    writeFileSync(join(mergeRoot, "app.ts"), `export function load() {\n  return 2;\n}\n`);
+    commit(mergeRoot, "docs + code");
+
+    const plan = await computePlan({
+      git: backend,
+      repoRoot: mergeRoot,
+      branch: "feature",
+      baseBranch: "main",
+      overrides: [{ kind: "force_merge", selectorA: "README.md::(file)", selectorB: "app.ts::load", note: null }],
+    });
+    expect(plan.ignoredOverrides).toEqual([]);
+    expect(sliceContaining(plan, "README.md")).toBe(sliceContaining(plan, "app.ts"));
+    // Merged into a symbol slice, it is no longer reported as a fallback group.
+    expect(plan.fallbackGroups.size).toBe(0);
   } finally {
     cleanup();
   }
