@@ -1,12 +1,11 @@
-import { existsSync } from "node:fs";
-import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { GitBackend } from "./git-backend";
 import type { CoarsenResult } from "./coarsen";
 import { computePlan, type Hunk, type PlanResult } from "./planner";
 import { resolveDiffSource, type DiffSource } from "./source";
 import { listOverrides, openStore } from "./store";
-import { DEFAULT_BUILD_CMD, verifyPerSliceBuild, verifyTreeHash, type TreeHashResult, type BuildCheckResult } from "./verify";
+import { verifyPerSliceBuild, verifyTreeHash, type TreeHashResult, type BuildCheckResult } from "./verify";
+import { discoverWorkspaceChecks, type WorkspaceChecks } from "./workspace";
 
 // The "load a plan" step -- merge-base, store, overrides, computePlan -- was
 // duplicated three ways (cli.ts's plan/verify/push shared one call, but
@@ -65,10 +64,15 @@ export function projectedUnits(plan: PlanResult, coarse: CoarsenResult | null): 
   return { order: coarse.order, slices, idToNum: new Map(coarse.order.map((label, i) => [label, i])) };
 }
 
-// Three states, not two: "--no-build-check was passed" and "no tsconfig.json
-// and no --build-cmd" both mean no build ran, but cli.ts prints a different
-// (or no) line for each -- collapsing them to one null would lose that.
-export type BuildOutcome = { kind: "disabled" } | { kind: "no-command" } | { kind: "ran"; buildCmd: string; result: BuildCheckResult };
+// Three states, not two: "--no-build-check was passed" and "nothing runnable
+// was found and no --build-cmd was given" both mean no build ran, but cli.ts
+// prints a different (or no) line for each -- collapsing them to one null
+// would lose that. "no-command" carries what the repo *does* offer, so the
+// skip can name the alternatives instead of just disappearing (issue #14).
+export type BuildOutcome =
+  | { kind: "disabled" }
+  | { kind: "no-command"; checks: WorkspaceChecks }
+  | { kind: "ran"; buildCmd: string; source: "override" | "root-tsconfig" | "root-script"; result: BuildCheckResult };
 
 // The tree-hash invariant + per-slice build check, as one structured result
 // instead of interleaved console output. Precondition: plan.hunks.length > 0
@@ -105,8 +109,14 @@ export async function runVerify(opts: {
 
   if (noBuildCheck) return { pass: tree.pass, tree, build: { kind: "disabled" } };
 
-  const buildCmd = buildCmdOverride ?? (existsSync(join(repoRoot, "tsconfig.json")) ? DEFAULT_BUILD_CMD : null);
-  if (!buildCmd) return { pass: tree.pass, tree, build: { kind: "no-command" } };
+  // A root tsconfig is no longer the only thing that counts: a workspace whose
+  // tsconfigs live one directory down still names its own typecheck in a root
+  // script, and silently skipping there is what issue #14 is about. drip runs
+  // what the repo declared for itself and composes nothing.
+  const checks = discoverWorkspaceChecks(repoRoot);
+  const buildCmd = buildCmdOverride ?? checks.rootCommand?.command ?? null;
+  if (!buildCmd) return { pass: tree.pass, tree, build: { kind: "no-command", checks } };
+  const source = buildCmdOverride ? ("override" as const) : checks.rootCommand!.source;
 
   const result = await verifyPerSliceBuild({
     git,
@@ -121,5 +131,5 @@ export async function runVerify(opts: {
     buildCmd,
     label: opts.coarsen || opts.units ? (id: string) => id : undefined, // projection ids are already their labels
   });
-  return { pass: tree.pass && result.failures.length === 0, tree, build: { kind: "ran", buildCmd, result } };
+  return { pass: tree.pass && result.failures.length === 0, tree, build: { kind: "ran", buildCmd, source, result } };
 }

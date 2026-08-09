@@ -35,6 +35,7 @@ import { resolveRepoRoot } from "./repo";
 import { describeSource, sourceToJson } from "./source";
 import { addOverride, deleteCorrespondence, listOverrides, openStore, recordTiming, removeOverride } from "./store";
 import type { VerificationRun } from "./verification";
+import { describeWorkspaceChecks, discoverWorkspaceChecks } from "./workspace";
 import { loadPlan, runVerify } from "./workflow";
 
 function usage(): never {
@@ -42,12 +43,12 @@ function usage(): never {
     "usage: drip plan <branch>|--worktree [--repo path] [--base branch] [--timing] [--assign-ids] [--json] [--coarsen] [--target-slices n] [--emit-manifest [--manifest path] [--force]]",
   );
   console.error("       drip verify <branch>|--worktree [--repo path] [--base branch] [--timing] [--coarsen] [--target-slices n] [--build-cmd cmd] [--no-build-check]");
-  console.error("       drip validate-plan <branch> [--manifest path] [--repo path] [--base branch] [--json] [--no-manifest-check] [--strict]");
+  console.error("       drip validate-plan <branch> [--manifest path] [--repo path] [--base branch] [--json] [--no-manifest-check] [--strict] [--require-verification]");
   console.error(
-    "       drip materialize <branch> [--manifest path] [--repo path] [--base branch] [--projection flat-first|stacked] [--only id[,id]] [--output dir] [--force] [--json] [--no-manifest-check] [--strict]",
+    "       drip materialize <branch> [--manifest path] [--repo path] [--base branch] [--projection flat-first|stacked] [--only id[,id]] [--output dir] [--force] [--json] [--no-manifest-check] [--strict] [--require-verification]",
   );
   console.error(
-    "       drip push <branch> [--repo path] [--base branch] [--projection stacked|flat-first] [--manifest path] [--no-manifest-check] [--strict] [--draft] [--build-cmd cmd] [--no-build-check] --yes | --dry-run",
+    "       drip push <branch> [--repo path] [--base branch] [--projection stacked|flat-first] [--manifest path] [--no-manifest-check] [--strict] [--require-verification] [--reviewable-stack] [--draft] [--build-cmd cmd] [--no-build-check] --yes | --dry-run",
   );
   console.error(
     "       drip override add <branch> --kind force_merge|force_split --selector-a file::Symbol [--selector-b file::Symbol] [--note text] [--repo path]",
@@ -84,7 +85,15 @@ function printVerifyResult(result: Awaited<ReturnType<typeof runVerify>>, sliceC
   const { build } = result;
   if (build.kind === "disabled") return;
   if (build.kind === "no-command") {
-    console.log("BUILD CHECK: skipped (no tsconfig.json found — use --build-cmd to specify one)");
+    // Never just "skipped". A vanished build check is how a projection that
+    // reconstructs the tree but doesn't compile reaches a PR (issue #14), so
+    // the line says what's missing and what this repo offers instead.
+    console.log(
+      `BUILD CHECK: skipped — no root tsconfig.json and no root \`typecheck\` script${build.checks.isJsWorkspace ? "" : " (not a JS/TS workspace)"}.`,
+    );
+    console.log("  A projection can reconstruct the mega branch's tree and still not compile on its own — pass --build-cmd, or give each");
+    console.log("  projection a `verification` command (`--require-verification` makes that mandatory for projections containing code).");
+    for (const line of describeWorkspaceChecks(build.checks)) console.log(`  ${line}`);
     return;
   }
 
@@ -99,7 +108,7 @@ function printVerifyResult(result: Awaited<ReturnType<typeof runVerify>>, sliceC
       if (lines.length > shown.length) console.log(`    ... (${lines.length - shown.length} more lines)`);
     }
   } else {
-    console.log(`BUILD CHECK: PASS (\`${build.buildCmd}\`, ${sliceCount} slices${skipNote})`);
+    console.log(`BUILD CHECK: PASS (\`${build.buildCmd}\`${build.source === "root-script" ? " — the repo's own root typecheck script" : ""}, ${sliceCount} slices${skipNote})`);
   }
 }
 
@@ -186,11 +195,13 @@ async function checkManifest(opts: {
   db: ReturnType<typeof openStore>;
   manifestPath: string;
   runVerification: boolean;
+  /** a projection containing code must declare a runnable check (issue #14) */
+  requireVerification: boolean;
   /** what the projections must reconstruct — the working tree under --worktree */
   sourceRef?: string;
 }) {
   const { git, repoRoot, branch, mergeBase, plan, db, sourceRef } = opts;
-  const resolved = resolveManifest(plan, loadManifest(opts.manifestPath), { branch });
+  const resolved = resolveManifest(plan, loadManifest(opts.manifestPath), { branch, requireVerification: opts.requireVerification });
   const checked = resolved.ok
     ? await validateManifestAgainstGit({ git, repoRoot, branch, mergeBase, plan, resolved, db, sourceRef, runVerification: opts.runVerification })
     : { findings: [] as Finding[], verification: [] as VerificationRun[] };
@@ -308,6 +319,10 @@ async function main() {
       "dry-run": { type: "boolean", default: false },
       yes: { type: "boolean", default: false },
       draft: { type: "boolean", default: false },
+      // issue #14: two guards between "a valid patch DAG" and "a reviewable,
+      // CI-verifiable GitHub stack".
+      "require-verification": { type: "boolean", default: false },
+      "reviewable-stack": { type: "boolean", default: false },
       // `materialize` only: which projections to write, and where to check
       // them out. Repeatable and comma-separated both work.
       only: { type: "string", multiple: true },
@@ -417,6 +432,7 @@ async function main() {
       manifestPath,
       sourceRef: source.ref,
       runVerification: !values["no-manifest-check"],
+      requireVerification: !!values["require-verification"],
     });
     const failed = manifestFailed(resolved, checked.findings, !!values.strict);
 
@@ -536,6 +552,7 @@ async function main() {
       manifestPath: values.manifest,
       sourceRef: source.ref,
       runVerification: !values["no-manifest-check"],
+      requireVerification: !!values["require-verification"],
     });
     printManifestReport(resolved, checked.findings, checked.verification, !!values.strict);
     if (manifestFailed(resolved, checked.findings, !!values.strict)) {
@@ -587,17 +604,32 @@ async function main() {
   }
 
   const draft = !!values.draft;
-  const results = await push({ git, db, repoRoot, branch, baseBranch, mergeBase, plan, dryRun, projection, units: manifestUnits, draft });
-  const mode = `${projection}${manifestUnits ? ", manifest" : ""}${draft ? ", draft" : ""}`;
+  const reviewableStack = !!values["reviewable-stack"];
+  const results = await push({ git, db, repoRoot, branch, baseBranch, mergeBase, plan, dryRun, projection, units: manifestUnits, draft, reviewableStack });
+  const mode = `${projection}${manifestUnits ? ", manifest" : ""}${draft ? ", draft" : ""}${reviewableStack ? ", reviewable-stack" : ""}`;
   console.log(dryRun ? `\nDRY RUN (${mode}, no branches pushed, no PRs created):` : `\nPUSHED (${mode}):`);
   for (const r of results) {
     // The draft state is only ever printed for a PR this run opens, so a
     // dry-run says "would open a draft" and a re-run over an existing PR
     // says nothing rather than implying it changed anything.
     const state = r.draft === null ? "" : r.draft ? " (draft)" : " (ready for review)";
-    console.log(`  ${r.sliceLabel} -> ${r.branchName} [${r.status}]${state} base: ${r.base}${r.prUrl ? ` ${r.prUrl}` : ""}`);
+    const base = r.hiddenBase ? `${r.base} (generated, not reviewable on GitHub)` : r.base;
+    console.log(`  ${r.sliceLabel} -> ${r.branchName} [${r.status}]${state} base: ${base}${r.prUrl ? ` ${r.prUrl}` : ""}`);
     if (r.note) console.log(`      ${r.note}`);
   }
+
+  // A generated integration base merges fine and reviews terribly, so it is
+  // called out as a group rather than left to be spotted per line (issue #14).
+  const hidden = results.filter((r) => r.hiddenBase);
+  if (hidden.length) {
+    console.log(
+      `\n${hidden.length} PR(s) target a generated integration base with no PR of its own: ${hidden.map((r) => r.base).join(", ")}.\n` +
+        "  Reviewers can't walk those prerequisites as a stack, and a workflow filtered on the base branch (e.g. `pull_request.branches: [main]`)\n" +
+        "  won't run CI on them. Re-run with --reviewable-stack to refuse instead, then merge those prerequisites into one projection or\n" +
+        "  declare a projection that depends on them.",
+    );
+  }
+
   const blocked = results.filter((r) => r.status === "blocked");
   if (blocked.length) {
     console.error(`\n${blocked.length} slice(s) blocked — not pushed. See the notes above.`);

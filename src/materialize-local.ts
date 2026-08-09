@@ -233,7 +233,11 @@ export async function materializeProjections(opts: {
     } else if (flat!.integrationCommit) {
       integrationRef = `${ref}-base`;
       base = integrationRef;
-      baseNote = `integration base unions ${flat!.prerequisites.join(", ")}`;
+      // Worth knowing before pushing, which is the whole point of previewing:
+      // on GitHub this base is a branch with no PR (issue #14).
+      baseNote =
+        `integration base unions ${flat!.prerequisites.join(", ")} — generated, and on GitHub it would have no PR of its own, ` +
+        "so `push --reviewable-stack` refuses it";
     } else if (flat!.baseSliceId) {
       base = refOf(flat!.baseSliceId);
     } else {

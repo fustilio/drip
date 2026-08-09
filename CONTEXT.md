@@ -58,6 +58,14 @@ A small non-feature change a projection needs to stay buildable and testable: an
 **Defer**:
 An explicit decision that an atomic slice lands in no projection *for now*, recorded with a reason. Deferred slices are excluded from what's pushed but still included in the tree-hash check, so deferral decides which PR something lands in and never whether it survives.
 
+**Reviewable stack**:
+A PR graph in which every base is a branch that has a PR on it. `--projection flat-first`'s generated integration base breaks that: it unions several prerequisites into a minted branch with no PR, so reviewers can't walk the prerequisites and a workflow filtered on the base branch never runs. Always reported; refused outright under `push --reviewable-stack`, whose remedy is to merge those prerequisites into one projection or declare one they all sit under. See docs/adr/0023.
+_Avoid_: stack (bare — `--projection stacked` is a different axis entirely)
+
+**Runnable check**:
+A command that was actually executed against a projection's own materialized tree. Distinct from a stated intention: `verificationReason` records a decision not to check, and under `--require-verification` that decision may not cover a projection containing code. drip only ever runs a check the repository named for itself — a root `tsconfig.json`, a root `typecheck` script, or a manifest `verification` entry — and merely *offers* the per-package scripts it discovers, since composing a workspace invocation and then failing someone's push on the result is a guess with consequences. See docs/adr/0023.
+_Avoid_: build check (that's the per-slice compiler run specifically), CI
+
 **Tree-hash invariant**:
 The core correctness check: `apply(slices in topological order) == tree(mega branch)`, verified by comparing git tree hashes.
 

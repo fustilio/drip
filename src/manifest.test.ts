@@ -364,6 +364,42 @@ test("a passing command is cached by tree, and skipping is explicit", async () =
   expect(skipped.verification).toEqual([]);
 });
 
+// --- issue #14: a reason is not a check ---------------------------------------
+//
+// The fixture's projections all set verificationReason, which is exactly the
+// shape that reached a real repo as draft PRs that reconstructed the tree and
+// did not typecheck.
+
+test("--require-verification refuses a verificationReason on a projection containing code", async () => {
+  const resolved = resolveManifest(await plan(), manifest(), { branch: "feature", requireVerification: true });
+  const waived = resolved.findings.filter((f) => f.code === "verification-waived");
+
+  // formatter, report and inbox are code; docs is a README and stays exempt.
+  expect(waived.map((f) => f.projection).sort()).toEqual(["formatter", "inbox", "report"]);
+  expect(waived.every((f) => f.severity === "error")).toBe(true);
+  expect(waived[0]!.message).toContain("verificationReason");
+  expect(resolved.ok).toBe(false);
+});
+
+test("--require-verification is satisfied by a real command, and off by default", async () => {
+  const m = manifest();
+  for (const projection of m.projections) {
+    if (projection.id !== "docs") projection.verification = ["bun run typecheck"];
+  }
+  expect(resolveManifest(await plan(), m, { branch: "feature", requireVerification: true }).findings).toEqual([]);
+  // Without the flag the same manifest that failed above passes, unchanged.
+  expect(resolveManifest(await plan(), manifest(), { branch: "feature" }).ok).toBe(true);
+});
+
+test("--require-verification leaves a docs-only projection alone, reason or not", async () => {
+  const m = manifest();
+  m.projections.find((x) => x.id === "docs")!.verificationReason = null;
+  const resolved = resolveManifest(await plan(), m, { branch: "feature", requireVerification: true });
+  // A README has nothing for a typecheck to have an opinion about, so it gets
+  // the ordinary warning rather than the new error.
+  expect(resolved.findings.filter((f) => f.projection === "docs").map((f) => f.code)).toEqual(["no-verification"]);
+});
+
 test("declaring no checks warns, and --strict turns that warning into a failure", async () => {
   const m = manifest();
   m.projections.find((x) => x.id === "docs")!.verificationReason = null;

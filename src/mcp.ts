@@ -124,15 +124,19 @@ server.tool(
       .boolean()
       .default(true)
       .describe("execute each projection's declared verification commands against its own materialized tree; set false to skip"),
+    requireVerification: z
+      .boolean()
+      .default(false)
+      .describe("fail any projection that contains code and declares no verification command, even if it gives a verificationReason"),
   },
-  async ({ repo, branch, base, manifestPath, runVerification }) => {
+  async ({ repo, branch, base, manifestPath, runVerification, requireVerification }) => {
     try {
       const repoRoot = resolveRepoRoot(git, repo);
       const { db, mergeBase, plan } = await loadPlan({ git, repoRoot, branch, baseBranch: base });
       if (plan.hunks.length === 0) return textResult({ ok: true, message: "no changes — nothing to validate" });
       if (!plan.order) return textResult(planToJson(plan));
 
-      const resolved = resolveManifest(plan, loadManifest(manifestPath), { branch });
+      const resolved = resolveManifest(plan, loadManifest(manifestPath), { branch, requireVerification });
       const checked = resolved.ok
         ? await validateManifestAgainstGit({ git, repoRoot, branch, mergeBase, plan, resolved, db, runVerification })
         : { findings: [], verification: [] };

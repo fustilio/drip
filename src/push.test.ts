@@ -182,7 +182,7 @@ test("draft: an existing PR keeps its own state — nothing is set, and the flag
 // Fixture DAG: `shared` and `other` are independent roots; featureA depends on
 // `shared` alone; featureC depends on both.
 
-function makeFlatFixture() {
+function makeFlatFixture(opts: { withDependent?: boolean } = {}) {
   const { repoRoot: root, cleanup: cleanupRoot } = makeTempRepo("drip-push-flat-");
   const { remoteRoot: remote, cleanup: cleanupRemote } = makeBareRemote("drip-push-flat-remote-");
   git(["remote", "add", "origin", remote], root);
@@ -199,6 +199,13 @@ function makeFlatFixture() {
     join(root, "c.ts"),
     `import { shared } from "./helper";\nimport { other } from "./helper2";\n\nexport function featureC() {\n  return shared(1) + other(2);\n}\n`,
   );
+  // A slice whose only prerequisite is featureC — i.e. one that sits *above*
+  // the projection with the integration base. Used to check that refusing to
+  // push featureC refuses this too, rather than opening a PR against a branch
+  // that was never pushed.
+  if (opts.withDependent) {
+    writeFileSync(join(root, "d.ts"), `import { featureC } from "./c";\n\nexport function featureD() {\n  return featureC() + 1;\n}\n`);
+  }
   commit(root, "feature");
 
   return {
@@ -211,12 +218,23 @@ function makeFlatFixture() {
   };
 }
 
-async function runFlatPush(root: string, projection: "stacked" | "flat-first") {
+async function runFlatPush(root: string, projection: "stacked" | "flat-first", opts: { reviewableStack?: boolean } = {}) {
   const { push } = await import("./push");
   using db = openStore(root);
   const plan = await computePlan({ git: backend, repoRoot: root, branch: "feature", baseBranch: "main" });
   const mergeBase = backend.mergeBase("main", "feature", root);
-  const results = await push({ git: backend, db, repoRoot: root, branch: "feature", baseBranch: "main", mergeBase, plan, dryRun: false, projection });
+  const results = await push({
+    git: backend,
+    db,
+    repoRoot: root,
+    branch: "feature",
+    baseBranch: "main",
+    mergeBase,
+    plan,
+    dryRun: false,
+    projection,
+    reviewableStack: opts.reviewableStack,
+  });
   // Index results by a file the slice touches, so assertions don't depend on
   // slice numbering.
   const byFile = new Map<string, (typeof results)[number]>();
@@ -303,6 +321,72 @@ test("re-running in the same projection is still a no-op: no re-push, no re-targ
     expect(results.every((r) => r.status === "unchanged")).toBe(true);
     expect(ghPrSetBase).not.toHaveBeenCalled();
     expect(ghCreatePr).not.toHaveBeenCalled();
+  } finally {
+    cleanup();
+  }
+});
+
+// --- issue #14: hidden integration bases -------------------------------------
+
+test("a generated integration base is flagged as not reviewable on GitHub", async () => {
+  const { root, cleanup } = makeFlatFixture();
+  try {
+    const { results, byFile } = await runFlatPush(root, "flat-first");
+    const c = byFile.get("c.ts")!;
+    // Two prerequisites, so drip mints a branch that has no PR of its own.
+    expect(c.base).toBe(`${c.branchName}-base`);
+    expect(c.hiddenBase).toBe(true);
+    expect(c.note).toContain("not directly reviewable on GitHub");
+    expect(c.note).toContain("won't run CI");
+    // Everything targeting a real branch or the base branch is unaffected.
+    expect(results.filter((r) => r.hiddenBase)).toHaveLength(1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("--reviewable-stack refuses the hidden base instead of pushing it", async () => {
+  const { root, remote, cleanup } = makeFlatFixture();
+  try {
+    const { byFile } = await runFlatPush(root, "flat-first", { reviewableStack: true });
+    const c = byFile.get("c.ts")!;
+    expect(c.status).toBe("blocked");
+    expect(c.hiddenBase).toBe(false);
+    expect(c.note).toContain("--reviewable-stack");
+    // Refused means refused: no branch, no integration branch, no PR.
+    const remoteBranches = gitOutput(["branch"], remote);
+    expect(remoteBranches).not.toContain(c.branchName);
+    expect(remoteBranches).not.toContain(`${c.branchName}-base`);
+    // The independent roots still go out — one unreviewable projection doesn't
+    // hold back the ones that are fine.
+    expect(byFile.get("helper.ts")!.status).toBe("created");
+    expect(byFile.get("helper2.ts")!.status).toBe("created");
+  } finally {
+    cleanup();
+  }
+});
+
+test("--reviewable-stack also refuses whatever depended on the refused projection", async () => {
+  const { root, remote, cleanup } = makeFlatFixture({ withDependent: true });
+  try {
+    const { byFile } = await runFlatPush(root, "flat-first", { reviewableStack: true });
+    const d = byFile.get("d.ts")!;
+    // Its base would be featureC's branch, which was never pushed — a PR
+    // against a nonexistent branch is not an improvement on no PR.
+    expect(d.status).toBe("blocked");
+    expect(d.note).toContain("was not pushed");
+    expect(gitOutput(["branch"], remote)).not.toContain(d.branchName);
+  } finally {
+    cleanup();
+  }
+});
+
+test("--reviewable-stack is a no-op in stacked mode, which has no generated bases", async () => {
+  const { root, cleanup } = makeFlatFixture();
+  try {
+    const { results } = await runFlatPush(root, "stacked", { reviewableStack: true });
+    expect(results.every((r) => r.status === "created")).toBe(true);
+    expect(results.some((r) => r.hiddenBase)).toBe(false);
   } finally {
     cleanup();
   }

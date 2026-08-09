@@ -35,6 +35,13 @@ export type PushResult = {
    * preview has to say before `--yes`.
    */
   draft: boolean | null;
+  /**
+   * True when this PR targets a *generated* integration branch — one drip
+   * minted to union several prerequisites, which has no PR of its own. The PR
+   * merges, but its prerequisites aren't reviewable as a stack and a workflow
+   * filtered on `pull_request.branches: [main]` never runs on it (issue #14).
+   */
+  hiddenBase: boolean;
 };
 
 // Pure: which of the five statuses a slice is in, given what's already known
@@ -104,6 +111,8 @@ export async function push(opts: {
   units?: PushUnits;
   /** open drip-owned PRs as drafts; never changes an existing PR's state */
   draft?: boolean;
+  /** refuse any projection that would need a generated integration base (issue #14) */
+  reviewableStack?: boolean;
 }): Promise<PushResult[]> {
   const { git, db, repoRoot, branch, baseBranch, mergeBase, plan, dryRun } = opts;
   const projection = opts.projection ?? "stacked";
@@ -167,6 +176,10 @@ export async function push(opts: {
   // dependent must target the base branch itself rather than a branch that
   // was dropped from this run.
   const droppedToBase = new Set<string>();
+  // Slices this run refused to push. A dependent of one of them would open a
+  // PR against a branch that doesn't exist, so it's refused too rather than
+  // left to fail at GitHub.
+  const blockedIds = new Set<string>();
 
   try {
     for (const { sliceId, commit } of commits) {
@@ -178,16 +191,21 @@ export async function push(opts: {
       const existing = getCorrespondence(db, branch, signature);
       const flat = flatById.get(sliceId);
 
+      // Every refusal below produces the same shape: nothing pushed, the slice
+      // recorded as blocked so its dependents are refused too.
+      const block = (note: string): void => {
+        blockedIds.add(sliceId);
+        results.push({ sliceLabel, branchName, prUrl: existing?.prUrl ?? null, status: "blocked", base: baseBranch, note, draft: null, hiddenBase: false });
+      };
+
       if (!commit) {
-        results.push({
-          sliceLabel,
-          branchName,
-          prUrl: existing?.prUrl ?? null,
-          status: "blocked",
-          base: baseBranch,
-          note: `${flat?.applyError ?? "could not be materialized"} — re-run with --projection stacked to include this slice`,
-          draft: null,
-        });
+        block(`${flat?.applyError ?? "could not be materialized"} — re-run with --projection stacked to include this slice`);
+        continue;
+      }
+
+      const blockedPrereq = flat?.prerequisites.find((p) => blockedIds.has(p));
+      if (blockedPrereq) {
+        block(`its prerequisite ${label(blockedPrereq)} was not pushed, so this PR would target a branch that doesn't exist`);
         continue;
       }
 
@@ -206,14 +224,33 @@ export async function push(opts: {
       if (projection === "stacked") {
         base = baseForNext;
       } else if (flat!.integrationCommit) {
+        // A generated integration base is mergeable and not reviewable: it has
+        // no PR, so reviewers can't see the prerequisites as a stack, and a
+        // workflow filtered on the base branch never fires. Say so on every
+        // run, and refuse outright when the caller asked for a stack that a
+        // human can actually walk (issue #14).
+        if (opts.reviewableStack) {
+          block(
+            `needs a generated integration base unioning ${flat!.prerequisites.map(label).join(", ")}, which would have no PR of its own — ` +
+              "--reviewable-stack refuses that. Merge those prerequisites into one projection, or declare a projection that depends on them " +
+              "and let this one depend on it instead.",
+          );
+          continue;
+        }
         integrationBranch = `${branchName}-base`;
         base = integrationBranch;
-        note = `integration base unions ${flat!.prerequisites.map(label).join(", ")}`;
+        note =
+          `integration base unions ${flat!.prerequisites.map(label).join(", ")} — '${integrationBranch}' is generated and has no PR, ` +
+          "so these prerequisites are not directly reviewable on GitHub and a workflow filtered on the base branch won't run CI here";
       } else if (flat!.baseSliceId && !droppedToBase.has(flat!.baseSliceId)) {
         base = sliceBranch(flat!.baseSliceId);
       } else {
         base = baseBranch;
       }
+      // Only meaningful for a PR this run leaves pointing at the generated
+      // branch — a squash-merged slice's PR is closed, so it targets nothing.
+      let hiddenBase = !!integrationBranch;
+
       if (flat?.widened) {
         note = [note, `prerequisites widened past the slice DAG to make the patch apply: ${flat.prerequisites.map(label).join(", ")}`]
           .filter(Boolean)
@@ -256,10 +293,13 @@ export async function push(opts: {
           .filter(Boolean)
           .join("; ");
       }
-      if (status === "squash-merged") draft = null;
+      if (status === "squash-merged") {
+        draft = null;
+        hiddenBase = false;
+      }
 
       if (dryRun) {
-        results.push({ sliceLabel, branchName, prUrl: existing?.prUrl ?? null, status, base, note, draft });
+        results.push({ sliceLabel, branchName, prUrl: existing?.prUrl ?? null, status, base, note, draft, hiddenBase });
         if (status !== "squash-merged") baseForNext = branchName;
         else droppedToBase.add(sliceId);
         continue;
@@ -271,14 +311,14 @@ export async function push(opts: {
           deleteCorrespondence(db, branch, signature);
         }
         droppedToBase.add(sliceId);
-        results.push({ sliceLabel, branchName, prUrl: existing?.prUrl ?? null, status, base, note, draft });
+        results.push({ sliceLabel, branchName, prUrl: existing?.prUrl ?? null, status, base, note, draft, hiddenBase });
         continue; // dropped from the stack — baseForNext stays where it was
       }
 
       if (status === "unchanged") {
         // Nothing to do: the hash above already covers the branch's tree and
         // its target ref, so "unchanged" really means the PR is already right.
-        results.push({ sliceLabel, branchName, prUrl: existing!.prUrl, status, base, note, draft });
+        results.push({ sliceLabel, branchName, prUrl: existing!.prUrl, status, base, note, draft, hiddenBase });
         baseForNext = branchName;
         continue;
       }
@@ -295,6 +335,7 @@ export async function push(opts: {
         // The lease did its job: someone pushed to the adopted branch after
         // drip last saw it. Refusing loudly and leaving that commit alone is
         // the whole reason adopted branches aren't force-pushed blind.
+        blockedIds.add(sliceId);
         results.push({
           sliceLabel,
           branchName,
@@ -305,6 +346,7 @@ export async function push(opts: {
             `the adopted branch has moved on the remote since drip recorded ${existing!.commitSha!.slice(0, 7)} — ` +
             "force-with-lease refused rather than discard those commits. Review them, then re-run `drip manifest adopt` to re-bind.",
           draft: null,
+          hiddenBase: false,
         });
         continue;
       }
@@ -355,7 +397,7 @@ export async function push(opts: {
         baseRef,
         adopted: !!existing?.adopted,
       });
-      results.push({ sliceLabel, branchName, prUrl, status, base, note, draft });
+      results.push({ sliceLabel, branchName, prUrl, status, base, note, draft, hiddenBase });
       baseForNext = branchName;
     }
   } finally {

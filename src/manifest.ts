@@ -11,6 +11,7 @@ import type { PushUnits } from "./push";
 import { gitPath } from "./repo";
 import { verifyTreeHash } from "./verify";
 import { runManifestVerification, type VerificationRun } from "./verification";
+import { isCodeFile } from "./workspace";
 
 // Semantic projection manifest (issue #9).
 //
@@ -75,6 +76,7 @@ export type Finding = {
     | "apply-failure"
     | "tree-hash-mismatch"
     | "no-verification"
+    | "verification-waived"
     | "verification-failed"
     | "ordinal-selector"
     | "branch-mismatch"
@@ -225,7 +227,15 @@ function resolveSelector(plan: PlanResult, selector: string): { sliceId: string;
 const countChangedLines = (hunks: Hunk[]) =>
   hunks.reduce((n, h) => n + h.raw.split("\n").filter((l) => /^[+-]/.test(l) && !/^(\+\+\+|---)/.test(l)).length, 0);
 
-export function resolveManifest(plan: PlanResult, manifest: Manifest, opts: { branch?: string } = {}): ResolvedManifest {
+export function resolveManifest(
+  plan: PlanResult,
+  manifest: Manifest,
+  opts: {
+    branch?: string;
+    /** a projection containing code must declare a runnable check; a reason isn't enough (issue #14) */
+    requireVerification?: boolean;
+  } = {},
+): ResolvedManifest {
   const findings: Finding[] = [];
   const add = (severity: Finding["severity"], code: Finding["code"], projection: string | null, message: string) =>
     findings.push({ severity, code, projection, message });
@@ -414,8 +424,27 @@ export function resolveManifest(plan: PlanResult, manifest: Manifest, opts: { br
     // "This PR is independently reviewable" is a claim about it being runnable,
     // and an empty `verification` makes that claim untested. Allowed, but only
     // as a stated decision — a warning by default, an error under --strict.
-    if (!entry.verification.length && !entry.verificationReason) {
-      add("warning", "no-verification", id, "declares no verification commands — add some, or set verificationReason to say why none apply");
+    //
+    // Under --require-verification the exemption stops applying to projections
+    // that contain code: a prose reason is not a check, and a mechanically
+    // split projection can reconstruct the tree exactly and still not compile
+    // because the symbols it needs landed in a different one (issue #14).
+    // Docs-, config- and lockfile-only projections keep the old rule — there
+    // is nothing there for a typecheck to have an opinion about.
+    const codeFiles = files.filter(isCodeFile);
+    if (!entry.verification.length) {
+      if (opts.requireVerification && codeFiles.length) {
+        add(
+          "error",
+          "verification-waived",
+          id,
+          `contains ${codeFiles.length} code file(s) and declares no verification command` +
+            (entry.verificationReason ? ` — verificationReason ("${entry.verificationReason}") does not satisfy --require-verification` : "") +
+            ": a projection can reconstruct the mega branch's tree and still not typecheck on its own",
+        );
+      } else if (!entry.verificationReason) {
+        add("warning", "no-verification", id, "declares no verification commands — add some, or set verificationReason to say why none apply");
+      }
     }
 
     projections.push({

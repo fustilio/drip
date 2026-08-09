@@ -9,8 +9,6 @@ import type { ExcludedSection, FileSection, Hunk } from "./planner";
 import { computeContentHash, computeSliceSignature } from "./signature";
 import { getBuildCache, upsertBuildCache } from "./store";
 
-export const DEFAULT_BUILD_CMD = "bunx tsc --noEmit";
-
 export type TreeHashResult = { pass: boolean; message: string };
 export type BuildCheckResult = { failures: Array<{ slice: string; output: string }>; skipped: number };
 
