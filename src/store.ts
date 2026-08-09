@@ -62,9 +62,12 @@ export function openStore(repoRoot: string): Database {
     )
   `);
   // M3: content-addressed skip + interdiff need the last-pushed content hash
-  // and commit sha. ALTER TABLE ADD COLUMN has no IF NOT EXISTS — swallow the
-  // "duplicate column" error on repos that already have this table.
-  for (const col of ["content_hash TEXT", "commit_sha TEXT"]) {
+  // and commit sha. base_ref records what the PR was last targeted at, so a
+  // changed base (e.g. switching --projection) is detected locally instead of
+  // costing a `gh pr view` per slice on every run. ALTER TABLE ADD COLUMN has
+  // no IF NOT EXISTS — swallow the "duplicate column" error on repos that
+  // already have this table.
+  for (const col of ["content_hash TEXT", "commit_sha TEXT", "base_ref TEXT"]) {
     try {
       db.run(`ALTER TABLE correspondence ADD COLUMN ${col}`);
     } catch {}
@@ -106,12 +109,13 @@ export type Correspondence = {
   prUrl: string | null;
   contentHash: string | null;
   commitSha: string | null;
+  baseRef: string | null;
 };
 
 export function getCorrespondence(db: Database, branch: string, sliceSignature: string): Correspondence | null {
   const row = db
     .query(
-      "SELECT id, branch, slice_signature as sliceSignature, slice_branch as sliceBranch, pr_number as prNumber, pr_url as prUrl, content_hash as contentHash, commit_sha as commitSha FROM correspondence WHERE branch = ? AND slice_signature = ?",
+      "SELECT id, branch, slice_signature as sliceSignature, slice_branch as sliceBranch, pr_number as prNumber, pr_url as prUrl, content_hash as contentHash, commit_sha as commitSha, base_ref as baseRef FROM correspondence WHERE branch = ? AND slice_signature = ?",
     )
     .get(branch, sliceSignature) as Correspondence | null;
   return row;
@@ -119,16 +123,17 @@ export function getCorrespondence(db: Database, branch: string, sliceSignature: 
 
 export function upsertCorrespondence(db: Database, c: Correspondence): void {
   db.query(
-    `INSERT INTO correspondence (branch, slice_signature, slice_branch, pr_number, pr_url, content_hash, commit_sha, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+    `INSERT INTO correspondence (branch, slice_signature, slice_branch, pr_number, pr_url, content_hash, commit_sha, base_ref, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
      ON CONFLICT(branch, slice_signature) DO UPDATE SET
        slice_branch = excluded.slice_branch,
        pr_number = excluded.pr_number,
        pr_url = excluded.pr_url,
        content_hash = excluded.content_hash,
        commit_sha = excluded.commit_sha,
+       base_ref = excluded.base_ref,
        updated_at = datetime('now')`,
-  ).run(c.branch, c.sliceSignature, c.sliceBranch, c.prNumber, c.prUrl, c.contentHash, c.commitSha);
+  ).run(c.branch, c.sliceSignature, c.sliceBranch, c.prNumber, c.prUrl, c.contentHash, c.commitSha, c.baseRef);
 }
 
 export function deleteCorrespondence(db: Database, branch: string, sliceSignature: string): void {

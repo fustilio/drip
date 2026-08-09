@@ -12,7 +12,9 @@ import { loadPlan, runVerify } from "./workflow";
 function usage(): never {
   console.error("usage: drip plan <branch> [--repo path] [--base branch] [--timing] [--assign-ids] [--json]");
   console.error("       drip verify <branch> [--repo path] [--base branch] [--timing] [--build-cmd cmd] [--no-build-check]");
-  console.error("       drip push <branch> [--repo path] [--base branch] [--build-cmd cmd] [--no-build-check] --yes | --dry-run");
+  console.error(
+    "       drip push <branch> [--repo path] [--base branch] [--projection stacked|flat-first] [--build-cmd cmd] [--no-build-check] --yes | --dry-run",
+  );
   console.error(
     "       drip override add <branch> --kind force_merge|force_split --selector-a file::Symbol [--selector-b file::Symbol] [--note text] [--repo path]",
   );
@@ -120,6 +122,7 @@ async function main() {
       "assign-ids": { type: "boolean", default: false },
       "build-cmd": { type: "string" },
       "no-build-check": { type: "boolean", default: false },
+      projection: { type: "string", default: "stacked" },
       "dry-run": { type: "boolean", default: false },
       yes: { type: "boolean", default: false },
       json: { type: "boolean", default: false },
@@ -216,10 +219,21 @@ async function main() {
     throw new DripError("push creates real branches and opens real PRs on GitHub — pass --yes to confirm, or --dry-run to preview first");
   }
 
-  const results = await push({ git, db, repoRoot, branch, baseBranch, mergeBase, plan, dryRun });
-  console.log(dryRun ? "\nDRY RUN (no branches pushed, no PRs created):" : "\nPUSHED:");
+  const projection = values.projection!;
+  if (projection !== "stacked" && projection !== "flat-first") {
+    throw new DripError(`--projection must be 'stacked' or 'flat-first', got '${projection}'`);
+  }
+
+  const results = await push({ git, db, repoRoot, branch, baseBranch, mergeBase, plan, dryRun, projection });
+  console.log(dryRun ? `\nDRY RUN (${projection}, no branches pushed, no PRs created):` : `\nPUSHED (${projection}):`);
   for (const r of results) {
-    console.log(`  ${r.sliceLabel} -> ${r.branchName} [${r.status}]${r.prUrl ? ` ${r.prUrl}` : ""}`);
+    console.log(`  ${r.sliceLabel} -> ${r.branchName} [${r.status}] base: ${r.base}${r.prUrl ? ` ${r.prUrl}` : ""}`);
+    if (r.note) console.log(`      ${r.note}`);
+  }
+  const blocked = results.filter((r) => r.status === "blocked");
+  if (blocked.length) {
+    console.error(`\n${blocked.length} slice(s) blocked — not pushed. See the notes above.`);
+    process.exit(1);
   }
 }
 

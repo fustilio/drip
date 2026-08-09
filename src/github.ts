@@ -29,6 +29,18 @@ export function ghPrComment(repoRoot: string, prNumber: number, body: string): v
   }
 }
 
+// Re-targets an existing PR. Needed when a slice's chosen base changes between
+// runs — switching `--projection`, or a prerequisite dropping out of the plan —
+// so the PR keeps showing only its own slice's diff instead of everything back
+// to the base branch.
+export function ghPrSetBase(repoRoot: string, prNumber: number, base: string): void {
+  try {
+    execFileSync("gh", ["pr", "edit", String(prNumber), "--base", base], { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] });
+  } catch (e: any) {
+    throw new DripError(`gh pr edit --base failed for #${prNumber}: ${String(e.stderr ?? e.message ?? "").trim()}`);
+  }
+}
+
 export function ghPrClose(repoRoot: string, prNumber: number, comment: string): void {
   try {
     execFileSync("gh", ["pr", "close", String(prNumber), "--comment", comment], { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] });

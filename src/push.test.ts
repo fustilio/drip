@@ -16,6 +16,7 @@ function correspondence(contentHash: string): Correspondence {
     prUrl: "https://example.com/pull/1",
     contentHash,
     commitSha: "deadbeef",
+    baseRef: "main",
   };
 }
 
@@ -61,7 +62,8 @@ test("squash-merged wins over everything else, regardless of correspondence stat
 const ghCreatePr = mock((_opts: unknown) => ({ number: 42, url: "https://example.com/pull/42" }));
 const ghPrClose = mock((_repoRoot: string, _prNumber: number, _comment: string) => {});
 const ghPrComment = mock((_repoRoot: string, _prNumber: number, _body: string) => {});
-mock.module("./github", () => ({ ghCreatePr, ghPrClose, ghPrComment, ghPrState: mock(() => "OPEN") }));
+const ghPrSetBase = mock((_repoRoot: string, _prNumber: number, _base: string) => {});
+mock.module("./github", () => ({ ghCreatePr, ghPrClose, ghPrComment, ghPrSetBase, ghPrState: mock(() => "OPEN") }));
 
 const reconcileComments = mock(async (_opts: unknown) => ({ unchanged: 0, orphaned: 0 }));
 mock.module("./anchors", () => ({ reconcileComments }));
@@ -135,6 +137,137 @@ test("updated: content change on an existing PR posts an interdiff and reconcile
   expect(ghCreatePr).not.toHaveBeenCalled();
   expect(ghPrComment).toHaveBeenCalledTimes(1);
   expect(reconcileComments).toHaveBeenCalledTimes(1);
+});
+
+// --- issue #6: flat-first projection ----------------------------------------
+//
+// Fixture DAG: `shared` and `other` are independent roots; featureA depends on
+// `shared` alone; featureC depends on both.
+
+function makeFlatFixture() {
+  const { repoRoot: root, cleanup: cleanupRoot } = makeTempRepo("drip-push-flat-");
+  const { remoteRoot: remote, cleanup: cleanupRemote } = makeBareRemote("drip-push-flat-remote-");
+  git(["remote", "add", "origin", remote], root);
+
+  writeFileSync(join(root, "helper.ts"), `export function shared(x: number) {\n  return x + 1;\n}\n`);
+  writeFileSync(join(root, "helper2.ts"), `export function other(x: number) {\n  return x + 10;\n}\n`);
+  commit(root, "init");
+
+  git(["checkout", "-q", "-b", "feature"], root);
+  writeFileSync(join(root, "helper.ts"), `export function shared(x: number) {\n  return x + 2;\n}\n`);
+  writeFileSync(join(root, "helper2.ts"), `export function other(x: number) {\n  return x + 20;\n}\n`);
+  writeFileSync(join(root, "a.ts"), `import { shared } from "./helper";\n\nexport function featureA() {\n  return shared(1);\n}\n`);
+  writeFileSync(
+    join(root, "c.ts"),
+    `import { shared } from "./helper";\nimport { other } from "./helper2";\n\nexport function featureC() {\n  return shared(1) + other(2);\n}\n`,
+  );
+  commit(root, "feature");
+
+  return {
+    root,
+    remote,
+    cleanup: () => {
+      cleanupRoot();
+      cleanupRemote();
+    },
+  };
+}
+
+async function runFlatPush(root: string, projection: "stacked" | "flat-first") {
+  const { push } = await import("./push");
+  using db = openStore(root);
+  const plan = await computePlan({ git: backend, repoRoot: root, branch: "feature", baseBranch: "main" });
+  const mergeBase = backend.mergeBase("main", "feature", root);
+  const results = await push({ git: backend, db, repoRoot: root, branch: "feature", baseBranch: "main", mergeBase, plan, dryRun: false, projection });
+  // Index results by a file the slice touches, so assertions don't depend on
+  // slice numbering.
+  const byFile = new Map<string, (typeof results)[number]>();
+  for (const r of results) {
+    const entry = [...plan.slices.entries()].find(([id]) => `slice${plan.idToNum.get(id)}` === r.sliceLabel)!;
+    for (const file of new Set(entry[1].map((h) => h.file))) byFile.set(file, r);
+  }
+  return { results, byFile };
+}
+
+test("issue #6: flat-first targets independent roots at the base branch, not at each other", async () => {
+  const { root, cleanup } = makeFlatFixture();
+  try {
+    const { results, byFile } = await runFlatPush(root, "flat-first");
+    expect(results.every((r) => r.status === "created")).toBe(true);
+
+    // Two independent roots: both go straight at main.
+    expect(byFile.get("helper.ts")!.base).toBe("main");
+    expect(byFile.get("helper2.ts")!.base).toBe("main");
+    // One prerequisite: targets that prerequisite's branch, nothing else.
+    expect(byFile.get("a.ts")!.base).toBe(byFile.get("helper.ts")!.branchName);
+    // Two prerequisites: gets a generated integration base, and says so.
+    expect(byFile.get("c.ts")!.base).toBe(`${byFile.get("c.ts")!.branchName}-base`);
+    expect(byFile.get("c.ts")!.note).toContain("integration base unions");
+
+    // No PR is stacked on another purely because of topological ordering.
+    expect(byFile.get("helper2.ts")!.base).not.toBe(byFile.get("helper.ts")!.branchName);
+  } finally {
+    cleanup();
+  }
+});
+
+test("issue #6: a flat-first root branch contains only its own slice, unlike the stacked chain", async () => {
+  const flat = makeFlatFixture();
+  const stacked = makeFlatFixture();
+  try {
+    const { byFile: flatByFile } = await runFlatPush(flat.root, "flat-first");
+    const { byFile: stackedByFile } = await runFlatPush(stacked.root, "stacked");
+
+    // helper2 is independent of helper. Flat-first's helper2 branch must not
+    // carry helper's change; the stacked chain (if helper2 comes later) does.
+    const flatHelper2 = gitOutput(["show", `${flatByFile.get("helper2.ts")!.branchName}:helper.ts`], flat.remote);
+    expect(flatHelper2).toContain("x + 1"); // unchanged — helper's slice isn't in this branch
+
+    // Sanity that the fixture actually exercises the difference: in stacked
+    // mode the later branch does carry the earlier slice.
+    const stackedLast = [...stackedByFile.values()].sort((a, b) => a.sliceLabel.localeCompare(b.sliceLabel)).pop()!;
+    expect(gitOutput(["show", `${stackedLast.branchName}:helper.ts`], stacked.remote)).toContain("x + 2");
+  } finally {
+    flat.cleanup();
+    stacked.cleanup();
+  }
+});
+
+test("issue #6: switching projection re-pushes the branch and re-targets the PR, not one without the other", async () => {
+  const { root, remote, cleanup } = makeFlatFixture();
+  try {
+    await runFlatPush(root, "stacked");
+    ghPrSetBase.mockClear();
+    ghCreatePr.mockClear();
+    const { byFile } = await runFlatPush(root, "flat-first");
+
+    // The slice's own patch is untouched, but its branch content and target
+    // both moved — so this is an update, not a no-op skip.
+    const helper2 = byFile.get("helper2.ts")!;
+    expect(helper2.status).toBe("updated");
+    expect(helper2.base).toBe("main");
+    expect(ghCreatePr).not.toHaveBeenCalled(); // correspondence preserved across the switch
+    expect(ghPrSetBase.mock.calls.map((c) => c[2])).toContain("main");
+    // The re-pushed branch really is the flat one now.
+    expect(gitOutput(["show", `${helper2.branchName}:helper.ts`], remote)).toContain("x + 1");
+  } finally {
+    cleanup();
+  }
+});
+
+test("re-running in the same projection is still a no-op: no re-push, no re-target", async () => {
+  const { root, cleanup } = makeFlatFixture();
+  try {
+    await runFlatPush(root, "flat-first");
+    ghPrSetBase.mockClear();
+    ghCreatePr.mockClear();
+    const { results } = await runFlatPush(root, "flat-first");
+    expect(results.every((r) => r.status === "unchanged")).toBe(true);
+    expect(ghPrSetBase).not.toHaveBeenCalled();
+    expect(ghCreatePr).not.toHaveBeenCalled();
+  } finally {
+    cleanup();
+  }
 });
 
 test("squash-merged: content already on main closes the existing PR, never pushes a branch", async () => {

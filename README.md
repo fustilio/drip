@@ -10,7 +10,7 @@ A tool for drip-feeding a mega branch back into main as thin, reviewable PRs. Sl
 bun install
 bun src/cli.ts plan <branch> [--repo path] [--base branch] [--timing] [--assign-ids] [--json]
 bun src/cli.ts verify <branch> [--repo path] [--base branch] [--timing] [--build-cmd cmd] [--no-build-check]
-bun src/cli.ts push <branch> [--repo path] [--base branch] [--build-cmd cmd] [--no-build-check] --yes | --dry-run
+bun src/cli.ts push <branch> [--repo path] [--base branch] [--projection stacked|flat-first] [--build-cmd cmd] [--no-build-check] --yes | --dry-run
 bun src/cli.ts mcp
 ```
 
@@ -23,7 +23,9 @@ bun src/cli.ts mcp
   bun src/cli.ts override list <branch> [--repo path]
   bun src/cli.ts override remove <id> [--repo path]
   ```
-- **`push`** — refuses if `verify` fails. Materializes each slice as a `drip/<branch>/sliceN` branch, stacked (each PR's base is the previous slice's branch, per-slice content chained as real commits), and opens a PR via `gh` for each one that doesn't already have a correspondence entry (re-running updates the existing branch/PR instead of duplicating it — see `docs/adr/0006-slice-correspondence-key.md`). `--dry-run` previews without touching GitHub; otherwise `--yes` is required, since this is the one command with real external side effects.
+- **`push`** — refuses if `verify` fails. Materializes each slice as a `drip/<branch>/sliceN` branch and opens a PR via `gh` for each one that doesn't already have a correspondence entry (re-running updates the existing branch/PR instead of duplicating it — see `docs/adr/0006-slice-correspondence-key.md`). `--dry-run` previews without touching GitHub; otherwise `--yes` is required, since this is the one command with real external side effects.
+  - `--projection stacked` (default) chains every PR onto the previous slice's branch.
+  - `--projection flat-first` picks each base from the DAG instead: independent roots target the base branch, a slice with one prerequisite targets that prerequisite's branch, and a slice with several gets a generated `drip/<branch>/sliceN-base` integration branch. Nothing is made a review dependency purely by topological ordering — see `docs/adr/0016-flat-first-projection.md`. A slice whose hunks won't apply on its prerequisites alone is reported `blocked` and not pushed (exit 1), never silently dropped.
 - **`mcp`** — starts an MCP stdio server exposing `drip_plan`, `drip_verify`, `drip_override_list`, `drip_override_add`, `drip_override_remove` as tools, so an MCP client (an agent, an editor integration) can read plan/verify data and write override decisions without shelling out to the CLI. No `push` tool — that command has real side effects and needs `--yes` from a human. No AI provider inside drip anywhere — see `docs/adr/0009-ai-integration-external-not-bundled.md`.
 
 ## M0 spike
