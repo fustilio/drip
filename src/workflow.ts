@@ -2,7 +2,8 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { GitBackend } from "./git-backend";
-import { computePlan, type PlanResult } from "./planner";
+import type { CoarsenResult } from "./coarsen";
+import { computePlan, type Hunk, type PlanResult } from "./planner";
 import { resolveMergeBase } from "./repo";
 import { listOverrides, openStore } from "./store";
 import { DEFAULT_BUILD_CMD, verifyPerSliceBuild, verifyTreeHash, type TreeHashResult, type BuildCheckResult } from "./verify";
@@ -29,6 +30,21 @@ export async function loadPlan(opts: { git: GitBackend; repoRoot: string; branch
   return { db, mergeBase, plan };
 }
 
+// A coarsened plan in the exact shape verify already consumes: one "slice"
+// per projection, in projection-topological order. Coarsening only decides
+// which atomic slices are applied together, never which hunks exist or in what
+// order within a file — so the same tree-hash check proves the coarsened
+// projection reconstructs the mega branch, with no second verifier.
+export function projectedUnits(plan: PlanResult, coarse: CoarsenResult | null): {
+  order: string[];
+  slices: Map<string, Hunk[]>;
+  idToNum: Map<string, number>;
+} {
+  if (!coarse) return { order: plan.order!, slices: plan.slices, idToNum: plan.idToNum };
+  const slices = new Map(coarse.projections.map((p) => [p.label, p.sliceIds.flatMap((id) => plan.slices.get(id)!)]));
+  return { order: coarse.order, slices, idToNum: new Map(coarse.order.map((label, i) => [label, i])) };
+}
+
 // Three states, not two: "--no-build-check was passed" and "no tsconfig.json
 // and no --build-cmd" both mean no build ran, but cli.ts prints a different
 // (or no) line for each -- collapsing them to one null would lose that.
@@ -47,9 +63,11 @@ export async function runVerify(opts: {
   plan: PlanResult;
   buildCmdOverride: string | undefined;
   noBuildCheck: boolean;
+  coarsen?: CoarsenResult | null;
 }): Promise<{ pass: boolean; tree: TreeHashResult; build: BuildOutcome }> {
   const { git, db, branch, repoRoot, mergeBase, plan, buildCmdOverride, noBuildCheck } = opts;
-  const tree = await verifyTreeHash({ git, repoRoot, branch, mergeBase, files: plan.files, order: plan.order!, slices: plan.slices });
+  const units = projectedUnits(plan, opts.coarsen ?? null);
+  const tree = await verifyTreeHash({ git, repoRoot, branch, mergeBase, files: plan.files, order: units.order, slices: units.slices });
 
   if (noBuildCheck) return { pass: tree.pass, tree, build: { kind: "disabled" } };
 
@@ -63,10 +81,11 @@ export async function runVerify(opts: {
     repoRoot,
     mergeBase,
     files: plan.files,
-    order: plan.order!,
-    slices: plan.slices,
-    idToNum: plan.idToNum,
+    order: units.order,
+    slices: units.slices,
+    idToNum: units.idToNum,
     buildCmd,
+    label: opts.coarsen ? (id: string) => id : undefined, // projection labels are already their ids
   });
   return { pass: tree.pass && result.failures.length === 0, tree, build: { kind: "ran", buildCmd, result } };
 }

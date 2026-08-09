@@ -253,7 +253,7 @@ class UnionFind {
   }
 }
 
-function topoSort(nodes: string[], edges: [string, string][]): string[] | null {
+export function topoSort(nodes: string[], edges: [string, string][]): string[] | null {
   const indeg = new Map(nodes.map((n) => [n, 0]));
   const adj = new Map<string, string[]>(nodes.map((n) => [n, []]));
   for (const [from, to] of edges) {

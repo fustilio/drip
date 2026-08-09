@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { parseArgs } from "node:util";
 import { assignChangeIds } from "./change-id";
+import { computeProjections, printProjections, projectionsToJson } from "./coarsen";
 import { DripError } from "./errors";
 import { ShellGitBackend, type GitBackend } from "./git-backend";
 import { planToJson, printPlan } from "./planner";
@@ -10,8 +11,8 @@ import { addOverride, listOverrides, openStore, recordTiming, removeOverride } f
 import { loadPlan, runVerify } from "./workflow";
 
 function usage(): never {
-  console.error("usage: drip plan <branch> [--repo path] [--base branch] [--timing] [--assign-ids] [--json]");
-  console.error("       drip verify <branch> [--repo path] [--base branch] [--timing] [--build-cmd cmd] [--no-build-check]");
+  console.error("usage: drip plan <branch> [--repo path] [--base branch] [--timing] [--assign-ids] [--json] [--coarsen] [--target-slices n]");
+  console.error("       drip verify <branch> [--repo path] [--base branch] [--timing] [--coarsen] [--target-slices n] [--build-cmd cmd] [--no-build-check]");
   console.error(
     "       drip push <branch> [--repo path] [--base branch] [--projection stacked|flat-first] [--build-cmd cmd] [--no-build-check] --yes | --dry-run",
   );
@@ -126,6 +127,8 @@ async function main() {
       "dry-run": { type: "boolean", default: false },
       yes: { type: "boolean", default: false },
       json: { type: "boolean", default: false },
+      coarsen: { type: "boolean", default: false },
+      "target-slices": { type: "string" },
       kind: { type: "string" },
       "selector-a": { type: "string" },
       "selector-b": { type: "string" },
@@ -177,16 +180,34 @@ async function main() {
     return;
   }
 
-  if (jsonOut) console.log(JSON.stringify(planToJson(plan)));
-  else printPlan(plan);
+  // Coarsening needs an acyclic DAG, so it can only run after the plan is
+  // known good — the cycle report below still comes out either way.
+  const wantCoarsen = !!values.coarsen;
+  const targetSlices = values["target-slices"] === undefined ? undefined : Number(values["target-slices"]);
+  if (targetSlices !== undefined && !Number.isInteger(targetSlices)) {
+    throw new DripError(`--target-slices must be a whole number, got '${values["target-slices"]}'`);
+  }
+
+  if (!jsonOut) printPlan(plan);
 
   if (!plan.order) {
+    if (jsonOut) console.log(JSON.stringify(planToJson(plan)));
     process.exit(1);
   }
+
+  const coarse = wantCoarsen ? computeProjections(plan, { targetSlices }) : null;
+  if (jsonOut) console.log(JSON.stringify(coarse ? { ...planToJson(plan), ...projectionsToJson(coarse) } : planToJson(plan)));
+  else if (coarse) printProjections(coarse);
 
   if (command === "plan") {
     if (values.timing && !jsonOut) reportTiming(db, branch, "plan", plan.hunks.length, plan.slices.size, Date.now() - started);
     return;
+  }
+
+  // `push` materializes atomic slices; verifying a coarsened projection here
+  // would prove something other than what gets pushed.
+  if (coarse && command === "push") {
+    throw new DripError("--coarsen is a planning mode — `drip push` materializes atomic slices. Use `drip plan --coarsen` / `drip verify --coarsen`.");
   }
 
   const verifyResult = await runVerify({
@@ -198,8 +219,9 @@ async function main() {
     plan,
     buildCmdOverride: values["build-cmd"],
     noBuildCheck: !!values["no-build-check"],
+    coarsen: coarse,
   });
-  printVerifyResult(verifyResult, plan.order.length);
+  printVerifyResult(verifyResult, coarse ? coarse.projections.length : plan.order.length);
   const pass = verifyResult.pass;
 
   if (command === "verify") {

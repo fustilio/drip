@@ -93,8 +93,10 @@ export async function verifyPerSliceBuild(opts: {
   slices: Map<string, Hunk[]>;
   idToNum: Map<string, number>;
   buildCmd: string;
+  label?: (id: string) => string;
 }): Promise<BuildCheckResult> {
   const { git, db, branch, files, order, slices, repoRoot, idToNum, buildCmd } = opts;
+  const label = opts.label ?? ((id: string) => `slice${idToNum.get(id)}`);
   const commits = await materializeSliceCommits(opts);
   const tmpDir = mkdtempSync(join(tmpdir(), "drip-verify-build-"));
   const failures: Array<{ slice: string; output: string }> = [];
@@ -110,7 +112,7 @@ export async function verifyPerSliceBuild(opts: {
 
   try {
     for (const { sliceId, commit } of commits) {
-      const sliceLabel = `slice${idToNum.get(sliceId)}`;
+      const sliceLabel = label(sliceId);
       const sliceNum = idToNum.get(sliceId)!;
       const hunks = slices.get(sliceId)!;
       const signature = computeSliceSignature(hunks);

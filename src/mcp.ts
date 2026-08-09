@@ -2,6 +2,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { computeProjections, projectionsToJson } from "./coarsen";
 import { DripError } from "./errors";
 import { ShellGitBackend } from "./git-backend";
 import { planToJson } from "./planner";
@@ -28,13 +29,23 @@ const server = new McpServer({ name: "drip", version: "0.1.0" });
 
 server.tool(
   "drip_plan",
-  "Compute drip's slice plan for a mega branch: files/symbols/hunks per slice, the slice DAG, and any override selectors that matched nothing. Read-only.",
-  { repo: z.string().describe("path to the git repo"), branch: z.string(), base: z.string().default("main") },
-  async ({ repo, branch, base }) => {
+  "Compute drip's slice plan for a mega branch: files/symbols/hunks per slice, the slice DAG, fallback groups for hunks with no enclosing symbol, " +
+    "and any override selectors that matched nothing. Set coarsen to also get review-sized candidate projections above the atomic slices. Read-only.",
+  {
+    repo: z.string().describe("path to the git repo"),
+    branch: z.string(),
+    base: z.string().default("main"),
+    coarsen: z.boolean().default(false).describe("also emit review-sized candidate projections grouping the atomic slices"),
+    targetSlices: z.number().int().positive().optional().describe("with coarsen: merge by feature directory until at most this many projections remain"),
+  },
+  async ({ repo, branch, base, coarsen, targetSlices }) => {
     try {
       const repoRoot = resolveRepoRoot(git, repo);
       const { plan } = await loadPlan({ git, repoRoot, branch, baseBranch: base });
-      return textResult(plan.hunks.length === 0 ? { ok: true, slices: [], edges: [], unmatchedOverrideSelectors: [] } : planToJson(plan));
+      if (plan.hunks.length === 0) return textResult({ ok: true, slices: [], edges: [], fallbackGroups: [], unmatchedOverrideSelectors: [] });
+      const json = planToJson(plan);
+      if (!coarsen || !plan.order) return textResult(json);
+      return textResult({ ...json, ...projectionsToJson(computeProjections(plan, { targetSlices })) });
     } catch (e) {
       return errorResult(e);
     }
@@ -50,15 +61,18 @@ server.tool(
     base: z.string().default("main"),
     buildCmd: z.string().optional().describe("override the per-slice build command; defaults to `bunx tsc --noEmit` if tsconfig.json exists"),
     noBuildCheck: z.boolean().default(false),
+    coarsen: z.boolean().default(false).describe("verify the coarsened candidate projections instead of the atomic slices"),
+    targetSlices: z.number().int().positive().optional(),
   },
-  async ({ repo, branch, base, buildCmd, noBuildCheck }) => {
+  async ({ repo, branch, base, buildCmd, noBuildCheck, coarsen, targetSlices }) => {
     try {
       const repoRoot = resolveRepoRoot(git, repo);
       const { db, mergeBase, plan } = await loadPlan({ git, repoRoot, branch, baseBranch: base });
       if (plan.hunks.length === 0) return textResult({ ok: true, message: "no changes — nothing to verify" });
       if (!plan.order) return textResult(planToJson(plan));
 
-      const result = await runVerify({ git, db, branch, repoRoot, mergeBase, plan, buildCmdOverride: buildCmd, noBuildCheck });
+      const coarse = coarsen ? computeProjections(plan, { targetSlices }) : null;
+      const result = await runVerify({ git, db, branch, repoRoot, mergeBase, plan, buildCmdOverride: buildCmd, noBuildCheck, coarsen: coarse });
       const build =
         result.build.kind === "disabled"
           ? "disabled"
@@ -67,7 +81,7 @@ server.tool(
             : result.build.result.failures.length
               ? { pass: false, failures: result.build.result.failures }
               : { pass: true, skipped: result.build.result.skipped };
-      return textResult({ ok: result.pass, tree: result.tree.message, build });
+      return textResult({ ok: result.pass, tree: result.tree.message, build, ...(coarse ? projectionsToJson(coarse) : {}) });
     } catch (e) {
       return errorResult(e);
     }

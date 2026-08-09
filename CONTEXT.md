@@ -32,8 +32,13 @@ The edge *between* two slices — i.e., a symbol edge that was *not* absorbed in
 **Slice DAG**:
 The directed graph of slices, ordered by which slices' symbols are referenced by which other slices. Distinct from the (undirected) symbol-edge graph used to *form* slices — the DAG describes ordering *between* already-formed slices, not intra-slice grouping.
 
-**Ungrouped slice**:
-The fallback bucket for hunks tree-sitter can't map to an enclosing symbol (config, markdown, lockfiles, etc.). Not symbol-edged against anything — just a catch-all, excluded from the kill-gate's per-hunk scoring.
+**Fallback group**:
+A slice formed from hunks tree-sitter can't map to an enclosing symbol (config, markdown, lockfiles, top-level imports). Keyed deterministically by path — `<path>::(file)`, or `<dir>/package.json::(deps)` for a manifest and its lockfile — so it clusters and takes overrides through exactly the same machinery as a symbol group, and its identity survives replanning. Never a *definer* in the def-use graph, so no edge ever points at one. Each carries the reason it's unassigned (`dependency-manifest`, `unsupported-language`, `unparseable`, `no-enclosing-symbol`). Excluded from the kill-gate's per-hunk scoring.
+_Avoid_: ungrouped slice (there is no longer one global bucket — see docs/adr/0015), catch-all
+
+**Projection**:
+What a slice becomes when it's turned into something GitHub can show: a branch and a PR. Two independent axes. *Which* slices are reviewed together is `--coarsen`'s **candidate projection** — a review-sized group of atomic slices (docs/adr/0017). *What each branch is built on* is `push --projection`'s mode: `stacked` chains every PR onto the previous slice's branch, `flat-first` picks each base from the DAG so independent slices target the base branch directly (docs/adr/0016).
+_Avoid_: using "projection" bare when the coarsening/base-selection distinction matters
 
 **Tree-hash invariant**:
 The core correctness check: `apply(slices in topological order) == tree(mega branch)`, verified by comparing git tree hashes.
@@ -56,4 +61,4 @@ The link between a review comment and the code it refers to, used to survive for
 _Avoid_: link, mapping, reference
 
 **Slice signature**:
-A slice's identity key for correspondence purposes in M2: the sorted, joined list of `file::QualifiedSymbolPath` group-keys the slice unions together. An intermediate stand-in for real content-addressing (M3) — see `docs/adr/0006-slice-correspondence-key.md`.
+A slice's identity key for correspondence purposes in M2: the sorted, joined list of group keys the slice unions together — `file::QualifiedSymbolPath` for symbol groups, the fallback selector for fallback groups. An intermediate stand-in for real content-addressing (M3) — see `docs/adr/0006-slice-correspondence-key.md`.

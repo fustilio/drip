@@ -4,17 +4,22 @@ import { join } from "node:path";
 import type { GitBackend } from "./git-backend";
 import type { FileSection, Hunk } from "./planner";
 
-// The unified-diff text for one slice — used both to apply it and (in push.ts)
-// as the input to its content hash / squash-merge check.
-export function buildSlicePatch(files: FileSection[], slices: Map<string, Hunk[]>, sliceId: string): string {
-  const hunksInSlice = new Set(slices.get(sliceId)!.map((h) => h.index));
+// The unified-diff text for an arbitrary set of hunks, emitted in the diff's
+// own file and hunk order so it always applies as one patch.
+export function buildPatch(files: FileSection[], hunkIndices: Set<number>): string {
   let patch = "";
   for (const file of files) {
-    const selected = file.hunks.filter((h) => hunksInSlice.has(h.index));
+    const selected = file.hunks.filter((h) => hunkIndices.has(h.index));
     if (!selected.length) continue;
     patch += file.header + selected.map((h) => h.raw).join("");
   }
   return patch;
+}
+
+// The unified-diff text for one slice — used both to apply it and (in push.ts)
+// as the input to its content hash / squash-merge check.
+export function buildSlicePatch(files: FileSection[], slices: Map<string, Hunk[]>, sliceId: string): string {
+  return buildPatch(files, new Set(slices.get(sliceId)!.map((h) => h.index)));
 }
 
 export type ProjectionMode = "stacked" | "flat-first";
