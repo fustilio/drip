@@ -30,14 +30,15 @@ import { ghPrView } from "./github";
 import { planToJson, printPlan } from "./planner";
 import { push, type PushUnits } from "./push";
 import { resolveRepoRoot } from "./repo";
+import { describeSource, sourceToJson } from "./source";
 import { addOverride, deleteCorrespondence, listOverrides, openStore, recordTiming, removeOverride } from "./store";
 import { loadPlan, runVerify } from "./workflow";
 
 function usage(): never {
   console.error(
-    "usage: drip plan <branch> [--repo path] [--base branch] [--timing] [--assign-ids] [--json] [--coarsen] [--target-slices n] [--emit-manifest [--manifest path] [--force]]",
+    "usage: drip plan <branch>|--worktree [--repo path] [--base branch] [--timing] [--assign-ids] [--json] [--coarsen] [--target-slices n] [--emit-manifest [--manifest path] [--force]]",
   );
-  console.error("       drip verify <branch> [--repo path] [--base branch] [--timing] [--coarsen] [--target-slices n] [--build-cmd cmd] [--no-build-check]");
+  console.error("       drip verify <branch>|--worktree [--repo path] [--base branch] [--timing] [--coarsen] [--target-slices n] [--build-cmd cmd] [--no-build-check]");
   console.error("       drip validate-plan <branch> [--manifest path] [--repo path] [--base branch] [--json] [--no-manifest-check] [--strict]");
   console.error(
     "       drip push <branch> [--repo path] [--base branch] [--projection stacked|flat-first] [--manifest path] [--no-manifest-check] [--strict] [--build-cmd cmd] [--no-build-check] --yes | --dry-run",
@@ -277,6 +278,7 @@ async function main() {
       yes: { type: "boolean", default: false },
       json: { type: "boolean", default: false },
       coarsen: { type: "boolean", default: false },
+      worktree: { type: "boolean", default: false },
       "target-slices": { type: "string" },
       manifest: { type: "string" },
       "no-manifest-check": { type: "boolean", default: false },
@@ -290,7 +292,7 @@ async function main() {
     },
   });
 
-  const [command, branch] = positionals;
+  const [command, branchArg] = positionals;
 
   if (command === "mcp") {
     await import("./mcp");
@@ -310,7 +312,8 @@ async function main() {
   }
 
   const isCommand = command === "plan" || command === "verify" || command === "push" || command === "validate-plan";
-  if (!command || !branch || !isCommand) usage();
+  const worktree = !!values.worktree;
+  if (!command || !isCommand || (!branchArg && !worktree)) usage();
 
   const targetDir = values.repo ?? process.cwd();
   const repoRoot = resolveRepoRoot(git, targetDir);
@@ -319,23 +322,40 @@ async function main() {
 
   const jsonOut = !!values.json && (command === "plan" || command === "validate-plan");
 
+  // Worktree mode is a *planning* source: it describes work that isn't
+  // committed yet, so anything that rewrites history or publishes to GitHub
+  // has nothing coherent to act on. Both refuse rather than half-work.
+  if (worktree && values["assign-ids"]) {
+    throw new DripError("--assign-ids rewrites commits, so it can't run against a working tree — commit first, then assign ids");
+  }
+  if (worktree && command === "push") {
+    throw new DripError(
+      "push opens real PRs, and --worktree's content exists only in your working tree — commit the slices first. " +
+        "The manifest's selectors are durable, so a plan made with --worktree still validates once the commits exist.",
+    );
+  }
+
   if (command === "plan" && values["assign-ids"]) {
-    const { rewritten, headSha } = assignChangeIds(git, repoRoot, branch, baseBranch);
+    const { rewritten, headSha } = assignChangeIds(git, repoRoot, branchArg!, baseBranch);
     if (!jsonOut) {
       if (rewritten.length) {
         console.log(`Assigned Change-Id trailers, rewrote ${rewritten.length} commit(s):`);
         for (const r of rewritten) console.log(`  ${r.old.slice(0, 7)} -> ${r.new.slice(0, 7)}`);
-        console.log(`${branch} now points at ${headSha.slice(0, 7)}\n`);
+        console.log(`${branchArg} now points at ${headSha.slice(0, 7)}\n`);
       } else {
         console.log("All commits already have Change-Id trailers.\n");
       }
     }
   }
 
-  const { db, mergeBase, plan } = await loadPlan({ git, repoRoot, branch, baseBranch });
+  const { db, mergeBase, plan, source } = await loadPlan({ git, repoRoot, branch: branchArg, baseBranch, worktree });
+  // From here on the plan's identity is the branch it belongs to, which in
+  // worktree mode is the checked-out branch rather than a positional.
+  const branch = source.label;
+  if (!jsonOut) console.log(`${describeSource(source)}\n`);
 
   if (plan.hunks.length === 0) {
-    if (jsonOut) console.log(JSON.stringify({ ok: true, slices: [], edges: [], unmatchedOverrideSelectors: [] }));
+    if (jsonOut) console.log(JSON.stringify({ ok: true, slices: [], edges: [], unmatchedOverrideSelectors: [], excluded: plan.excluded, source: sourceToJson(source) }));
     else console.log(`No changes between ${baseBranch} and ${branch} — nothing to slice.`);
     return;
   }
@@ -372,12 +392,12 @@ async function main() {
   if (!jsonOut) printPlan(plan);
 
   if (!plan.order) {
-    if (jsonOut) console.log(JSON.stringify(planToJson(plan)));
+    if (jsonOut) console.log(JSON.stringify({ ...planToJson(plan), source: sourceToJson(source) }));
     process.exit(1);
   }
 
   const coarse = wantCoarsen ? computeProjections(plan, { targetSlices }) : null;
-  if (jsonOut) console.log(JSON.stringify(coarse ? { ...planToJson(plan), ...projectionsToJson(coarse) } : planToJson(plan)));
+  if (jsonOut) console.log(JSON.stringify({ ...planToJson(plan), ...(coarse ? projectionsToJson(coarse) : {}), source: sourceToJson(source) }));
   else if (coarse) printProjections(coarse);
 
   if (values["emit-manifest"]) {
@@ -440,6 +460,7 @@ async function main() {
     noBuildCheck: !!values["no-build-check"],
     coarsen: coarse,
     units: manifestVerifyUnits,
+    sourceRef: source.ref,
   });
   printVerifyResult(verifyResult, manifestUnits ? manifestUnits.order.length : coarse ? coarse.projections.length : plan.order.length);
   const pass = verifyResult.pass;

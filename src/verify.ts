@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import type { GitBackend } from "./git-backend";
 import { buildSlicePatch, materializeSliceCommits } from "./materialize";
-import type { FileSection, Hunk } from "./planner";
+import type { ExcludedSection, FileSection, Hunk } from "./planner";
 import { computeContentHash, computeSliceSignature } from "./signature";
 import { getBuildCache, upsertBuildCache } from "./store";
 
@@ -22,9 +22,15 @@ export async function verifyTreeHash(opts: {
   files: FileSection[];
   order: string[];
   slices: Map<string, Hunk[]>;
+  /** tree-ish the slices must reconstruct; defaults to `branch` (see src/source.ts) */
+  sourceRef?: string;
+  /** diff sections in no slice — the most common reason this check fails */
+  excluded?: ExcludedSection[];
 }): Promise<TreeHashResult> {
   const { git, repoRoot, branch, mergeBase, files, order, slices } = opts;
-  const expected = git.revParse(`${branch}^{tree}`, repoRoot);
+  // `<tree>^{tree}` resolves to the tree itself, so a synthetic worktree tree
+  // works here unchanged — the invariant is the same claim either way.
+  const expected = git.revParse(`${opts.sourceRef ?? branch}^{tree}`, repoRoot);
   const tmpDir = mkdtempSync(join(tmpdir(), "drip-verify-tree-"));
   const indexFile = join(tmpDir, "index");
   const env = { ...process.env, GIT_INDEX_FILE: indexFile };
@@ -43,9 +49,16 @@ export async function verifyTreeHash(opts: {
       }
     }
     const actual = git.writeTree(repoRoot, env);
-    return actual === expected
-      ? { pass: true, message: `INVARIANT: PASS (tree ${actual})` }
-      : { pass: false, message: `INVARIANT: FAIL — expected ${expected}, got ${actual}` };
+    if (actual === expected) return { pass: true, message: `INVARIANT: PASS (tree ${actual})` };
+    // A section drip couldn't slice is in the diff and in no slice, so it
+    // *guarantees* this mismatch. Saying so here is the difference between a
+    // failure that names its cause and one that sends you hunting.
+    const excluded = opts.excluded ?? [];
+    const cause = excluded.length
+      ? `\n  ${excluded.length} diff section(s) are in no slice and account for this on their own: ` +
+        excluded.map((e) => `${e.path ?? "(unknown)"} (${e.reason})`).join(", ")
+      : "";
+    return { pass: false, message: `INVARIANT: FAIL — expected ${expected}, got ${actual}${cause}` };
   } finally {
     rmSync(tmpDir, { recursive: true, force: true });
   }

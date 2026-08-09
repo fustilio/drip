@@ -13,8 +13,13 @@ export type CommitInfo = {
 export interface GitBackend {
   showToplevel(cwd: string): string;
   revParse(ref: string, cwd: string): string;
+  /** the checked-out branch, or null when HEAD is detached */
+  currentBranch(cwd: string): string | null;
   mergeBase(a: string, b: string, cwd: string): string;
   diff(a: string, b: string, cwd: string): string;
+  diffNameStatus(a: string, b: string, cwd: string): Array<{ status: string; path: string }>;
+  /** stage every non-ignored change in the working tree into `env`'s index */
+  addAll(cwd: string, env: Env): void;
   show(ref: string, path: string, cwd: string): string;
   readTree(treeish: string, cwd: string, env: Env): void;
   applyCached(patchFile: string, cwd: string, env: Env): void;
@@ -48,11 +53,34 @@ export class ShellGitBackend implements GitBackend {
   revParse(ref: string, cwd: string) {
     return run(["rev-parse", ref], cwd).trim();
   }
+  currentBranch(cwd: string) {
+    const out = run(["rev-parse", "--abbrev-ref", "HEAD"], cwd).trim();
+    return out === "HEAD" ? null : out; // detached
+  }
   mergeBase(a: string, b: string, cwd: string) {
     return run(["merge-base", a, b], cwd).trim();
   }
   diff(a: string, b: string, cwd: string) {
     return run(["diff", "-U3", a, b], cwd);
+  }
+  diffNameStatus(a: string, b: string, cwd: string) {
+    return run(["diff", "--name-status", "-z", a, b], cwd)
+      .split("\0")
+      .filter(Boolean)
+      .reduce<Array<{ status: string; path: string }>>((acc, field, i, all) => {
+        // -z emits status and path as separate NUL-terminated fields, so the
+        // pairing is positional. (Renames add a second path field; drip's
+        // parseDiff doesn't handle renames anyway — see plan.excluded.)
+        if (i % 2 === 0 && all[i + 1] !== undefined) acc.push({ status: field, path: all[i + 1]! });
+        return acc;
+      }, []);
+  }
+  // Runs against the caller's scratch index (GIT_INDEX_FILE in env), never the
+  // repo's own — planning the worktree must not stage anything for real. It
+  // does write blobs for untracked files into the object database; they are
+  // unreferenced and get collected like any other loose object.
+  addAll(cwd: string, env: Env) {
+    run(["add", "-A"], cwd, env);
   }
   show(ref: string, path: string, cwd: string) {
     return run(["show", `${ref}:${path}`], cwd);

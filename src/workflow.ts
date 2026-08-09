@@ -4,7 +4,7 @@ import type { Database } from "bun:sqlite";
 import type { GitBackend } from "./git-backend";
 import type { CoarsenResult } from "./coarsen";
 import { computePlan, type Hunk, type PlanResult } from "./planner";
-import { resolveMergeBase } from "./repo";
+import { resolveDiffSource, type DiffSource } from "./source";
 import { listOverrides, openStore } from "./store";
 import { DEFAULT_BUILD_CMD, verifyPerSliceBuild, verifyTreeHash, type TreeHashResult, type BuildCheckResult } from "./verify";
 
@@ -17,17 +17,37 @@ import { DEFAULT_BUILD_CMD, verifyPerSliceBuild, verifyTreeHash, type TreeHashRe
 // Doesn't throw on an empty diff or a DAG cycle -- those are valid plan
 // states, not failures. Callers inspect plan.hunks.length / plan.order
 // exactly as before.
-export async function loadPlan(opts: { git: GitBackend; repoRoot: string; branch: string; baseBranch: string }): Promise<{
+export async function loadPlan(opts: {
+  git: GitBackend;
+  repoRoot: string;
+  /** omit only with worktree: true, where the checked-out branch names the plan */
+  branch?: string;
+  baseBranch: string;
+  /** plan the working tree — staged, unstaged and untracked — instead of committed history (issue #12) */
+  worktree?: boolean;
+}): Promise<{
   db: Database;
   mergeBase: string;
   plan: PlanResult;
+  source: DiffSource;
 }> {
-  const { git, repoRoot, branch, baseBranch } = opts;
-  const mergeBase = resolveMergeBase(git, baseBranch, branch, repoRoot);
+  const { git, repoRoot, baseBranch } = opts;
+  const source = resolveDiffSource(git, repoRoot, { branch: opts.branch, baseBranch, worktree: !!opts.worktree });
   const db = openStore(repoRoot);
-  const overrides = listOverrides(db, branch);
-  const plan = await computePlan({ git, repoRoot, branch, baseBranch, overrides });
-  return { db, mergeBase, plan };
+  // Overrides, correspondence and manifests are keyed to the branch this work
+  // lands on, not to the tree the content came from — so a worktree plan
+  // inherits the decisions already made about the same change.
+  const overrides = listOverrides(db, source.label);
+  const plan = await computePlan({
+    git,
+    repoRoot,
+    branch: source.label,
+    baseBranch,
+    overrides,
+    sourceRef: source.ref,
+    mergeBase: source.mergeBase,
+  });
+  return { db, mergeBase: source.mergeBase, plan, source };
 }
 
 // A coarsened plan in the exact shape verify already consumes: one "slice"
@@ -66,10 +86,22 @@ export async function runVerify(opts: {
   coarsen?: CoarsenResult | null;
   /** explicit units (a manifest's projections) — takes precedence over coarsen */
   units?: { order: string[]; slices: Map<string, Hunk[]>; idToNum: Map<string, number> };
+  /** tree-ish the slices must reconstruct; defaults to `branch` */
+  sourceRef?: string;
 }): Promise<{ pass: boolean; tree: TreeHashResult; build: BuildOutcome }> {
   const { git, db, branch, repoRoot, mergeBase, plan, buildCmdOverride, noBuildCheck } = opts;
   const units = opts.units ?? projectedUnits(plan, opts.coarsen ?? null);
-  const tree = await verifyTreeHash({ git, repoRoot, branch, mergeBase, files: plan.files, order: units.order, slices: units.slices });
+  const tree = await verifyTreeHash({
+    git,
+    repoRoot,
+    branch,
+    mergeBase,
+    files: plan.files,
+    order: units.order,
+    slices: units.slices,
+    sourceRef: opts.sourceRef,
+    excluded: plan.excluded,
+  });
 
   if (noBuildCheck) return { pass: tree.pass, tree, build: { kind: "disabled" } };
 

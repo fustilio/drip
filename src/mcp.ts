@@ -8,6 +8,7 @@ import { loadManifest, manifestReportToJson, resolveManifest, validateManifestAg
 import { ShellGitBackend } from "./git-backend";
 import { planToJson } from "./planner";
 import { resolveRepoRoot } from "./repo";
+import { sourceToJson } from "./source";
 import { addOverride, listOverrides, openStore, removeOverride } from "./store";
 import { loadPlan, runVerify } from "./workflow";
 
@@ -34,19 +35,29 @@ server.tool(
     "and any override selectors that matched nothing. Set coarsen to also get review-sized candidate projections above the atomic slices. Read-only.",
   {
     repo: z.string().describe("path to the git repo"),
-    branch: z.string(),
+    branch: z.string().optional().describe("the mega branch; omit only with worktree=true, where the checked-out branch is used"),
     base: z.string().default("main"),
     coarsen: z.boolean().default(false).describe("also emit review-sized candidate projections grouping the atomic slices"),
     targetSlices: z.number().int().positive().optional().describe("with coarsen: merge by feature directory until at most this many projections remain"),
+    worktree: z
+      .boolean()
+      .default(false)
+      .describe(
+        "plan the working tree — staged, unstaged and untracked changes on top of committed history — instead of committed history alone. " +
+          "Read-only: builds a tree in a scratch index and never stages anything. The `source` field reports which files were uncommitted.",
+      ),
   },
-  async ({ repo, branch, base, coarsen, targetSlices }) => {
+  async ({ repo, branch, base, coarsen, targetSlices, worktree }) => {
     try {
       const repoRoot = resolveRepoRoot(git, repo);
-      const { plan } = await loadPlan({ git, repoRoot, branch, baseBranch: base });
-      if (plan.hunks.length === 0) return textResult({ ok: true, slices: [], edges: [], fallbackGroups: [], unmatchedOverrideSelectors: [] });
+      const { plan, source } = await loadPlan({ git, repoRoot, branch, baseBranch: base, worktree });
+      const sourceJson = sourceToJson(source);
+      if (plan.hunks.length === 0) {
+        return textResult({ ok: true, slices: [], edges: [], fallbackGroups: [], unmatchedOverrideSelectors: [], source: sourceJson });
+      }
       const json = planToJson(plan);
-      if (!coarsen || !plan.order) return textResult(json);
-      return textResult({ ...json, ...projectionsToJson(computeProjections(plan, { targetSlices })) });
+      if (!coarsen || !plan.order) return textResult({ ...json, source: sourceJson });
+      return textResult({ ...json, ...projectionsToJson(computeProjections(plan, { targetSlices })), source: sourceJson });
     } catch (e) {
       return errorResult(e);
     }
@@ -58,22 +69,34 @@ server.tool(
   "Run drip's tree-hash invariant and per-slice standalone build check for a mega branch. Read-only (no branches pushed, no PRs touched).",
   {
     repo: z.string(),
-    branch: z.string(),
+    branch: z.string().optional(),
     base: z.string().default("main"),
     buildCmd: z.string().optional().describe("override the per-slice build command; defaults to `bunx tsc --noEmit` if tsconfig.json exists"),
     noBuildCheck: z.boolean().default(false),
     coarsen: z.boolean().default(false).describe("verify the coarsened candidate projections instead of the atomic slices"),
     targetSlices: z.number().int().positive().optional(),
+    worktree: z.boolean().default(false).describe("verify that the slices reconstruct the working tree, rather than the branch tip"),
   },
-  async ({ repo, branch, base, buildCmd, noBuildCheck, coarsen, targetSlices }) => {
+  async ({ repo, branch, base, buildCmd, noBuildCheck, coarsen, targetSlices, worktree }) => {
     try {
       const repoRoot = resolveRepoRoot(git, repo);
-      const { db, mergeBase, plan } = await loadPlan({ git, repoRoot, branch, baseBranch: base });
-      if (plan.hunks.length === 0) return textResult({ ok: true, message: "no changes — nothing to verify" });
+      const { db, mergeBase, plan, source } = await loadPlan({ git, repoRoot, branch, baseBranch: base, worktree });
+      if (plan.hunks.length === 0) return textResult({ ok: true, message: "no changes — nothing to verify", source: sourceToJson(source) });
       if (!plan.order) return textResult(planToJson(plan));
 
       const coarse = coarsen ? computeProjections(plan, { targetSlices }) : null;
-      const result = await runVerify({ git, db, branch, repoRoot, mergeBase, plan, buildCmdOverride: buildCmd, noBuildCheck, coarsen: coarse });
+      const result = await runVerify({
+        git,
+        db,
+        branch: source.label,
+        repoRoot,
+        mergeBase,
+        plan,
+        buildCmdOverride: buildCmd,
+        noBuildCheck,
+        coarsen: coarse,
+        sourceRef: source.ref,
+      });
       const build =
         result.build.kind === "disabled"
           ? "disabled"
@@ -82,7 +105,7 @@ server.tool(
             : result.build.result.failures.length
               ? { pass: false, failures: result.build.result.failures }
               : { pass: true, skipped: result.build.result.skipped };
-      return textResult({ ok: result.pass, tree: result.tree.message, build, ...(coarse ? projectionsToJson(coarse) : {}) });
+      return textResult({ ok: result.pass, tree: result.tree.message, build, ...(coarse ? projectionsToJson(coarse) : {}), source: sourceToJson(source) });
     } catch (e) {
       return errorResult(e);
     }

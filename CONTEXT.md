@@ -8,6 +8,14 @@ A tool for drip-feeding a mega branch back into main as thin, reviewable PRs. Sl
 The durable source of truth — a git branch containing a coherent but large, unreviewable diff against its target (e.g. `main`). Identified as the input branch diffed against its merge-base with the target.
 _Avoid_: feature branch, source branch
 
+**Diff source**:
+Where a plan's "after" state is read from — a tree-ish, nothing more. Normally the mega branch itself; under `--worktree`, a tree built from the working tree (staged, unstaged and untracked) in a scratch index, so a change can be partitioned before the commits that would make it reviewable exist. Always base-relative either way: committed branch work and uncommitted edits are one change to slice. The *identity* of the plan stays the branch — overrides, correspondence and manifests key off that, not off the tree. Reported on every run, never inferred. See docs/adr/0021.
+_Avoid_: input, working copy, staging
+
+**Excluded section**:
+A diff section drip cannot turn into hunks — binary, pure rename, mode-only, an empty file creation — and which therefore appears in no slice. Reported with its path and reason, and named again in any tree-hash failure, since a section that's in the diff and in no slice guarantees the mismatch on its own.
+_Avoid_: skipped file, unsupported (both hide that the change is still real)
+
 **Hunk**:
 A single contiguous block of changed lines, as produced by git's own diff algorithm. The atomic unit of clustering — never re-derived or re-split by tree-sitter or any other analysis.
 _Avoid_: change, edit, diff block

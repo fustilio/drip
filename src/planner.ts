@@ -47,6 +47,15 @@ export type Hunk = {
 
 export type FileSection = { header: string; path: string; hunks: Hunk[] };
 
+// A diff section that produced no hunks, and therefore appears in no slice.
+// These used to be dropped silently, which made them invisible right up until
+// the tree-hash invariant failed and named no cause (issue #12).
+export type ExcludedSection = {
+  path: string | null;
+  reason: "binary" | "rename-only" | "mode-only" | "empty-file" | "unrecognized";
+  detail: string;
+};
+
 // Why a slice->slice edge exists: the symbol reference (leaf name) found in
 // the referencing hunk's changed text, and the locations on both ends —
 // surfaced in cycle diagnostics so a user can judge real-vs-false-positive.
@@ -78,6 +87,8 @@ export type PlanResult = {
   fallbackGroups: Map<string, FallbackGroup>; // keyed by slice id
   ignoredOverrides: string[];
   overrides: Override[];
+  /** diff sections that yielded no hunks — in the diff, in no slice */
+  excluded: ExcludedSection[];
 };
 
 // The sentinel "symbol" part of a fallback group's selector. Not a real
@@ -109,17 +120,47 @@ export function groupKeyOf(h: Hunk): string {
   return h.fallbackSelector ?? `${h.file}::${FALLBACK_FILE}`;
 }
 
-export function parseDiff(diffText: string): FileSection[] {
+// Why a section yielded nothing, from the header alone. Each of these is a
+// real change that drip cannot slice; naming which is the difference between
+// "your plan is incomplete here" and an unexplained invariant failure later.
+function exclusionReason(header: string): ExcludedSection["reason"] {
+  if (/^Binary files |^GIT binary patch/m.test(header)) return "binary";
+  if (/^rename (from|to) /m.test(header)) return "rename-only";
+  if (/^(old|new) mode /m.test(header)) return "mode-only";
+  if (/^(new|deleted) file mode /m.test(header)) return "empty-file";
+  return "unrecognized";
+}
+
+export function parseDiff(diffText: string): { files: FileSection[]; excluded: ExcludedSection[] } {
   const sections = diffText.split(/^diff --git /m).slice(1);
   const files: FileSection[] = [];
+  const excluded: ExcludedSection[] = [];
   let hunkIndex = 0;
 
   for (const section of sections) {
     const body = "diff --git " + section;
     const firstHunk = body.search(/^@@ /m);
     const header = firstHunk === -1 ? body : body.slice(0, firstHunk);
-    const pathMatch = header.match(/^\+\+\+ b\/(.+)$/m) ?? header.match(/^--- a\/(.+)$/m);
-    if (!pathMatch || firstHunk === -1) continue; // binary/rename-only — not handled
+    // `a/x b/y` on the `diff --git` line is the last resort for a section with
+    // no ---/+++ pair at all, which is what a pure rename or mode change is.
+    const pathMatch =
+      header.match(/^\+\+\+ b\/(.+)$/m) ?? header.match(/^--- a\/(.+)$/m) ?? header.match(/^diff --git a\/(.+?) b\/.+$/m);
+    if (!pathMatch || firstHunk === -1) {
+      const reason = exclusionReason(header);
+      excluded.push({
+        path: pathMatch?.[1] ?? null,
+        reason,
+        detail:
+          reason === "unrecognized"
+            ? header.trim().split("\n").slice(0, 3).join(" / ")
+            : header
+                .trim()
+                .split("\n")
+                .filter((l) => !l.startsWith("diff --git") && !l.startsWith("index "))
+                .join(" / "),
+      });
+      continue;
+    }
 
     const path = pathMatch[1]!;
     const hunkTexts = body.slice(firstHunk).split(/(?=^@@ )/m);
@@ -151,8 +192,9 @@ export function parseDiff(diffText: string): FileSection[] {
       });
     }
     if (hunks.length) files.push({ header, path, hunks });
+    else excluded.push({ path, reason: exclusionReason(header), detail: "no hunks in this section" });
   }
-  return files;
+  return { files, excluded };
 }
 
 async function loadLanguageFor(path: string): Promise<Language | null> {
@@ -279,14 +321,23 @@ export async function computePlan(opts: {
   branch: string;
   baseBranch?: string;
   overrides?: Override[];
+  /** tree-ish holding the changed content; defaults to `branch`. See src/source.ts. */
+  sourceRef?: string;
+  /** precomputed merge-base; required when sourceRef isn't a commit */
+  mergeBase?: string;
 }): Promise<PlanResult> {
   const { git, repoRoot, branch } = opts;
   const baseBranch = opts.baseBranch ?? "main";
   const overrides = opts.overrides ?? [];
+  // `branch` is the plan's *identity* (overrides, correspondence, labels);
+  // `source` is where its content is read from. They differ only in worktree
+  // mode, where the source is a synthetic tree with no history to merge-base
+  // against — hence the caller-supplied merge base.
+  const source = opts.sourceRef ?? branch;
+  const mergeBase = opts.mergeBase ?? git.mergeBase(baseBranch, branch, repoRoot);
 
-  const mergeBase = git.mergeBase(baseBranch, branch, repoRoot);
-  const diffText = git.diff(mergeBase, branch, repoRoot);
-  const files = parseDiff(diffText);
+  const diffText = git.diff(mergeBase, source, repoRoot);
+  const { files, excluded } = parseDiff(diffText);
   const allHunks: Hunk[] = files.flatMap((f) => f.hunks);
 
   if (allHunks.length === 0) {
@@ -301,6 +352,7 @@ export async function computePlan(opts: {
       fallbackGroups: new Map(),
       ignoredOverrides: [],
       overrides,
+      excluded,
     };
   }
 
@@ -323,7 +375,7 @@ export async function computePlan(opts: {
 
     let content: string;
     try {
-      content = git.show(branch, file.path, repoRoot);
+      content = git.show(source, file.path, repoRoot);
     } catch {
       try {
         content = git.show(mergeBase, file.path, repoRoot);
@@ -475,7 +527,7 @@ export async function computePlan(opts: {
     });
   }
 
-  return { hunks: allHunks, files, slices, edges, edgeEvidence: sliceEdges, order, idToNum, fallbackGroups, ignoredOverrides, overrides };
+  return { hunks: allHunks, files, slices, edges, edgeEvidence: sliceEdges, order, idToNum, fallbackGroups, ignoredOverrides, overrides, excluded };
 }
 
 // Strongly-connected components (Tarjan) restricted to components with more
@@ -596,9 +648,10 @@ export function planToJson(plan: PlanResult): object {
       fallbackGroups,
       cycles: computeCycleDiagnostics(plan),
       unmatchedOverrideSelectors: plan.ignoredOverrides,
+      excluded: plan.excluded,
     };
   }
-  return { ok: true, slices, edges, fallbackGroups, unmatchedOverrideSelectors: plan.ignoredOverrides };
+  return { ok: true, slices, edges, fallbackGroups, unmatchedOverrideSelectors: plan.ignoredOverrides, excluded: plan.excluded };
 }
 
 export function printPlan(plan: PlanResult): void {
@@ -624,6 +677,14 @@ export function printPlan(plan: PlanResult): void {
       );
       for (const s of fallback.selectors) console.log(`    ${s}`);
     }
+  }
+
+  // Loud on purpose: an excluded section is a real change that is in the diff
+  // and in no slice, so it will fail the tree-hash invariant later. Better to
+  // read it here, next to the plan it's missing from.
+  if (plan.excluded.length) {
+    console.log("\nEXCLUDED (in the diff, in no slice — drip cannot slice these):");
+    for (const e of plan.excluded) console.log(`  ${e.path ?? "(unknown path)"} — ${e.reason}${e.detail ? `: ${e.detail}` : ""}`);
   }
 
   if (plan.ignoredOverrides.length) {

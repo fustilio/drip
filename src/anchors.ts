@@ -36,7 +36,7 @@ export async function reconcileComments(opts: {
   const { git, db, repoRoot, branch, sliceSignature, mergeBase, oldCommitSha, newHunks, prNumber } = opts;
 
   const oldDiffText = git.diff(mergeBase, oldCommitSha, repoRoot);
-  const oldFiles = parseDiff(oldDiffText);
+  const { files: oldFiles } = parseDiff(oldDiffText);
   const sliceFilePaths = new Set(newHunks.map((h) => h.file));
   const oldHunksByFile = new Map(oldFiles.filter((f) => sliceFilePaths.has(f.path)).map((f) => [f.path, f.hunks]));
   const newHunksByFile = new Map<string, Hunk[]>();
