@@ -8,10 +8,10 @@ A tool for drip-feeding a mega branch back into main as thin, reviewable PRs. Sl
 
 ```bash
 bun install
-bun src/cli.ts plan <branch> [--repo path] [--base branch] [--timing] [--assign-ids] [--json] [--coarsen] [--target-slices n]
+bun src/cli.ts plan <branch> [--repo path] [--base branch] [--timing] [--assign-ids] [--json] [--coarsen] [--target-slices n] [--emit-manifest [--manifest path] [--force]]
 bun src/cli.ts verify <branch> [--repo path] [--base branch] [--timing] [--coarsen] [--target-slices n] [--build-cmd cmd] [--no-build-check]
 bun src/cli.ts push <branch> [--repo path] [--base branch] [--projection stacked|flat-first] [--manifest path] [--build-cmd cmd] [--no-build-check] --yes | --dry-run
-bun src/cli.ts validate-plan <branch> --manifest path [--repo path] [--base branch] [--json]
+bun src/cli.ts validate-plan <branch> [--manifest path] [--repo path] [--base branch] [--json]
 bun src/cli.ts mcp
 ```
 
@@ -51,6 +51,8 @@ bun src/cli.ts mcp
     "defer": [{ "slice": "README.md::(file)", "reason": "ships with the release notes" }]
   }
   ```
+
+  **Where it lives.** With no `--manifest`, `validate-plan` looks in `.drip/projections/<branch>.json` (in the working tree, committable — an approved review plan is a document a team argues about and keeps) and then `<gitdir>/drip/projections/<branch>.json` (private to the clone). `drip plan <branch> --coarsen --emit-manifest` writes a valid starting skeleton there — every slice assigned, real selectors filled in — for you or an agent to give real ids, titles and intents; it refuses to overwrite without `--force`. `push` deliberately does **not** auto-discover: a manifest left lying around must never silently change what `push --yes` sends to GitHub, so it says one exists and pushes atomic slices unless you pass `--manifest`.
 
   Validated: every slice assigned exactly once or explicitly deferred with a reason; nothing deferred that another projection needs; the `dependsOn` graph acyclic; every atomic dependency crossing a boundary declared (widening is fine, dropping is not); each projection actually applies on its declared prerequisites; shared glue reachable from everyone who needs it; budgets respected unless `oversizeReason` says otherwise; and the whole graph still reconstructs the mega-branch tree — deferred slices included, so deferral can't silently lose work. `push --manifest` runs the same validation and refuses on any error; a projection's PR is keyed on its manifest `id`, so replanning underneath it doesn't cost the PR its identity or its review comments.
 - **`mcp`** — starts an MCP stdio server exposing `drip_plan`, `drip_verify`, `drip_validate_plan`, `drip_override_list`, `drip_override_add`, `drip_override_remove` as tools, so an MCP client (an agent, an editor integration) can read plan/verify data and write override decisions without shelling out to the CLI. No `push` tool — that command has real side effects and needs `--yes` from a human. No AI provider inside drip anywhere — see `docs/adr/0009-ai-integration-external-not-bundled.md`.

@@ -2,7 +2,19 @@
 import { parseArgs } from "node:util";
 import { assignChangeIds } from "./change-id";
 import { computeProjections, printProjections, projectionsToJson } from "./coarsen";
-import { loadManifest, manifestReportToJson, printManifestReport, resolveManifest, unitsFromManifest, validateManifestAgainstGit, verificationUnits } from "./manifest";
+import {
+  emitManifest,
+  findManifest,
+  loadManifest,
+  manifestCandidates,
+  manifestReportToJson,
+  printManifestReport,
+  resolveManifest,
+  unitsFromManifest,
+  validateManifestAgainstGit,
+  verificationUnits,
+  writeManifest,
+} from "./manifest";
 import { DripError } from "./errors";
 import { ShellGitBackend, type GitBackend } from "./git-backend";
 import { planToJson, printPlan } from "./planner";
@@ -12,9 +24,11 @@ import { addOverride, listOverrides, openStore, recordTiming, removeOverride } f
 import { loadPlan, runVerify } from "./workflow";
 
 function usage(): never {
-  console.error("usage: drip plan <branch> [--repo path] [--base branch] [--timing] [--assign-ids] [--json] [--coarsen] [--target-slices n]");
+  console.error(
+    "usage: drip plan <branch> [--repo path] [--base branch] [--timing] [--assign-ids] [--json] [--coarsen] [--target-slices n] [--emit-manifest [--manifest path] [--force]]",
+  );
   console.error("       drip verify <branch> [--repo path] [--base branch] [--timing] [--coarsen] [--target-slices n] [--build-cmd cmd] [--no-build-check]");
-  console.error("       drip validate-plan <branch> --manifest path [--repo path] [--base branch] [--json]");
+  console.error("       drip validate-plan <branch> [--manifest path] [--repo path] [--base branch] [--json]");
   console.error(
     "       drip push <branch> [--repo path] [--base branch] [--projection stacked|flat-first] [--manifest path] [--build-cmd cmd] [--no-build-check] --yes | --dry-run",
   );
@@ -132,6 +146,8 @@ async function main() {
       coarsen: { type: "boolean", default: false },
       "target-slices": { type: "string" },
       manifest: { type: "string" },
+      "emit-manifest": { type: "boolean", default: false },
+      force: { type: "boolean", default: false },
       kind: { type: "string" },
       "selector-a": { type: "string" },
       "selector-b": { type: "string" },
@@ -186,12 +202,21 @@ async function main() {
 
   // --- validate-plan: the manifest's own command, no push, no side effects ---
   if (command === "validate-plan") {
-    if (!values.manifest) throw new DripError("validate-plan requires --manifest <path>");
+    // Read-only, so discovering the conventional location is safe and saves
+    // typing the same path every run.
+    const manifestPath = values.manifest ?? findManifest(repoRoot, branch);
+    if (!manifestPath) {
+      throw new DripError(
+        `no manifest found for '${branch}' — pass --manifest <path>, or create one at ${manifestCandidates(repoRoot, branch)[0]} ` +
+          `(\`drip plan ${branch} --coarsen --emit-manifest\` writes a starting point)`,
+      );
+    }
+    if (!values.manifest && !jsonOut) console.log(`using ${manifestPath}\n`);
     if (!plan.order) {
       printPlan(plan);
       throw new DripError("cannot validate a manifest against a cyclic slice DAG — resolve the cycle first");
     }
-    const resolved = resolveManifest(plan, loadManifest(values.manifest), { branch });
+    const resolved = resolveManifest(plan, loadManifest(manifestPath), { branch });
     // The git-backed checks only make sense once the manifest is structurally
     // coherent; running them on a broken graph just produces noise.
     const gitFindings = resolved.ok
@@ -223,6 +248,15 @@ async function main() {
   if (jsonOut) console.log(JSON.stringify(coarse ? { ...planToJson(plan), ...projectionsToJson(coarse) } : planToJson(plan)));
   else if (coarse) printProjections(coarse);
 
+  if (values["emit-manifest"]) {
+    if (!coarse) throw new DripError("--emit-manifest needs --coarsen: the emitted skeleton is built from the coarsened projections");
+    // `--manifest` names the destination here; on every other command it names
+    // the input. Same flag, same meaning — "the manifest file for this run".
+    const out = values.manifest ?? manifestCandidates(repoRoot, branch)[0]!;
+    writeManifest(out, emitManifest(coarse, plan, { branch, base: baseBranch }), { force: !!values.force });
+    console.log(`\nwrote ${out} — a starting point, not a plan: give each projection a real id, title and intent before using it.`);
+  }
+
   if (command === "plan") {
     if (values.timing && !jsonOut) reportTiming(db, branch, "plan", plan.hunks.length, plan.slices.size, Date.now() - started);
     return;
@@ -240,6 +274,13 @@ async function main() {
   // manifest is worse than not pushing at all.
   let manifestUnits: PushUnits | undefined;
   let manifestVerifyUnits: ReturnType<typeof verificationUnits> | undefined;
+  // Unlike validate-plan, push does *not* auto-discover. A manifest left lying
+  // around must never silently change what a `push --yes` sends to GitHub —
+  // but staying quiet about one would be its own trap, so say it's there.
+  if (!values.manifest && command === "push") {
+    const found = findManifest(repoRoot, branch);
+    if (found) console.log(`\nnote: a manifest exists at ${found}, but --manifest was not passed — pushing atomic slices.`);
+  }
   if (values.manifest) {
     const resolved = resolveManifest(plan, loadManifest(values.manifest), { branch });
     const gitFindings = resolved.ok ? await validateManifestAgainstGit({ git, repoRoot, branch, mergeBase, plan, resolved }) : [];

@@ -1,7 +1,6 @@
-import { execFileSync } from "node:child_process";
 import { Database } from "bun:sqlite";
-import { isAbsolute, join } from "node:path";
 import { DripError } from "./errors";
+import { gitPath } from "./repo";
 
 export type OverrideKind = "force_merge" | "force_split";
 
@@ -14,18 +13,9 @@ export type Override = {
   note: string | null;
 };
 
-// `git rev-parse --git-path` resolves to the worktree's private gitdir, not
-// a hardcoded `<repoRoot>/.git` (which is a pointer file, not a directory,
-// in a linked worktree) — see docs/adr/0011-drip-db-location.md.
-function dripDbPath(repoRoot: string): string {
-  const out = execFileSync("git", ["rev-parse", "--git-path", "drip.db"], { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] })
-    .toString()
-    .trim();
-  return isAbsolute(out) ? out : join(repoRoot, out);
-}
-
 export function openStore(repoRoot: string): Database {
-  const db = new Database(dripDbPath(repoRoot), { create: true });
+  // See docs/adr/0011-drip-db-location.md for why this isn't `<repoRoot>/.git`.
+  const db = new Database(gitPath(repoRoot, "drip.db"), { create: true });
   db.run(`
     CREATE TABLE IF NOT EXISTS overrides (
       id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -1,5 +1,17 @@
+import { execFileSync } from "node:child_process";
+import { isAbsolute, join } from "node:path";
 import { DripError } from "./errors";
 import type { GitBackend } from "./git-backend";
+
+// `git rev-parse --git-path <name>` resolves to the worktree's private gitdir,
+// not a hardcoded `<repoRoot>/.git` (which is a pointer *file*, not a
+// directory, in a linked worktree) — see docs/adr/0011-drip-db-location.md.
+export function gitPath(repoRoot: string, name: string): string {
+  const out = execFileSync("git", ["rev-parse", "--git-path", name], { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] })
+    .toString()
+    .trim();
+  return isAbsolute(out) ? out : join(repoRoot, out);
+}
 
 export function resolveRepoRoot(git: GitBackend, targetDir: string): string {
   try {

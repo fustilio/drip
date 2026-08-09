@@ -110,6 +110,20 @@ something lands in, never whether it exists.
 - Verification runs against whatever `push` will materialize — atomic slices,
   coarsened projections, or manifest projections — never against something
   else.
-- Manifest storage is the caller's problem. Drip takes a path. It is *not*
-  written into `.git/drip.db`: unlike overrides, an approved review plan is a
-  document a team will want to diff, review and commit alongside the branch.
+- Manifest storage has a convention, not a requirement. With no `--manifest`,
+  `validate-plan` looks in `.drip/projections/<branch>.json` (tracked, and
+  first on purpose — unlike overrides, an approved review plan is a document a
+  team argues about, reviews and keeps, so it does not belong in
+  `.git/drip.db`) and then `<gitdir>/drip/projections/<branch>.json` for the
+  solo case. `plan --coarsen --emit-manifest` writes a valid skeleton there,
+  refusing to overwrite without `--force`.
+- **`push` deliberately does not auto-discover.** A stale manifest sitting in
+  the conventional location must never silently change what `push --yes` sends
+  to GitHub — the `--yes` gate confirms "push", not "push these projections
+  rather than these slices". So push requires the flag, and prints a notice
+  when a manifest exists that it is not using. Staying silent would be its own
+  trap; discovering it would be worse.
+- The emitted skeleton has mechanical ids and **no `intent`**. Inventing
+  product intent is precisely what drip has no basis to do, and a placeholder
+  would end up in a real PR body. It exists so the author edits a valid,
+  complete file rather than hand-writing selectors.

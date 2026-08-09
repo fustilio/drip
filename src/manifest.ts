@@ -1,10 +1,13 @@
-import { readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { z } from "zod";
+import type { CoarsenResult } from "./coarsen";
 import { DripError } from "./errors";
 import type { GitBackend } from "./git-backend";
 import { materializeFlatFirst } from "./materialize";
 import { groupKeyOf, topoSort, type Hunk, type PlanResult } from "./planner";
 import type { PushUnits } from "./push";
+import { gitPath } from "./repo";
 import { verifyTreeHash } from "./verify";
 
 // Semantic projection manifest (issue #9).
@@ -96,6 +99,74 @@ export type ResolvedManifest = {
   findings: Finding[];
   ok: boolean;
 };
+
+// Where a manifest lives when nobody says otherwise.
+//
+// Two locations, checked in this order:
+//
+//   .drip/projections/<branch>.json        — in the working tree, committable
+//   <gitdir>/drip/projections/<branch>.json — private to the clone
+//
+// The tracked location comes first on purpose. An approved review plan is a
+// document a team argues about, reviews and keeps — unlike overrides, which are
+// one person's local boundary corrections and belong in `.git/drip.db`
+// (docs/adr/0002). The private location exists for the solo case where you
+// don't want the plan in the branch's own diff.
+export function manifestCandidates(repoRoot: string, branch: string): string[] {
+  return [join(repoRoot, ".drip", "projections", `${branch}.json`), join(gitPath(repoRoot, "drip/projections"), `${branch}.json`)];
+}
+
+export function findManifest(repoRoot: string, branch: string): string | null {
+  return manifestCandidates(repoRoot, branch).find((p) => existsSync(p)) ?? null;
+}
+
+// A starting-point manifest built from the coarsened projections, for a human
+// or an agent to edit. Deliberately *not* a finished plan: the ids are
+// mechanical and there is no `intent`, because inventing product intent is
+// exactly the thing drip has no basis to do (docs/adr/0018). It exists so the
+// author edits a valid, complete skeleton instead of hand-writing selectors.
+export function emitManifest(coarse: CoarsenResult, plan: PlanResult, opts: { branch: string; base: string }): Manifest {
+  const used = new Map<string, number>();
+  const dedupe = (slug: string) => {
+    const n = (used.get(slug) ?? 0) + 1;
+    used.set(slug, n);
+    return n === 1 ? slug : `${slug}-${n}`;
+  };
+  const idFor = (p: CoarsenResult["projections"][number]) => {
+    // A dependency-manifest projection named after whichever lockfile sorted
+    // first ("bun") reads as a package name, not a change. Name it for what it
+    // is; the directory heuristic below is only sensible for source.
+    const reasons = new Set(p.sliceIds.flatMap((s) => plan.fallbackGroups.get(s)?.reasons ?? []));
+    if (p.fallbackOnly && reasons.size === 1 && reasons.has("dependency-manifest")) return dedupe("deps");
+
+    const dirs = p.files.map((f) => f.split("/").slice(0, -1));
+    const common: string[] = [];
+    if (dirs.length) {
+      for (let i = 0; i < dirs[0]!.length; i++) {
+        const seg = dirs[0]![i]!;
+        if (dirs.every((d) => d[i] === seg)) common.push(seg);
+        else break;
+      }
+    }
+    const basis = common.length ? common.join("-") : (p.files[0] ?? p.label).split("/").pop()!.replace(/\.[^.]+$/, "");
+    return dedupe(basis.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || p.label);
+  };
+
+  const idByLabel = new Map(coarse.projections.map((p) => [p.label, idFor(p)]));
+  return ManifestSchema.parse({
+    version: 1,
+    sourceBranch: opts.branch,
+    base: opts.base,
+    projections: coarse.projections.map((p) => ({
+      id: idByLabel.get(p.label)!,
+      title: `drip: ${idByLabel.get(p.label)!}`,
+      // Every group key of every member slice: more verbose than one key per
+      // slice, but it survives a slice being split apart by a later replan.
+      atomicSlices: [...new Set(p.sliceIds.flatMap((s) => plan.slices.get(s)!.map(groupKeyOf)))].sort(),
+      dependsOn: p.prerequisites.map((label) => idByLabel.get(label)!).sort(),
+    })),
+  });
+}
 
 export function loadManifest(path: string): Manifest {
   let raw: string;
@@ -523,4 +594,12 @@ export function printManifestReport(resolved: ResolvedManifest, extra: Finding[]
   }
 
   console.log(errors.length ? `\nMANIFEST: FAIL (${errors.length} error(s), ${warnings.length} warning(s))` : `\nMANIFEST: PASS (${warnings.length} warning(s))`);
+}
+
+export function writeManifest(path: string, manifest: Manifest, opts: { force?: boolean } = {}): void {
+  if (existsSync(path) && !opts.force) {
+    throw new DripError(`${path} already exists — pass --force to overwrite (this would discard any hand-written intent in it)`);
+  }
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, `${JSON.stringify(manifest, null, 2)}\n`);
 }

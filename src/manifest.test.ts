@@ -1,8 +1,20 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { computeProjections } from "./coarsen";
 import { ShellGitBackend } from "./git-backend";
-import { ManifestSchema, resolveManifest, unitsFromManifest, validateManifestAgainstGit, verificationUnits, type Manifest } from "./manifest";
+import {
+  emitManifest,
+  findManifest,
+  ManifestSchema,
+  manifestCandidates,
+  resolveManifest,
+  unitsFromManifest,
+  validateManifestAgainstGit,
+  verificationUnits,
+  writeManifest,
+  type Manifest,
+} from "./manifest";
 import { computePlan, type PlanResult } from "./planner";
 import { commit, git, makeTempRepo } from "./test-helpers";
 import { verifyTreeHash } from "./verify";
@@ -171,6 +183,53 @@ test("correspondence identity is the projection id, not the atomic slices under 
   m.projections.find((p) => p.id === "formatter")!.atomicSlices.push("src/appeals/report.ts::(file)");
   const moved = unitsFromManifest(resolveManifest(await plan(), m, { branch: "feature" }), "feature");
   expect(moved.signature("report")).toBe(units.signature("report"));
+});
+
+test("an emitted skeleton is a valid manifest that validates clean against the plan it came from", async () => {
+  const p = await plan();
+  const emitted = emitManifest(computeProjections(p), p, { branch: "feature", base: "main" });
+
+  // Round-trip through the schema: whatever we write must be loadable.
+  expect(() => ManifestSchema.parse(JSON.parse(JSON.stringify(emitted)))).not.toThrow();
+
+  const resolved = resolveManifest(p, emitted, { branch: "feature" });
+  expect(resolved.findings).toEqual([]);
+  // Every atomic slice accounted for — a skeleton that dropped one would be a
+  // trap, since the author would have to notice the omission themselves.
+  expect(resolved.projections.flatMap((x) => x.sliceIds).sort()).toEqual([...p.slices.keys()].sort());
+
+  const findings = await validateManifestAgainstGit({ git: backend, repoRoot, branch: "feature", mergeBase, plan: p, resolved });
+  expect(findings).toEqual([]);
+});
+
+test("emitted ids are deterministic, unique, and name what the projection is", async () => {
+  const p = await plan();
+  const a = emitManifest(computeProjections(p), p, { branch: "feature", base: "main" });
+  const b = emitManifest(computeProjections(p), p, { branch: "feature", base: "main" });
+  const ids = a.projections.map((x) => x.id);
+  expect(b.projections.map((x) => x.id)).toEqual(ids);
+  expect(new Set(ids).size).toBe(ids.length);
+  expect(ids.every((id) => /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id))).toBe(true);
+});
+
+test("the conventional manifest location is discovered, and prefers the committable one", () => {
+  const candidates = manifestCandidates(repoRoot, "feature");
+  expect(candidates[0]).toBe(join(repoRoot, ".drip", "projections", "feature.json"));
+  expect(candidates[1]).toContain(join("drip", "projections", "feature.json"));
+  expect(findManifest(repoRoot, "feature")).toBeNull();
+
+  try {
+    writeManifest(candidates[1]!, manifest());
+    expect(findManifest(repoRoot, "feature")).toBe(candidates[1]!);
+    writeManifest(candidates[0]!, manifest());
+    expect(findManifest(repoRoot, "feature")).toBe(candidates[0]!);
+    // Never silently clobber a hand-edited plan.
+    expect(() => writeManifest(candidates[0]!, manifest())).toThrow(/already exists/);
+    expect(() => writeManifest(candidates[0]!, manifest(), { force: true })).not.toThrow();
+  } finally {
+    rmSync(join(repoRoot, ".drip"), { recursive: true, force: true });
+    rmSync(candidates[1]!, { force: true });
+  }
 });
 
 test("the manifest's projections reconstruct the mega-branch tree", async () => {
