@@ -130,6 +130,53 @@ test("--target-slices merges by feature directory until the budget is met", asyn
   expect(projectionFor(capped, "README.md").files).toEqual(["README.md"]);
 });
 
+test("issue #9: a budget balances projections instead of collapsing everything into one", async () => {
+  const { repoRoot: wideRoot, cleanup } = makeTempRepo("drip-coarsen-test-wide-");
+  try {
+    mkdirSync(join(wideRoot, "src", "wide"), { recursive: true });
+    // Twelve mutually independent symbols in one directory: nothing links them,
+    // so only the directory-affinity budget pass can merge them.
+    for (let i = 0; i < 12; i++) {
+      writeFileSync(join(wideRoot, "src", "wide", `m${i}.ts`), `export function fn${i}() {\n  return ${i};\n}\n`);
+    }
+    commit(wideRoot, "init");
+    git(["checkout", "-q", "-b", "feature"], wideRoot);
+    for (let i = 0; i < 12; i++) {
+      writeFileSync(join(wideRoot, "src", "wide", `m${i}.ts`), `export function fn${i}() {\n  return ${i} + 1;\n}\n`);
+    }
+    commit(wideRoot, "touch all twelve");
+
+    const p = await computePlan({ git: backend, repoRoot: wideRoot, branch: "feature", baseBranch: "main" });
+    expect(p.order).not.toBeNull();
+    expect(p.slices.size).toBe(12);
+
+    const coarse = computeProjections(p, { targetSlices: 4 });
+    expect(coarse.projections.length).toBe(4);
+    expect(coarse.targetMet).toBe(true);
+
+    // The actual regression: the budget used to be met by folding everything
+    // into one projection and leaving the rest as near-empty singletons. Greedy
+    // pairing doesn't promise perfect thirds, but it does promise that no
+    // projection runs away and none is left trivial.
+    const sizes = coarse.projections.map((x) => x.sliceIds.length);
+    expect(Math.max(...sizes)).toBeLessThanOrEqual(4); // fair share is 3
+    expect(Math.min(...sizes)).toBeGreaterThanOrEqual(2);
+    expect(coarse.largestProjectionHunks).toBeLessThanOrEqual(Math.ceil(12 / 4) * 2);
+  } finally {
+    cleanup();
+  }
+});
+
+test("issue #9: an unreachable budget stops with a reason instead of one runaway projection", async () => {
+  const p = await plan();
+  // Far more aggressive than this diff's shape allows: docs and manifests are
+  // held out of directory merging entirely, so 1 is not reachable.
+  const coarse = computeProjections(p, { targetSlices: 1 });
+  expect(coarse.targetMet).toBe(false);
+  expect(coarse.unmetReason).not.toBeNull();
+  expect(coarse.projections.length).toBeGreaterThan(1);
+});
+
 test("coarsening is deterministic across replans", async () => {
   const a = computeProjections(await plan(), { targetSlices: 3 });
   const b = computeProjections(await plan(), { targetSlices: 3 });

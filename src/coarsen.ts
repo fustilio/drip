@@ -27,6 +27,7 @@ export type Projection = {
   slices: string[]; // constituent atomic slice labels
   files: string[];
   symbols: string[];
+  hunkCount: number; // review-size proxy: what a budget is actually balancing
   prerequisites: string[]; // projection labels this one must land after
   merges: { rule: MergeRule; absorbed: string; into: string }[];
   pinned: boolean; // holds a force_split-pinned group — never merged
@@ -40,6 +41,8 @@ export type CoarsenResult = {
   atomicSliceCount: number;
   targetSlices: number | null;
   targetMet: boolean;
+  unmetReason: "size-cap" | "structure" | null;
+  largestProjectionHunks: number;
 };
 
 const TEST_FILE = /(^|\/)__tests__\/|\.(test|spec)\.[cm]?[jt]sx?$/;
@@ -174,6 +177,12 @@ export function computeProjections(plan: PlanResult, opts: { targetSlices?: numb
   // files (docs, config) stay out of it — they're separate projections unless
   // an override says otherwise.
   let targetMet = targetSlices === null;
+  // Why a requested budget wasn't reached: "size-cap" means further merges
+  // would have produced one runaway projection, "structure" means cycles or
+  // force_split pins blocked them. The distinction matters — the first says
+  // the budget is too aggressive for this diff, the second that it's
+  // unreachable at any size.
+  let unmetReason: "size-cap" | "structure" | null = null;
   if (targetSlices !== null) {
     const eligible = (root: string) => {
       if (pinned.has(root)) return false;
@@ -182,6 +191,17 @@ export function computeProjections(plan: PlanResult, opts: { targetSlices?: numb
     };
     const maxDepth = Math.max(0, ...order.flatMap((id) => filesOf.get(id)!.map((f) => dirSegments(f).length)));
     const rejected = new Set<string>();
+    const sizeOf = (root: string) => membersOf(root).reduce((n, m) => n + hunksOf(m).length, 0);
+
+    // A budget asks for N *reviewable* units, not N buckets one of which holds
+    // everything. Seeding every merge in a bucket at its first member produced
+    // exactly that: on a real 161-slice branch `--target-slices 12` met the
+    // count by folding 149 slices into one projection (issue #9). So pair the
+    // two smallest candidates, and refuse any merge that would push a
+    // projection past twice its fair share of the diff.
+    const totalHunks = order.reduce((n, id) => n + hunksOf(id).length, 0);
+    const sizeCap = Math.max(1, Math.ceil(totalHunks / targetSlices) * 2);
+    let cappedOut = false;
 
     while (roots().length > targetSlices) {
       let merged = false;
@@ -199,22 +219,34 @@ export function computeProjections(plan: PlanResult, opts: { targetSlices?: numb
           buckets.set(prefix, list);
         }
         for (const prefix of [...buckets.keys()].sort()) {
-          const group = buckets.get(prefix)!.sort((a, b) => rank.get(a)! - rank.get(b)!);
-          for (let i = 1; i < group.length; i++) {
-            const pair = `${group[0]} ${group[i]}`;
-            if (rejected.has(pair)) continue;
-            if (tryMerge(group[0]!, group[i]!, "directory-affinity")) {
-              merged = true;
-              break;
+          // Smallest first, rank only as a deterministic tie-break.
+          const group = buckets.get(prefix)!.sort((a, b) => sizeOf(a) - sizeOf(b) || rank.get(a)! - rank.get(b)!);
+          for (let i = 0; i < group.length && !merged; i++) {
+            for (let j = i + 1; j < group.length; j++) {
+              const a = group[i]!;
+              const b = group[j]!;
+              const pair = `${a} ${b}`;
+              if (rejected.has(pair)) continue;
+              if (sizeOf(a) + sizeOf(b) > sizeCap) {
+                // Not permanently rejected: a later pass may pair either side
+                // with something small enough.
+                cappedOut = true;
+                continue;
+              }
+              if (tryMerge(a, b, "directory-affinity")) {
+                merged = true;
+                break;
+              }
+              rejected.add(pair);
             }
-            rejected.add(pair);
           }
           if (merged) break;
         }
       }
-      if (!merged) break; // nothing left that can merge without a cycle
+      if (!merged) break; // nothing mergeable without a cycle or past the cap
     }
     targetMet = roots().length <= targetSlices;
+    if (!targetMet) unmetReason = cappedOut ? "size-cap" : "structure";
   }
 
   // --- emit ------------------------------------------------------------------
@@ -244,6 +276,7 @@ export function computeProjections(plan: PlanResult, opts: { targetSlices?: numb
       slices: sliceIds.map(sliceLabel),
       files: [...new Set(hunks.map((h) => h.file))].sort(),
       symbols: [...new Set(hunks.map((h) => h.qualifiedSymbol).filter((s): s is string => !!s))].sort(),
+      hunkCount: hunks.length,
       prerequisites: [...new Set(prereqs)],
       merges: merges.get(root) ?? [],
       pinned: pinned.has(root),
@@ -258,6 +291,8 @@ export function computeProjections(plan: PlanResult, opts: { targetSlices?: numb
     atomicSliceCount: order.length,
     targetSlices,
     targetMet,
+    unmetReason,
+    largestProjectionHunks: Math.max(0, ...projections.map((p) => p.hunkCount)),
   };
 }
 
@@ -267,6 +302,8 @@ export function projectionsToJson(coarse: CoarsenResult): object {
     projectionCount: coarse.projections.length,
     targetSlices: coarse.targetSlices,
     targetMet: coarse.targetMet,
+    unmetReason: coarse.unmetReason,
+    largestProjectionHunks: coarse.largestProjectionHunks,
     projections: coarse.projections.map((p) => ({
       projection: p.label,
       signature: p.signature,
@@ -274,6 +311,7 @@ export function projectionsToJson(coarse: CoarsenResult): object {
       prerequisites: p.prerequisites,
       files: p.files,
       symbols: p.symbols,
+      hunkCount: p.hunkCount,
       merges: p.merges,
       pinned: p.pinned,
       fallbackOnly: p.fallbackOnly,
@@ -288,14 +326,18 @@ export function printProjections(coarse: CoarsenResult): void {
   console.log(`\nPROJECTIONS (${coarse.projections.length} candidate PRs from ${coarse.atomicSliceCount} atomic slices):`);
   for (const p of coarse.projections) {
     const tags = [p.pinned ? "pinned" : null, p.fallbackOnly ? "fallback" : null].filter(Boolean).join(", ");
-    console.log(`  ${p.label}${tags ? ` (${tags})` : ""}: ${p.slices.join(", ")}`);
+    console.log(`  ${p.label}${tags ? ` (${tags})` : ""}: ${p.slices.length} slice(s), ${p.hunkCount} hunk(s)`);
+    console.log(`    ${p.slices.join(", ")}`);
     for (const f of p.files) console.log(`    ${f}`);
     if (p.prerequisites.length) console.log(`    requires: ${p.prerequisites.join(", ")}`);
     for (const m of p.merges) console.log(`    merged ${m.absorbed} into ${m.into} (${m.rule})`);
   }
   if (coarse.targetSlices !== null && !coarse.targetMet) {
-    console.log(
-      `\n  note: could not reach --target-slices ${coarse.targetSlices} — ${coarse.projections.length} projections remain; further merges would make the projection graph cyclic or are pinned by a force_split override.`,
-    );
+    const why =
+      coarse.unmetReason === "size-cap"
+        ? "further merges would have produced one runaway projection rather than a reviewable unit — the budget is too aggressive for this diff's shape"
+        : "further merges would make the projection graph cyclic, or are pinned by a force_split override";
+    console.log(`\n  note: stopped at ${coarse.projections.length} projections, short of --target-slices ${coarse.targetSlices}: ${why}.`);
+    console.log(`  largest projection: ${coarse.largestProjectionHunks} hunk(s). Coarsening cannot derive semantic boundaries — see \`--manifest\`.`);
   }
 }

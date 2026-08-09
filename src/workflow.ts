@@ -64,9 +64,11 @@ export async function runVerify(opts: {
   buildCmdOverride: string | undefined;
   noBuildCheck: boolean;
   coarsen?: CoarsenResult | null;
+  /** explicit units (a manifest's projections) — takes precedence over coarsen */
+  units?: { order: string[]; slices: Map<string, Hunk[]>; idToNum: Map<string, number> };
 }): Promise<{ pass: boolean; tree: TreeHashResult; build: BuildOutcome }> {
   const { git, db, branch, repoRoot, mergeBase, plan, buildCmdOverride, noBuildCheck } = opts;
-  const units = projectedUnits(plan, opts.coarsen ?? null);
+  const units = opts.units ?? projectedUnits(plan, opts.coarsen ?? null);
   const tree = await verifyTreeHash({ git, repoRoot, branch, mergeBase, files: plan.files, order: units.order, slices: units.slices });
 
   if (noBuildCheck) return { pass: tree.pass, tree, build: { kind: "disabled" } };
@@ -85,7 +87,7 @@ export async function runVerify(opts: {
     slices: units.slices,
     idToNum: units.idToNum,
     buildCmd,
-    label: opts.coarsen ? (id: string) => id : undefined, // projection labels are already their ids
+    label: opts.coarsen || opts.units ? (id: string) => id : undefined, // projection ids are already their labels
   });
   return { pass: tree.pass && result.failures.length === 0, tree, build: { kind: "ran", buildCmd, result } };
 }

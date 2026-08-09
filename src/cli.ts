@@ -2,10 +2,11 @@
 import { parseArgs } from "node:util";
 import { assignChangeIds } from "./change-id";
 import { computeProjections, printProjections, projectionsToJson } from "./coarsen";
+import { loadManifest, manifestReportToJson, printManifestReport, resolveManifest, unitsFromManifest, validateManifestAgainstGit, verificationUnits } from "./manifest";
 import { DripError } from "./errors";
 import { ShellGitBackend, type GitBackend } from "./git-backend";
 import { planToJson, printPlan } from "./planner";
-import { push } from "./push";
+import { push, type PushUnits } from "./push";
 import { resolveRepoRoot } from "./repo";
 import { addOverride, listOverrides, openStore, recordTiming, removeOverride } from "./store";
 import { loadPlan, runVerify } from "./workflow";
@@ -13,8 +14,9 @@ import { loadPlan, runVerify } from "./workflow";
 function usage(): never {
   console.error("usage: drip plan <branch> [--repo path] [--base branch] [--timing] [--assign-ids] [--json] [--coarsen] [--target-slices n]");
   console.error("       drip verify <branch> [--repo path] [--base branch] [--timing] [--coarsen] [--target-slices n] [--build-cmd cmd] [--no-build-check]");
+  console.error("       drip validate-plan <branch> --manifest path [--repo path] [--base branch] [--json]");
   console.error(
-    "       drip push <branch> [--repo path] [--base branch] [--projection stacked|flat-first] [--build-cmd cmd] [--no-build-check] --yes | --dry-run",
+    "       drip push <branch> [--repo path] [--base branch] [--projection stacked|flat-first] [--manifest path] [--build-cmd cmd] [--no-build-check] --yes | --dry-run",
   );
   console.error(
     "       drip override add <branch> --kind force_merge|force_split --selector-a file::Symbol [--selector-b file::Symbol] [--note text] [--repo path]",
@@ -129,6 +131,7 @@ async function main() {
       json: { type: "boolean", default: false },
       coarsen: { type: "boolean", default: false },
       "target-slices": { type: "string" },
+      manifest: { type: "string" },
       kind: { type: "string" },
       "selector-a": { type: "string" },
       "selector-b": { type: "string" },
@@ -150,14 +153,15 @@ async function main() {
     return;
   }
 
-  if (!command || !branch || (command !== "plan" && command !== "verify" && command !== "push")) usage();
+  const isCommand = command === "plan" || command === "verify" || command === "push" || command === "validate-plan";
+  if (!command || !branch || !isCommand) usage();
 
   const targetDir = values.repo ?? process.cwd();
   const repoRoot = resolveRepoRoot(git, targetDir);
   const baseBranch = values.base!;
   const started = Date.now();
 
-  const jsonOut = !!values.json && command === "plan";
+  const jsonOut = !!values.json && (command === "plan" || command === "validate-plan");
 
   if (command === "plan" && values["assign-ids"]) {
     const { rewritten, headSha } = assignChangeIds(git, repoRoot, branch, baseBranch);
@@ -177,6 +181,26 @@ async function main() {
   if (plan.hunks.length === 0) {
     if (jsonOut) console.log(JSON.stringify({ ok: true, slices: [], edges: [], unmatchedOverrideSelectors: [] }));
     else console.log(`No changes between ${baseBranch} and ${branch} — nothing to slice.`);
+    return;
+  }
+
+  // --- validate-plan: the manifest's own command, no push, no side effects ---
+  if (command === "validate-plan") {
+    if (!values.manifest) throw new DripError("validate-plan requires --manifest <path>");
+    if (!plan.order) {
+      printPlan(plan);
+      throw new DripError("cannot validate a manifest against a cyclic slice DAG — resolve the cycle first");
+    }
+    const resolved = resolveManifest(plan, loadManifest(values.manifest), { branch });
+    // The git-backed checks only make sense once the manifest is structurally
+    // coherent; running them on a broken graph just produces noise.
+    const gitFindings = resolved.ok
+      ? await validateManifestAgainstGit({ git, repoRoot, branch, mergeBase, plan, resolved })
+      : [];
+    if (jsonOut) console.log(JSON.stringify(manifestReportToJson(resolved, gitFindings)));
+    else printManifestReport(resolved, gitFindings);
+    const failed = [...resolved.findings, ...gitFindings].some((f) => f.severity === "error");
+    if (failed) process.exit(1);
     return;
   }
 
@@ -210,6 +234,26 @@ async function main() {
     throw new DripError("--coarsen is a planning mode — `drip push` materializes atomic slices. Use `drip plan --coarsen` / `drip verify --coarsen`.");
   }
 
+  // A manifest defines the units `push` materializes, so verification must run
+  // against those same units — verifying atomic slices and pushing projections
+  // would prove the wrong thing. Validated first: pushing an incoherent
+  // manifest is worse than not pushing at all.
+  let manifestUnits: PushUnits | undefined;
+  let manifestVerifyUnits: ReturnType<typeof verificationUnits> | undefined;
+  if (values.manifest) {
+    const resolved = resolveManifest(plan, loadManifest(values.manifest), { branch });
+    const gitFindings = resolved.ok ? await validateManifestAgainstGit({ git, repoRoot, branch, mergeBase, plan, resolved }) : [];
+    printManifestReport(resolved, gitFindings);
+    if ([...resolved.findings, ...gitFindings].some((f) => f.severity === "error")) {
+      console.error("\npush refused: manifest validation failed");
+      process.exit(1);
+    }
+    manifestUnits = unitsFromManifest(resolved, branch);
+    // Verification covers the deferred remainder too, so the tree check proves
+    // nothing was lost; push still only materializes the projections.
+    manifestVerifyUnits = verificationUnits(resolved);
+  }
+
   const verifyResult = await runVerify({
     git,
     db,
@@ -220,8 +264,9 @@ async function main() {
     buildCmdOverride: values["build-cmd"],
     noBuildCheck: !!values["no-build-check"],
     coarsen: coarse,
+    units: manifestVerifyUnits,
   });
-  printVerifyResult(verifyResult, coarse ? coarse.projections.length : plan.order.length);
+  printVerifyResult(verifyResult, manifestUnits ? manifestUnits.order.length : coarse ? coarse.projections.length : plan.order.length);
   const pass = verifyResult.pass;
 
   if (command === "verify") {
@@ -246,8 +291,9 @@ async function main() {
     throw new DripError(`--projection must be 'stacked' or 'flat-first', got '${projection}'`);
   }
 
-  const results = await push({ git, db, repoRoot, branch, baseBranch, mergeBase, plan, dryRun, projection });
-  console.log(dryRun ? `\nDRY RUN (${projection}, no branches pushed, no PRs created):` : `\nPUSHED (${projection}):`);
+  const results = await push({ git, db, repoRoot, branch, baseBranch, mergeBase, plan, dryRun, projection, units: manifestUnits });
+  const mode = `${projection}${manifestUnits ? ", manifest" : ""}`;
+  console.log(dryRun ? `\nDRY RUN (${mode}, no branches pushed, no PRs created):` : `\nPUSHED (${mode}):`);
   for (const r of results) {
     console.log(`  ${r.sliceLabel} -> ${r.branchName} [${r.status}] base: ${r.base}${r.prUrl ? ` ${r.prUrl}` : ""}`);
     if (r.note) console.log(`      ${r.note}`);

@@ -10,7 +10,8 @@ A tool for drip-feeding a mega branch back into main as thin, reviewable PRs. Sl
 bun install
 bun src/cli.ts plan <branch> [--repo path] [--base branch] [--timing] [--assign-ids] [--json] [--coarsen] [--target-slices n]
 bun src/cli.ts verify <branch> [--repo path] [--base branch] [--timing] [--coarsen] [--target-slices n] [--build-cmd cmd] [--no-build-check]
-bun src/cli.ts push <branch> [--repo path] [--base branch] [--projection stacked|flat-first] [--build-cmd cmd] [--no-build-check] --yes | --dry-run
+bun src/cli.ts push <branch> [--repo path] [--base branch] [--projection stacked|flat-first] [--manifest path] [--build-cmd cmd] [--no-build-check] --yes | --dry-run
+bun src/cli.ts validate-plan <branch> --manifest path [--repo path] [--base branch] [--json]
 bun src/cli.ts mcp
 ```
 
@@ -28,7 +29,31 @@ bun src/cli.ts mcp
 - **`push`** — refuses if `verify` fails. Materializes each slice as a `drip/<branch>/sliceN` branch and opens a PR via `gh` for each one that doesn't already have a correspondence entry (re-running updates the existing branch/PR instead of duplicating it — see `docs/adr/0006-slice-correspondence-key.md`). `--dry-run` previews without touching GitHub; otherwise `--yes` is required, since this is the one command with real external side effects.
   - `--projection stacked` (default) chains every PR onto the previous slice's branch.
   - `--projection flat-first` picks each base from the DAG instead: independent roots target the base branch, a slice with one prerequisite targets that prerequisite's branch, and a slice with several gets a generated `drip/<branch>/sliceN-base` integration branch. Nothing is made a review dependency purely by topological ordering — see `docs/adr/0016-flat-first-projection.md`. A slice whose hunks won't apply on its prerequisites alone is reported `blocked` and not pushed (exit 1), never silently dropped.
-- **`mcp`** — starts an MCP stdio server exposing `drip_plan`, `drip_verify`, `drip_override_list`, `drip_override_add`, `drip_override_remove` as tools, so an MCP client (an agent, an editor integration) can read plan/verify data and write override decisions without shelling out to the CLI. No `push` tool — that command has real side effects and needs `--yes` from a human. No AI provider inside drip anywhere — see `docs/adr/0009-ai-integration-external-not-bundled.md`.
+- **`validate-plan`** — checks a **semantic projection manifest** against the current plan. Coarsening can balance slices; it cannot know that six of them are "the report-tab detail experience". So that boundary is stated explicitly in a JSON manifest, proposed by whatever is upstream (an agent reading `plan --json`, a human, both), and validated deterministically here — never derived, never auto-discovered, never written by drip. See `docs/adr/0018-semantic-projection-manifest.md`.
+
+  ```jsonc
+  {
+    "version": 1,
+    "sourceBranch": "mega-appeals",
+    "budgets": { "files": 20, "hunks": 60, "changedLines": 800 },
+    "projections": [
+      {
+        "id": "report-tab-details",
+        "title": "feat(appeals): show Report-tab details",
+        "intent": "Expose and render report, offence, offender and vehicle detail.",
+        // durable group-key selectors, not `slice17` ordinals — those renumber on replan
+        "atomicSlices": ["src/appeals/report.ts::renderReport"],
+        "glue": ["src/appeals/report.ts::(file)"],
+        "dependsOn": ["appeals-dto"],
+        "verification": ["bun test"]
+      }
+    ],
+    "defer": [{ "slice": "README.md::(file)", "reason": "ships with the release notes" }]
+  }
+  ```
+
+  Validated: every slice assigned exactly once or explicitly deferred with a reason; nothing deferred that another projection needs; the `dependsOn` graph acyclic; every atomic dependency crossing a boundary declared (widening is fine, dropping is not); each projection actually applies on its declared prerequisites; shared glue reachable from everyone who needs it; budgets respected unless `oversizeReason` says otherwise; and the whole graph still reconstructs the mega-branch tree — deferred slices included, so deferral can't silently lose work. `push --manifest` runs the same validation and refuses on any error; a projection's PR is keyed on its manifest `id`, so replanning underneath it doesn't cost the PR its identity or its review comments.
+- **`mcp`** — starts an MCP stdio server exposing `drip_plan`, `drip_verify`, `drip_validate_plan`, `drip_override_list`, `drip_override_add`, `drip_override_remove` as tools, so an MCP client (an agent, an editor integration) can read plan/verify data and write override decisions without shelling out to the CLI. No `push` tool — that command has real side effects and needs `--yes` from a human. No AI provider inside drip anywhere — see `docs/adr/0009-ai-integration-external-not-bundled.md`.
 
 ## M0 spike
 
