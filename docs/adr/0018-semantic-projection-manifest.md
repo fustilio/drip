@@ -32,8 +32,15 @@ A versioned JSON manifest, passed explicitly to `drip validate-plan` or
 proposes it from `plan --json`; drip owns validation and materialization and
 nothing else. Same boundary as docs/adr/0009: no AI inside the binary.
 
-The manifest is inert until passed. It is never read implicitly, never
-auto-discovered, and never written by drip.
+The manifest never *acts* implicitly. `push` uses one only when `--manifest`
+names it, so what a `push --yes` sends to GitHub is always something the caller
+asked for by name.
+
+Reading and writing are a weaker case, and the convention below reflects that:
+`validate-plan` (read-only, no side effects) discovers a manifest in the
+conventional location, and `plan --coarsen --emit-manifest` writes a skeleton
+there. Neither changes what gets pushed. See the Consequences section — this
+asymmetry is the whole point, not an inconsistency.
 
 ### Members are selectors, not ordinals
 
