@@ -10,7 +10,7 @@ A tool for drip-feeding a mega branch back into main as thin, reviewable PRs. Sl
 bun install
 bun src/cli.ts plan <branch>|--worktree [--repo path] [--base branch] [--timing] [--assign-ids] [--json] [--coarsen] [--target-slices n] [--emit-manifest [--manifest path] [--force]]
 bun src/cli.ts verify <branch>|--worktree [--repo path] [--base branch] [--timing] [--coarsen] [--target-slices n] [--build-cmd cmd] [--no-build-check]
-bun src/cli.ts push <branch> [--repo path] [--base branch] [--projection stacked|flat-first] [--manifest path] [--no-manifest-check] [--strict] [--require-verification] [--require-intent] [--reviewable-stack] [--draft] [--build-cmd cmd] [--no-build-check] --yes | --dry-run
+bun src/cli.ts push <branch> [--repo path] [--base branch] [--projection stacked|flat-first] [--manifest path] [--no-manifest-check] [--strict] [--require-verification] [--require-intent] [--reviewable-stack] [--draft] [--reclaim] [--build-cmd cmd] [--no-build-check] --yes | --dry-run
 bun src/cli.ts validate-plan <branch> [--manifest path] [--repo path] [--base branch] [--json] [--no-manifest-check] [--strict] [--require-verification] [--require-intent]
 bun src/cli.ts materialize <branch> [--manifest path] [--repo path] [--base branch] [--projection flat-first|stacked] [--only id[,id]] [--output dir] [--force] [--json] [--no-manifest-check] [--strict] [--require-verification] [--require-intent]
 bun src/cli.ts manifest adopt <branch> --projection id --pr n --head branch [--manifest path] [--repo path] [--base branch] [--remote name] [--json] [--yes]
@@ -21,6 +21,8 @@ bun src/cli.ts review-context <branch> [--projection id] [--manifest path] [--re
 bun src/cli.ts score <branch>|--worktree --expected path [--layer atomic|candidates|manifest] [--manifest path] [--target-slices n] [--threshold f] [--include-fallback] [--json] [--repo path] [--base branch]
 bun src/cli.ts mcp
 ```
+
+Every command declares its own flags, so `--help` is generated rather than maintained — `drip --help` lists the commands, `drip <command> --help` gives that command's flags with their accepted values. A flag that belongs to another command is an error rather than silently ignored. See `docs/adr/0029-cli-framework.md`.
 
 - **`plan`** — diffs `<branch>` against its merge-base with `--base` (default `main`), clusters hunks into slices via a tree-sitter symbol-edge graph (TypeScript/JavaScript only), prints the slice DAG. `--assign-ids` injects Gerrit-format `Change-Id` trailers into any commit missing one (opt-in, rewrites the branch in place, prints the old→new SHA mapping — never automatic). `--json` prints only a machine-readable plan (slices, files, symbols, edges, unmatched override selectors) — no other output — for an external tool to read ambiguous-boundary/naming context and write decisions back through `drip override add`. See BUILD-PLAN.md §9: the AI belongs upstream of the tool, not inside it — there's no `--ai` flag or bundled provider integration here on purpose.
   Hunks tree-sitter can't map to an enclosing symbol don't go into one catch-all bucket: each gets a deterministic per-file **fallback group** (`<path>::(file)`, or `<dir>/package.json::(deps)` for a manifest and its lockfile) with the reason it's unassigned, and those selectors work with `override add` like any symbol — see `docs/adr/0015-fallback-grouping.md`.
