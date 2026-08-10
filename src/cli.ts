@@ -52,7 +52,7 @@ function usage(): never {
     "       drip materialize <branch> [--manifest path] [--repo path] [--base branch] [--projection flat-first|stacked] [--only id[,id]] [--output dir] [--force] [--json] [--no-manifest-check] [--strict] [--require-verification] [--require-intent]",
   );
   console.error(
-    "       drip push <branch> [--repo path] [--base branch] [--projection stacked|flat-first] [--manifest path] [--no-manifest-check] [--strict] [--require-verification] [--require-intent] [--reviewable-stack] [--draft] [--build-cmd cmd] [--no-build-check] --yes | --dry-run",
+    "       drip push <branch> [--repo path] [--base branch] [--projection stacked|flat-first] [--manifest path] [--no-manifest-check] [--strict] [--require-verification] [--require-intent] [--reviewable-stack] [--draft] [--reclaim] [--build-cmd cmd] [--no-build-check] --yes | --dry-run",
   );
   console.error(
     "       drip override add <branch> --kind force_merge|force_split --selector-a file::Symbol [--selector-b file::Symbol] [--note text] [--repo path]",
@@ -391,6 +391,9 @@ async function main() {
       // with a name, not a review unit.
       "require-intent": { type: "boolean", default: false },
       "reviewable-stack": { type: "boolean", default: false },
+      // `push` only: overwrite a drip-owned branch that someone else has pushed
+      // to. Never applies to an adopted branch (docs/adr/0028).
+      reclaim: { type: "boolean", default: false },
       // `materialize` only: which projections to write, and where to check
       // them out. Repeatable and comma-separated both work.
       only: { type: "string", multiple: true },
@@ -788,8 +791,9 @@ async function main() {
 
   const draft = !!values.draft;
   const reviewableStack = !!values["reviewable-stack"];
-  const results = await push({ git, db, repoRoot, branch, baseBranch, mergeBase, plan, dryRun, projection, units: manifestUnits, draft, reviewableStack });
-  const mode = `${projection}${manifestUnits ? ", manifest" : ""}${draft ? ", draft" : ""}${reviewableStack ? ", reviewable-stack" : ""}`;
+  const reclaim = !!values.reclaim;
+  const results = await push({ git, db, repoRoot, branch, baseBranch, mergeBase, plan, dryRun, projection, units: manifestUnits, draft, reviewableStack, reclaim });
+  const mode = `${projection}${manifestUnits ? ", manifest" : ""}${draft ? ", draft" : ""}${reviewableStack ? ", reviewable-stack" : ""}${reclaim ? ", reclaim" : ""}`;
   console.log(dryRun ? `\nDRY RUN (${mode}, no branches pushed, no PRs created):` : `\nPUSHED (${mode}):`);
   for (const r of results) {
     // The draft state is only ever printed for a PR this run opens, so a

@@ -12,8 +12,8 @@ import { deleteCorrespondence, getCorrespondence, upsertCorrespondence, type Cor
 
 // "blocked" means there was nothing safe to push and drip said so instead of
 // skipping quietly: the slice's hunks wouldn't apply on its prerequisites
-// alone (flat-first), or an adopted branch moved on the remote and the lease
-// refused (docs/adr/0020).
+// alone (flat-first), or the branch moved on the remote since drip last wrote
+// it (docs/adr/0020 for adopted branches, docs/adr/0028 for drip-owned ones).
 export type SliceStatus = "created" | "updated" | "unchanged" | "squash-merged" | "dry-run" | "blocked";
 
 // The branch drip mints for a unit it owns. Adopted units keep their own
@@ -113,6 +113,13 @@ export async function push(opts: {
   draft?: boolean;
   /** refuse any projection that would need a generated integration base (issue #14) */
   reviewableStack?: boolean;
+  /**
+   * Push over a *drip-owned* branch that has moved on the remote, instead of
+   * refusing it. Never applies to an adopted branch — drip doesn't own that one
+   * and no flag here makes it safe to discard someone else's commit
+   * (docs/adr/0028).
+   */
+  reclaim?: boolean;
 }): Promise<PushResult[]> {
   const { git, db, repoRoot, branch, baseBranch, mergeBase, plan, dryRun } = opts;
   const projection = opts.projection ?? "stacked";
@@ -165,6 +172,26 @@ export async function push(opts: {
   // current tip? A clean --reverse --check apply means yes. One scratch index,
   // rebuilt fresh per slice from the tip (--check never mutates it, but
   // read-tree is cheap and keeps each check independent of the others).
+  // What the remote actually holds right now, read once for the whole run.
+  // Without this, "unchanged" means "drip's materialized tree matches the one
+  // drip recorded last time" and says nothing about the branch a reviewer is
+  // looking at: a commit pushed onto a drip-owned branch made the PR disagree
+  // with the projection, and drip either force-pushed over it or reported
+  // `unchanged` and left it there. Sha comparison against the recorded
+  // correspondence closes both holes (docs/adr/0028).
+  //
+  // A real push needs the network anyway, so a failure here is fatal — silently
+  // skipping the check immediately before a force-push is the bug being fixed.
+  // A dry-run is expected to work offline, so there it degrades to "unknown"
+  // and every affected result says the check didn't run.
+  let remoteHeads: Map<string, string> | null;
+  try {
+    remoteHeads = git.lsRemoteHeads("origin", repoRoot);
+  } catch (e) {
+    if (!dryRun) throw e;
+    remoteHeads = null;
+  }
+
   const baseTip = git.revParse(baseBranch, repoRoot);
   const tmpDir = mkdtempSync(join(tmpdir(), "drip-reconcile-"));
   const indexFile = join(tmpDir, "index");
@@ -281,7 +308,7 @@ export async function push(opts: {
       // its commit graph is pure loss (docs/adr/0020).
       const atThisTree = !!existing?.adopted && !!existing.commitSha && treeOf(existing.commitSha) === treeOf(commit);
       const effectiveHash = atThisTree && existing!.contentHash ? existing!.contentHash : contentHash;
-      const status = classifySliceStatus({ existing, squashMerged, contentHash: effectiveHash, dryRun });
+      let status = classifySliceStatus({ existing, squashMerged, contentHash: effectiveHash, dryRun });
 
       // Asked for drafts and there's nothing to open: say so rather than let
       // the flag look like it did something.
@@ -296,6 +323,64 @@ export async function push(opts: {
       if (status === "squash-merged") {
         draft = null;
         hiddenBase = false;
+      }
+
+      // Has the branch moved since drip last wrote it? Only meaningful once
+      // there's a recorded sha to expect — a branch with no correspondence is
+      // one drip has never pushed, and the name is drip's to claim.
+      //
+      // Deliberately checked after the squash-merge decision: a squash-merged
+      // projection's branch is about to become irrelevant and its PR closed, so
+      // whatever happened to it doesn't stand in the way of that cleanup.
+      //
+      // The rule across both cases below: discarding a commit drip didn't write
+      // needs permission, recreating drip's own branch doesn't.
+      let leaseExpect: string | null = existing?.commitSha ?? null;
+      if (status !== "squash-merged" && existing?.commitSha) {
+        const remoteTip = remoteHeads?.get(branchName) ?? null;
+        // Whatever the remote says, "unchanged" was decided against the sha
+        // drip recorded, not against the branch as it stands now.
+        const mustRepush = () => {
+          if (status === "unchanged") status = dryRun ? "dry-run" : "updated";
+        };
+
+        if (remoteHeads === null) {
+          note = [note, "could not read the remote to check whether this branch has moved; a real push checks this and refuses on drift"]
+            .filter(Boolean)
+            .join("; ");
+        } else if (remoteTip && remoteTip !== existing.commitSha) {
+          const moved =
+            `${existing.adopted ? "the adopted branch" : "this branch"} is at ${remoteTip.slice(0, 7)} on the remote, ` +
+            `but drip last wrote ${existing.commitSha.slice(0, 7)} — someone pushed to it`;
+          if (existing.adopted) {
+            block(`${moved}. Review those commits, then re-run \`drip manifest adopt\` to re-bind.`);
+            continue;
+          }
+          if (!opts.reclaim) {
+            block(
+              `${moved}. Refusing rather than discarding it: fold the change into the mega branch and replan, ` +
+                "or re-run with --reclaim to overwrite the branch with drip's projection.",
+            );
+            continue;
+          }
+          note = [note, `${moved}; --reclaim overwrote it`].filter(Boolean).join("; ");
+          leaseExpect = remoteTip; // the recorded sha is stale; expect what's actually there
+          mustRepush();
+        } else if (!remoteTip) {
+          // The branch is gone but correspondence still points at it. Putting
+          // back a branch drip owns discards nothing, so it needs no flag; an
+          // adopted branch drip never created is not one it will recreate.
+          if (existing.adopted) {
+            block(
+              `the adopted branch ${branchName} no longer exists on the remote, but correspondence still records ` +
+                `${existing.commitSha.slice(0, 7)}. Restore it, or drop the binding with \`drip manifest forget\`.`,
+            );
+            continue;
+          }
+          note = [note, `${branchName} was missing on the remote and was recreated from drip's projection`].filter(Boolean).join("; ");
+          leaseExpect = null; // nothing to expect: the ref doesn't exist
+          mustRepush();
+        }
       }
 
       if (dryRun) {
@@ -327,24 +412,28 @@ export async function push(opts: {
       if (integrationBranch && flat!.integrationCommit) {
         git.push("origin", `${flat!.integrationCommit}:refs/heads/${integrationBranch}`, repoRoot, true);
       }
-      const lease = existing?.adopted && existing.commitSha ? { ref: branchName, expect: existing.commitSha } : undefined;
+      // Every branch drip has a recorded sha for is pushed under a lease, its
+      // own included: the ls-remote check above reads the remote once per run,
+      // and this is what closes the window between that read and this push.
+      const lease = leaseExpect ? { ref: branchName, expect: leaseExpect } : undefined;
       try {
         git.push("origin", `${commit}:refs/heads/${branchName}`, repoRoot, true, lease);
       } catch (e) {
         if (!lease) throw e;
-        // The lease did its job: someone pushed to the adopted branch after
-        // drip last saw it. Refusing loudly and leaving that commit alone is
-        // the whole reason adopted branches aren't force-pushed blind.
+        // The lease did its job: the branch moved between this run's ls-remote
+        // and this push. Refusing loudly and leaving that commit alone is the
+        // whole point — for an adopted branch because drip doesn't own it, for
+        // a drip-owned one because nobody asked for it to be discarded.
         blockedIds.add(sliceId);
         results.push({
           sliceLabel,
           branchName,
-          prUrl: existing!.prUrl,
+          prUrl: existing?.prUrl ?? null,
           status: "blocked",
           base,
           note:
-            `the adopted branch has moved on the remote since drip recorded ${existing!.commitSha!.slice(0, 7)} — ` +
-            "force-with-lease refused rather than discard those commits. Review them, then re-run `drip manifest adopt` to re-bind.",
+            `${branchName} moved on the remote during this run (expected ${lease.expect.slice(0, 7)}) — ` +
+            "force-with-lease refused rather than discard those commits. Re-run to see where it stands now.",
           draft: null,
           hiddenBase: false,
         });

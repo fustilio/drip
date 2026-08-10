@@ -97,12 +97,12 @@ afterEach(() => {
   cleanupRemote();
 });
 
-async function runPush(dryRun = false, draft = false) {
+async function runPush(dryRun = false, draft = false, extra: { reclaim?: boolean } = {}) {
   const { push } = await import("./push");
   using db = openStore(repoRoot);
   const plan = await computePlan({ git: backend, repoRoot, branch: "feature", baseBranch: "main" });
   const mergeBase = backend.mergeBase("main", "feature", repoRoot);
-  const results = await push({ git: backend, db, repoRoot, branch: "feature", baseBranch: "main", mergeBase, plan, dryRun, draft });
+  const results = await push({ git: backend, db, repoRoot, branch: "feature", baseBranch: "main", mergeBase, plan, dryRun, draft, ...extra });
   return { results, db, plan };
 }
 
@@ -175,6 +175,98 @@ test("draft: an existing PR keeps its own state — nothing is set, and the flag
   expect(ghCreatePr).not.toHaveBeenCalled();
   expect(results[0]!.draft).toBeNull();
   expect(results[0]!.note).toContain("--draft applies only when opening a PR");
+});
+
+// --- docs/adr/0028: a drip-owned branch that moved on the remote -------------
+//
+// The hole these cover: `unchanged` used to be decided purely against the sha
+// drip recorded, so a commit someone pushed onto a drip-owned branch was either
+// force-pushed away (plan moved) or left in place under an "unchanged" that
+// claimed the PR was right (plan didn't). Neither was reported.
+
+/** A reviewer pushes a commit straight onto the branch drip opened. */
+function pushOntoSliceBranch(message: string) {
+  git(["fetch", "-q", "origin", "drip/feature/slice0"], repoRoot);
+  git(["checkout", "-q", "-B", "reviewer", "FETCH_HEAD"], repoRoot);
+  writeFileSync(join(repoRoot, "REVIEW.md"), `${message}\n`);
+  commit(repoRoot, message);
+  git(["push", "-q", "origin", "reviewer:drip/feature/slice0"], repoRoot);
+  git(["checkout", "-q", "feature"], repoRoot);
+}
+
+test("drip-owned branch moved, plan unchanged: blocked, not reported 'unchanged'", async () => {
+  await runPush();
+  pushOntoSliceBranch("reviewer: address feedback");
+
+  const { results } = await runPush();
+  expect(results[0]!.status).toBe("blocked");
+  expect(results[0]!.note).toContain("someone pushed to it");
+  expect(results[0]!.note).toContain("--reclaim");
+  // The commit is still there: refusing means refusing, not "warn and clobber".
+  expect(gitOutput(["log", "--format=%s", "-1", "drip/feature/slice0"], remoteRoot).trim()).toBe("reviewer: address feedback");
+});
+
+test("drip-owned branch moved, plan also moved: still blocked rather than force-pushed over", async () => {
+  await runPush();
+  pushOntoSliceBranch("reviewer: address feedback");
+
+  writeFileSync(join(repoRoot, "a.ts"), `export function a() {\n  return 3;\n}\n`);
+  commit(repoRoot, "feature edit");
+
+  const { results } = await runPush();
+  expect(results[0]!.status).toBe("blocked");
+  expect(gitOutput(["log", "--format=%s", "-1", "drip/feature/slice0"], remoteRoot).trim()).toBe("reviewer: address feedback");
+  // Blocked means nothing was sent to GitHub either.
+  expect(ghPrComment).not.toHaveBeenCalled();
+  expect(reconcileComments).not.toHaveBeenCalled();
+});
+
+test("--reclaim overwrites a drip-owned branch that moved, and says it did", async () => {
+  await runPush();
+  pushOntoSliceBranch("reviewer: address feedback");
+
+  const { results } = await runPush(false, false, { reclaim: true });
+  expect(results[0]!.status).toBe("updated");
+  expect(results[0]!.note).toContain("--reclaim overwrote it");
+  expect(gitOutput(["log", "--format=%s", "-1", "drip/feature/slice0"], remoteRoot).trim()).not.toBe("reviewer: address feedback");
+});
+
+test("--reclaim is not an adopted-branch escape hatch: it only touches branches drip owns", async () => {
+  const { push } = await import("./push");
+  using db = openStore(repoRoot);
+  const plan = await computePlan({ git: backend, repoRoot, branch: "feature", baseBranch: "main" });
+  const mergeBase = backend.mergeBase("main", "feature", repoRoot);
+  const { computeSliceSignature } = await import("./signature");
+  const signature = computeSliceSignature(plan.slices.get(plan.order![0]!)!);
+
+  // Same drift, but the correspondence says this branch was adopted.
+  await push({ git: backend, db, repoRoot, branch: "feature", baseBranch: "main", mergeBase, plan, dryRun: false });
+  upsertCorrespondence(db, { ...getCorrespondence(db, "feature", signature)!, adopted: true });
+  pushOntoSliceBranch("reviewer: address feedback");
+
+  const results = await push({ git: backend, db, repoRoot, branch: "feature", baseBranch: "main", mergeBase, plan, dryRun: false, reclaim: true });
+  expect(results[0]!.status).toBe("blocked");
+  expect(results[0]!.note).toContain("manifest adopt");
+  expect(gitOutput(["log", "--format=%s", "-1", "drip/feature/slice0"], remoteRoot).trim()).toBe("reviewer: address feedback");
+});
+
+test("a drip-owned branch deleted from the remote is recreated, not reported 'unchanged'", async () => {
+  await runPush();
+  git(["push", "-q", "origin", "--delete", "drip/feature/slice0"], repoRoot);
+
+  const { results } = await runPush();
+  expect(results[0]!.status).toBe("updated");
+  expect(results[0]!.note).toContain("recreated");
+  expect(gitOutput(["branch"], remoteRoot)).toContain("drip/feature/slice0");
+});
+
+test("dry-run reports drift without pushing anything", async () => {
+  await runPush();
+  pushOntoSliceBranch("reviewer: address feedback");
+
+  const { results } = await runPush(true);
+  expect(results[0]!.status).toBe("blocked");
+  expect(gitOutput(["log", "--format=%s", "-1", "drip/feature/slice0"], remoteRoot).trim()).toBe("reviewer: address feedback");
 });
 
 // --- issue #6: flat-first projection ----------------------------------------

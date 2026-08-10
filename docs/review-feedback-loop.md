@@ -44,8 +44,9 @@ that drift without changing anything.
 | External input | What drip does | When | Where it's reported |
 |---|---|---|---|
 | **Review comment on a hunk** | Re-derives the slice's hunks and looks for an exact hash match. Still there → left alone. Gone → a threaded reply on the original comment saying the code moved and couldn't be confidently relocated. | Next push, and only if that projection's content actually changed | The reply on the thread; `review-context` lists comments drip previously failed to relocate |
-| **Commit pushed to a branch drip opened** | Nothing protects it. See [Who owns the branch](#who-owns-the-branch) below — this is the sharp edge. | — | — |
-| **Commit pushed to an *adopted* branch** | `--force-with-lease` against the sha drip recorded refuses the push rather than discarding the commit. The projection is marked `blocked` and everything depending on it is refused too. | Next push | `blocked` status with the recorded sha and "review them, then re-run `drip manifest adopt`" |
+| **Commit pushed to a branch drip opened** | Refused. drip reads the remote once per run, sees the branch isn't at the sha it last wrote, and blocks rather than choosing silently between discarding the commit and ignoring it. `--reclaim` overwrites deliberately. | Next push | `blocked`, naming both shas and the two ways forward |
+| **Commit pushed to an *adopted* branch** | Same refusal, and no `--reclaim`: drip doesn't own the branch. The projection is `blocked` and everything depending on it is refused too. | Next push | `blocked` with the recorded sha and "review them, then re-run `drip manifest adopt`" |
+| **PR branch deleted from the remote** | drip-opened → recreated from the projection, reported in the note. Adopted → `blocked`; drip won't recreate a branch it never made. | Next push | The note, or `blocked` |
 | **Projection squash-merged into base** | Reverse-applies the projection's patch against the base tip; if it applies clean the content is already on base, so the projection is dropped from the stack and its PR closed with a comment. Later projections re-base past it. | Next push | `squash-merged` status; the closing comment on the PR |
 | **PR base retargeted by hand** | On a PR drip opened: retargeted back to what the manifest graph implies. On an adopted PR: reported every run and never changed, because the base is a review decision someone else made. | Next push | The projection's note: "targets X, but the manifest implies Y — drip does not retarget an adopted PR" |
 | **More commits on the mega branch** | Replans from scratch. A manifest projection keeps its PR because correspondence is keyed on the manifest `id`; an atomic slice keeps its PR only while its symbol composition is stable. | Next plan/push | `review-context` reports content drift per projection, with the changed files and selectors |
@@ -57,29 +58,29 @@ that drift without changing anything.
 Almost every row above is a consequence of one distinction:
 
 - A **drip-opened** branch (`drip/<branch>/<id>`) is drip's property. It is
-  force-pushed with no lease, retargeted freely, and regenerated rather than
-  rebased — that is what "slices are derived projections" means.
+  regenerated rather than rebased — that is what "slices are derived
+  projections" means — and retargeted freely.
 - An **adopted** branch (`drip manifest adopt`) is someone else's property.
-  Force-pushed **with a lease**, skipped on tree equality rather than content
-  hash, and never retargeted (docs/adr/0020).
+  Skipped on tree equality rather than content hash, and never retargeted
+  (docs/adr/0020).
 
 If a branch has reviewers on it and history you care about, adopt it. Don't let
 drip open a parallel PR beside it — that's what `drip manifest discover` is for.
 
-> [!WARNING]
-> **A commit pushed to a drip-opened branch is not safe.** There is no lease on
-> that path, by design. Two things can happen, and neither is loud:
->
-> - drip's plan has moved → the branch is force-pushed and the commit is gone.
-> - drip's plan has *not* moved → the projection is reported `unchanged` and
->   nothing is pushed, so the commit survives on a branch that no longer matches
->   the projection drip thinks is there. The content hash covers drip's own
->   materialized tree, not the remote branch's current tip, so drip does not
->   notice.
->
-> Review suggestions on a drip-opened PR belong in the mega branch, not on the
-> projection branch. `drip review-context` is the way to check what a PR
-> currently carries before assuming either outcome.
+What ownership does **not** change is whether drip may discard a commit it
+didn't write. Every branch drip has a recorded sha for is checked against the
+remote once per run and pushed under a lease, its own branches included, so a
+commit someone pushed onto a projection branch blocks the push either way
+(docs/adr/0028). The difference is the way out: a drip-owned branch can be
+overwritten deliberately with `--reclaim`, an adopted one can only be re-bound
+with `manifest adopt`.
+
+> [!TIP]
+> A review fix pushed straight onto a projection branch will block the next
+> `drip push`, and that is the intended outcome rather than an obstacle. The
+> projection is derived from the mega branch: a change that only exists on the
+> branch is a change the next replan cannot see. Fold it into the mega branch
+> and replan. `--reclaim` is for when you've decided the commit isn't wanted.
 
 ## What drip never does on its own
 
@@ -123,6 +124,13 @@ Honest limits, so they aren't discovered in a review:
   them unresolved.
 - **A base changed on an adopted PR is reported, never absorbed.** Picking it up
   means changing it on the PR and re-running `manifest adopt`.
+- **Drift is detected by sha, not by content.** A branch someone pushed to is
+  reported as moved even if they pushed exactly what drip was about to; telling
+  those apart needs a fetch per branch and doesn't change the answer
+  (docs/adr/0028).
+- **`--dry-run` can't check drift with an unreachable remote.** It degrades to
+  "unknown" and says so per projection rather than previewing a clean run it
+  never verified.
 
 ## Reading the state at any time
 

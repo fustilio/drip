@@ -296,7 +296,11 @@ test("push refuses to force over an adopted branch that moved on the remote", as
 
   const results = await runManifestPush();
   expect(results.get("helper")!.status).toBe("blocked");
-  expect(results.get("helper")!.note).toContain("moved on the remote");
+  // Named as adopted, and pointed at the one command that re-binds it — an
+  // adopted branch has no --reclaim escape hatch (docs/adr/0028).
+  expect(results.get("helper")!.note).toContain("the adopted branch is at");
+  expect(results.get("helper")!.note).toContain("manifest adopt");
+  expect(results.get("helper")!.note).not.toContain("--reclaim");
   // The reviewer's commit is still there.
   expect(gitOutput(["log", "--format=%s", "-1", "team/helper"], remoteRoot).trim()).toBe("reviewer: address feedback");
 });

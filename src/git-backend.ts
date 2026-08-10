@@ -31,6 +31,8 @@ export interface GitBackend {
   log(range: string, cwd: string): CommitInfo[];
   updateRef(ref: string, sha: string, cwd: string): void;
   fetch(remote: string, ref: string, cwd: string): void;
+  /** every `refs/heads/*` on the remote, keyed by short branch name */
+  lsRemoteHeads(remote: string, cwd: string): Map<string, string>;
   push(remote: string, refspec: string, cwd: string, force: boolean, lease?: Lease): void;
 }
 
@@ -147,17 +149,28 @@ export class ShellGitBackend implements GitBackend {
   fetch(remote: string, ref: string, cwd: string) {
     run(["fetch", remote, ref], cwd);
   }
+  // One network round trip for every branch on the remote, so push() can ask
+  // "did this branch move since drip last wrote it?" without fetching objects.
+  // Sha comparison only — the answer never needs the commit locally, which
+  // matters because drip's own materialized commits are unreferenced here.
+  lsRemoteHeads(remote: string, cwd: string) {
+    const heads = new Map<string, string>();
+    for (const line of run(["ls-remote", "--heads", remote], cwd).split("\n")) {
+      const [sha, ref] = line.trim().split(/\s+/);
+      if (sha && ref?.startsWith("refs/heads/")) heads.set(ref.slice("refs/heads/".length), sha);
+    }
+    return heads;
+  }
   push(remote: string, refspec: string, cwd: string, force: boolean, lease?: Lease) {
-    // Plain --force, not --force-with-lease: drip never fetches to keep a
-    // remote-tracking ref current, so lease would reject pushes to branches
-    // it itself owns and manages exclusively (the drip/<branch>/sliceN
-    // namespace) just because the local repo's view of the remote is stale.
-    //
-    // An adopted branch (docs/adr/0020) is the exception, and the reasoning
-    // inverts: drip does not own it, someone may have pushed a review fix onto
-    // it, and the sha drip last saw is a real expectation rather than a stale
-    // guess. There a lease is exactly right — the push fails instead of
-    // discarding a commit drip never saw.
+    // A lease is always the explicit `<ref>:<expect>` form, never bare
+    // --force-with-lease: the bare form consults the remote-tracking ref, which
+    // drip never fetches to keep current, and would reject pushes to branches
+    // drip owns exclusively just because the local view is stale. Given an
+    // explicit sha, git compares against the *actual* remote ref, so a lease is
+    // meaningful for a drip-owned branch (docs/adr/0028) and an adopted one
+    // (docs/adr/0020) alike: the push fails instead of discarding a commit drip
+    // never saw. Plain --force remains the path for a branch with no recorded
+    // sha to expect — a first push, or one drip has no correspondence for.
     const args = ["push"];
     if (lease) args.push(`--force-with-lease=${lease.ref}:${lease.expect}`);
     else if (force) args.push("--force");
