@@ -2,6 +2,7 @@ import { buildCommand } from "@stricli/core";
 import { DripError } from "../errors";
 import { findManifest, printManifestReport, unitsFromManifest, verificationUnits } from "../manifest";
 import { push, type PushUnits } from "../push";
+import { linearChains, linkStacks, printStackLinks } from "../stacks";
 import { runVerify } from "../workflow";
 import {
   baseFlag,
@@ -27,6 +28,7 @@ type PushFlags = {
   requireVerification: boolean;
   requireIntent: boolean;
   reviewableStack: boolean;
+  linkStack: boolean;
   draft: boolean;
   reclaim: boolean;
   buildCmd?: string;
@@ -127,6 +129,7 @@ export const pushCommand = buildCommand({
         manifestUnits ? "manifest" : null,
         flags.draft ? "draft" : null,
         flags.reviewableStack ? "reviewable-stack" : null,
+        flags.linkStack ? "link-stack" : null,
         flags.reclaim ? "reclaim" : null,
       ]
         .filter(Boolean)
@@ -154,6 +157,37 @@ export const pushCommand = buildCommand({
         );
       }
 
+      // The PR chain this push just produced, as GitHub's stack model sees it:
+      // derived from the bases actually set, so a chain reported here is one
+      // GitHub would accept (docs/adr/0030). Reported whether or not --link-stack
+      // was passed — a stack drip could have made and didn't is exactly the kind
+      // of thing that should never be discovered later.
+      const { chains, solitary } = linearChains(
+        results
+          .filter((r) => r.prNumber && (r.status === "created" || r.status === "updated" || r.status === "unchanged" || r.status === "dry-run"))
+          .map((r) => ({ id: r.sliceLabel, branch: r.branchName, prNumber: r.prNumber!, base: r.base })),
+      );
+
+      if (!chains.length) {
+        if (solitary.length > 1) {
+          console.log(
+            `\nNo GitHub stack: these PRs don't chain (${solitary.map((s) => `${s.node.id} — ${s.reason}`).join("; ")}).\n` +
+              "  A stack is a linear run of PRs, each based on the one below it. `--projection stacked` produces one by construction.",
+          );
+        }
+      } else if (flags.linkStack) {
+        printStackLinks(linkStacks({ repoRoot: ctx.repoRoot, chains, dryRun: flags.dryRun }), flags.dryRun);
+      } else {
+        console.log(
+          `\n${chains.length} PR chain(s) could be grouped as a GitHub stack — reviewers walk the layers in the PR UI and\n` +
+            "  `gh stack merge` lands a prefix of the chain atomically. Nothing was grouped: re-run with --link-stack, or\n" +
+            `  run \`drip stack link ${ctx.branch} --yes\` on its own.`,
+        );
+        for (const chain of chains) {
+          console.log(`    on ${chain.base}: ${chain.members.map((m) => `${m.id}(#${m.prNumber})`).join(" <- ")}`);
+        }
+      }
+
       const blocked = results.filter((r) => r.status === "blocked");
       if (blocked.length) {
         console.error(`\n${blocked.length} slice(s) blocked — not pushed. See the notes above.`);
@@ -174,6 +208,7 @@ export const pushCommand = buildCommand({
       manifest: { kind: "parsed", parse: String, brief: "push a manifest's projections instead of atomic slices", optional: true },
       ...manifestCheckFlags,
       reviewableStack: { kind: "boolean", brief: "refuse any projection needing a generated integration base", default: false },
+      linkStack: { kind: "boolean", brief: "group the resulting PR chain into a stack on GitHub", default: false },
       draft: { kind: "boolean", brief: "open drip-owned PRs as drafts", default: false },
       reclaim: { kind: "boolean", brief: "overwrite a drip-owned branch that has moved on the remote", default: false },
       ...buildCheckFlags,

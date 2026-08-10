@@ -28,6 +28,8 @@ flowchart LR
 
     PRS -- "the next push reconciles all of it<br/>nothing happens before that" --> PUSH
     PRS -.-> RC["drip review-context<br/>read-only, any time"]
+    PRS -.-> ST["drip stack link<br/>group the chain on GitHub"]
+    ST -.-> PRS
 
     classDef external stroke-dasharray: 5 3
     class EC,EB,EM,ER,EW external
@@ -50,6 +52,9 @@ that drift without changing anything.
 | **Projection squash-merged into base** | Reverse-applies the projection's patch against the base tip; if it applies clean the content is already on base, so the projection is dropped from the stack and its PR closed with a comment. Later projections re-base past it. | Next push | `squash-merged` status; the closing comment on the PR |
 | **PR base retargeted by hand** | On a PR drip opened: retargeted back to what the manifest graph implies. On an adopted PR: reported every run and never changed, because the base is a review decision someone else made. | Next push | The projection's note: "targets X, but the manifest implies Y — drip does not retarget an adopted PR" |
 | **More commits on the mega branch** | Replans from scratch. A manifest projection keeps its PR because correspondence is keyed on the manifest `id`; an atomic slice keeps its PR only while its symbol composition is stable. | Next plan/push | `review-context` reports content drift per projection, with the changed files and selectors |
+| **A PR added to drip's stack on GitHub** | Reported. `stack link` is additive and never removes, so an extra open PR above drip's chain is left alone and named; a PR interleaved *into* the chain makes it `diverged` and drip writes nothing. | `drip stack status`, and the next `stack link` | The chain's status line |
+| **The stack unstacked on GitHub** | Nothing. The PRs and their bases are untouched by unstacking, so drip's next `stack link` simply creates the stack again. | Next `stack link` | `created`, rather than `unchanged` |
+| **A stack member merged** | Excluded from the chain comparison — a merged PR stays in its stack forever, so comparing against the open members is what stops a second lap reporting a conflict that isn't one. | Every `stack status` / `stack link` | The member's line: `merged` |
 | **Base branch advances independently** | The merge-base moves and everything is recomputed against it. The tree-hash invariant is unaffected. | Next plan | Normal plan output |
 | **Content moved under an existing PR** | Posts an interdiff comment (previous force-push → this one), because GitHub renders nothing for a force-push. | Next push | The interdiff comment on the PR |
 
@@ -88,12 +93,19 @@ Nothing in this loop runs unattended. Specifically:
 
 - **No polling, no webhooks, no daemon.** Every reconciliation is a side effect
   of a `drip push` you ran.
-- **`push` is the only command with remote side effects**, and it requires
-  `--yes`. `materialize`, `validate-plan`, `manifest discover` and
-  `review-context` write nothing remote at all.
+- **`push` and `stack link` are the only commands with remote side effects**,
+  and both require `--yes`. `push` writes branches and PRs; `stack link` writes
+  nothing but stack membership. `materialize`, `validate-plan`,
+  `manifest discover`, `stack status` and `review-context` write nothing remote
+  at all.
 - **`push` does not auto-discover a manifest.** A manifest lying in
   `.drip/projections/` must never silently change what `push --yes` sends;
   it says one exists and pushes atomic slices unless you pass `--manifest`.
+- **Stack membership is never restructured.** Linking only creates a stack or
+  appends to one. A stack whose members disagree with drip's chain is reported
+  `diverged` and left exactly as it is — dissolving a grouping is a decision
+  about someone's review surface, and `gh stack unstack` is theirs to run.
+- **drip never merges a stack.** `gh stack merge <n> --yes` is printed, not run.
 - **Adoption is never inferred.** `manifest discover` proposes candidates on
   exact tree match and prints the command; binding still needs projection id,
   PR number and head branch, cross-checked, with `--yes`.
@@ -135,6 +147,7 @@ Honest limits, so they aren't discovered in a review:
 ## Reading the state at any time
 
 ```bash
+drip stack status <branch>                        # the PR chains, and what GitHub has grouped
 drip review-context <branch>                      # every projection
 drip review-context <branch> --projection <id>    # one
 drip review-context <branch> --no-review --json   # local half only, machine-readable
@@ -157,3 +170,4 @@ change across a run (docs/adr/0027).
 - `docs/adr/0016-flat-first-projection.md` — how a projection's base is chosen
 - `docs/adr/0020-adopting-existing-prs.md` — the ownership rule in full
 - `docs/adr/0027-read-only-review-context.md` — why the read surface is separate
+- `docs/adr/0030-github-stacks.md` — how drip's PR chain becomes a stack on GitHub

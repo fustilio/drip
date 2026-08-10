@@ -6,6 +6,7 @@ import { ShellGitBackend } from "./git-backend";
 import type { ReviewComment } from "./github";
 import { ManifestSchema, manifestSignature, resolveManifest, type Manifest } from "./manifest";
 import { computePlan, type PlanResult } from "./planner";
+import type { GhStack } from "./github";
 import { collectReviewContext } from "./review-context";
 import { markCommentProcessed, openStore, upsertCorrespondence } from "./store";
 import { commit, git, githubMock, gitOutput, makeBareRemote, makeTempRepo } from "./test-helpers";
@@ -96,7 +97,14 @@ const comment = (over: Partial<ReviewComment> = {}): ReviewComment => ({
   ...over,
 });
 
-async function collect(opts: { only?: string; readComments?: (repoRoot: string, pr: number) => ReviewComment[]; includeReview?: boolean } = {}) {
+async function collect(
+  opts: {
+    only?: string;
+    readComments?: (repoRoot: string, pr: number) => ReviewComment[];
+    includeReview?: boolean;
+    readStacks?: (repoRoot: string) => GhStack[];
+  } = {},
+) {
   const { plan, mergeBase, resolved } = await context();
   return collectReviewContext({
     git: backend,
@@ -110,6 +118,7 @@ async function collect(opts: { only?: string; readComments?: (repoRoot: string, 
     only: opts.only ?? null,
     includeReview: opts.includeReview,
     readComments: opts.readComments,
+    readStacks: opts.readStacks,
   });
 }
 
@@ -325,4 +334,63 @@ test("--no-review skips the GitHub read entirely and says so", async () => {
   if (helper.review.available) throw new Error("unreachable");
   expect(helper.review.reason).toContain("not requested");
   expect(helper.state).toBe("changed"); // the local half is unaffected
+});
+
+const stackOf = (number: number, prs: number[]): GhStack => ({
+  number,
+  url: `https://example.com/stacks/${number}`,
+  base: "main",
+  open: true,
+  prs: prs.map((n) => ({ number: n, state: "open", draft: false, merged: false, headRef: "" })),
+});
+
+test("a projection's PR reports which layer of which GitHub stack it sits in", async () => {
+  upsertCorrespondence(db, {
+    branch: "feature",
+    sliceSignature: manifestSignature("helper"),
+    sliceBranch: "drip/feature/helper",
+    prNumber: 7,
+    prUrl: null,
+    contentHash: "hash",
+    commitSha: backend.revParse("main", repoRoot),
+    baseRef: "main",
+    adopted: false,
+  });
+
+  const helper = (await collect({ only: "helper", readComments: () => [], readStacks: () => [stackOf(3, [7, 9])] })).projections[0]!;
+  expect(helper.stack).toEqual({ number: 3, url: "https://example.com/stacks/3", position: 1, size: 2 });
+});
+
+test("an unreadable stacks API says so, rather than reporting every PR as ungrouped", async () => {
+  upsertCorrespondence(db, {
+    branch: "feature",
+    sliceSignature: manifestSignature("helper"),
+    sliceBranch: "drip/feature/helper",
+    prNumber: 7,
+    prUrl: null,
+    contentHash: "hash",
+    commitSha: backend.revParse("main", repoRoot),
+    baseRef: "main",
+    adopted: false,
+  });
+
+  const report = await collect({
+    only: "helper",
+    readComments: () => [],
+    readStacks: () => {
+      throw new Error("stacked pull requests are not enabled here");
+    },
+  });
+  expect(report.stacksUnavailable).toContain("not enabled");
+  expect(report.projections[0]!.stack).toBeNull();
+});
+
+test("--no-review reads no stack state either, and names that as the reason", async () => {
+  const report = await collect({
+    includeReview: false,
+    readStacks: () => {
+      throw new Error("should never be called");
+    },
+  });
+  expect(report.stacksUnavailable).toBe("not requested (--no-review)");
 });

@@ -168,6 +168,115 @@ export function ghReplyToReviewComment(repoRoot: string, prNumber: number, comme
   }
 }
 
+// --- GitHub Stacks (public preview, 2026-07-30) ---
+//
+// A *stack* on GitHub is a first-class object grouping an ordered chain of PRs,
+// each based on the head of the one below it: reviewers walk the layers in the
+// PR UI and `gh stack merge` lands a prefix of the chain atomically. That is
+// exactly the shape `drip push --projection stacked` has always produced —
+// what was missing is the grouping object itself, which is what these
+// endpoints create.
+//
+// drip calls the REST API directly rather than shelling out to the `gh stack`
+// extension. The extension's other commands keep local tracking state in
+// `.git/gh-stack` and *rebase* the branches in place, which is the opposite of
+// how drip treats a projection branch (derived, regenerated, never rebased —
+// see CONTEXT.md "Slice"). The one part of the extension that fits a tool
+// which owns its own branches is `gh stack link`, whose whole job is "group
+// these PRs, keep no local state" — and that is these three calls. Not
+// depending on the extension also means one less thing to have installed, and
+// no `.git/gh-stack` file for `gh stack sync` to later act on.
+// See docs/adr/0030-github-stacks.md.
+
+export type GhStackPr = {
+  number: number;
+  /** "open" | "closed" — GitHub's REST casing, not the GraphQL screaming case `PrRef.state` uses */
+  state: string;
+  draft: boolean;
+  merged: boolean;
+  headRef: string;
+};
+
+export type GhStack = {
+  /** the repo-scoped stack number shown in the GitHub UI and accepted by `gh stack merge` */
+  number: number;
+  url: string;
+  /** the ref the bottom of the stack targets */
+  base: string;
+  open: boolean;
+  /** members bottom-to-top, as GitHub orders them */
+  prs: GhStackPr[];
+};
+
+function parseStack(raw: any): GhStack {
+  return {
+    number: Number(raw.number ?? 0),
+    url: String(raw.url ?? ""),
+    base: String(raw.base?.ref ?? ""),
+    open: !!raw.open,
+    prs: ((raw.pull_requests ?? []) as any[]).map((p) => ({
+      number: Number(p.number),
+      state: String(p.state ?? ""),
+      draft: !!p.draft,
+      merged: !!p.merged_at,
+      headRef: String(p.head?.ref ?? ""),
+    })),
+  };
+}
+
+// The stacks endpoints 404 on a repository that doesn't have stacked PRs
+// enabled, which is an ordinary condition during the public preview and not
+// the same thing as a broken call. Said in the message rather than left for
+// the caller to infer from a raw `gh` error.
+function ghStacksApi(repoRoot: string, args: string[], body?: unknown): unknown {
+  let out: string;
+  try {
+    out = execFileSync("gh", ["api", ...args, ...(body === undefined ? [] : ["--input", "-"])], {
+      cwd: repoRoot,
+      stdio: [body === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+      ...(body === undefined ? {} : { input: JSON.stringify(body) }),
+    }).toString();
+  } catch (e: any) {
+    const stderr = String(e.stderr ?? e.message ?? "").trim();
+    // Matched on the HTTP status specifically, not on the words "not found":
+    // `gh` missing from PATH reports "Executable not found in $PATH", and
+    // telling someone their repository lacks the feature when the CLI simply
+    // isn't installed sends them to the wrong place entirely.
+    if (/HTTP 404/.test(stderr)) {
+      throw new DripError(
+        `the GitHub stacks API returned 404 for this repository — stacked pull requests are in public preview and may not be enabled here (${stderr})`,
+      );
+    }
+    if (e?.code === "ENOENT") throw new DripError("the `gh` CLI is not installed, so drip can't reach the GitHub stacks API");
+    throw new DripError(`gh api ${args.join(" ")} failed: ${stderr}`);
+  }
+  const trimmed = out.trim();
+  return trimmed ? JSON.parse(trimmed) : null;
+}
+
+/** Every stack in the repository, with its ordered members. One read serves a whole report. */
+export function ghListStacks(repoRoot: string): GhStack[] {
+  const raw = ghStacksApi(repoRoot, ["repos/{owner}/{repo}/stacks"]);
+  return Array.isArray(raw) ? raw.map(parseStack) : [];
+}
+
+/**
+ * Creates a stack from PR numbers ordered bottom to top. GitHub requires at
+ * least two of them and validates that they form a real base-to-head chain —
+ * drip doesn't re-check that, since the API's answer is the authoritative one
+ * and a second opinion computed from stale local state would only disagree.
+ */
+export function ghCreateStack(repoRoot: string, prNumbers: number[]): GhStack {
+  return parseStack(ghStacksApi(repoRoot, ["--method", "POST", "repos/{owner}/{repo}/stacks"], { pull_requests: prNumbers }));
+}
+
+/** Appends PRs to the top of an existing stack. Additive: this never removes a member. */
+export function ghAddToStack(repoRoot: string, stackNumber: number, prNumbers: number[]): GhStack {
+  return parseStack(
+    ghStacksApi(repoRoot, ["--method", "POST", `repos/{owner}/{repo}/stacks/${stackNumber}/add`], { pull_requests: prNumbers }),
+  );
+}
+
 export function ghPrState(repoRoot: string, prNumber: number): "OPEN" | "CLOSED" | "MERGED" | "UNKNOWN" {
   try {
     const out = execFileSync("gh", ["pr", "view", String(prNumber), "--json", "state", "--jq", ".state"], {

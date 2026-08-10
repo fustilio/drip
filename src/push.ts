@@ -22,6 +22,8 @@ export type PushResult = {
   sliceLabel: string;
   branchName: string;
   prUrl: string | null;
+  /** the PR this unit corresponds to — what a GitHub stack is built out of (docs/adr/0030) */
+  prNumber: number | null;
   status: SliceStatus;
   base: string; // the ref this slice's PR targets
   note: string | null; // why it's blocked, or that a generated integration base was used
@@ -219,7 +221,7 @@ export async function push(opts: {
       // recorded as blocked so its dependents are refused too.
       const block = (note: string): void => {
         blockedIds.add(sliceId);
-        results.push({ sliceLabel, branchName, prUrl: existing?.prUrl ?? null, status: "blocked", base: baseBranch, note, draft: null, hiddenBase: false });
+        results.push({ sliceLabel, branchName, prUrl: existing?.prUrl ?? null, prNumber: existing?.prNumber ?? null, status: "blocked", base: baseBranch, note, draft: null, hiddenBase: false });
       };
 
       if (!commit) {
@@ -381,7 +383,7 @@ export async function push(opts: {
       }
 
       if (dryRun) {
-        results.push({ sliceLabel, branchName, prUrl: existing?.prUrl ?? null, status, base, note, draft, hiddenBase });
+        results.push({ sliceLabel, branchName, prUrl: existing?.prUrl ?? null, prNumber: existing?.prNumber ?? null, status, base, note, draft, hiddenBase });
         if (status !== "squash-merged") baseForNext = branchName;
         else droppedToBase.add(sliceId);
         continue;
@@ -393,14 +395,14 @@ export async function push(opts: {
           deleteCorrespondence(db, branch, signature);
         }
         droppedToBase.add(sliceId);
-        results.push({ sliceLabel, branchName, prUrl: existing?.prUrl ?? null, status, base, note, draft, hiddenBase });
+        results.push({ sliceLabel, branchName, prUrl: existing?.prUrl ?? null, prNumber: existing?.prNumber ?? null, status, base, note, draft, hiddenBase });
         continue; // dropped from the stack — baseForNext stays where it was
       }
 
       if (status === "unchanged") {
         // Nothing to do: the hash above already covers the branch's tree and
         // its target ref, so "unchanged" really means the PR is already right.
-        results.push({ sliceLabel, branchName, prUrl: existing!.prUrl, status, base, note, draft, hiddenBase });
+        results.push({ sliceLabel, branchName, prUrl: existing!.prUrl, prNumber: existing!.prNumber, status, base, note, draft, hiddenBase });
         baseForNext = branchName;
         continue;
       }
@@ -426,6 +428,7 @@ export async function push(opts: {
           sliceLabel,
           branchName,
           prUrl: existing?.prUrl ?? null,
+          prNumber: existing?.prNumber ?? null,
           status: "blocked",
           base,
           note:
@@ -483,7 +486,7 @@ export async function push(opts: {
         baseRef,
         adopted: !!existing?.adopted,
       });
-      results.push({ sliceLabel, branchName, prUrl, status, base, note, draft, hiddenBase });
+      results.push({ sliceLabel, branchName, prUrl, prNumber, status, base, note, draft, hiddenBase });
       baseForNext = branchName;
     }
   } finally {

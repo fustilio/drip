@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { projectionBranch } from "./adopt";
 import type { GitBackend } from "./git-backend";
-import { ghListReviewComments, type ReviewComment } from "./github";
+import { ghListReviewComments, ghListStacks, type GhStack, type ReviewComment } from "./github";
 import { manifestSignature, type ResolvedManifest } from "./manifest";
 import { materializeFlatFirst } from "./materialize";
 import { groupKeyOf, type PlanResult } from "./planner";
@@ -80,15 +80,25 @@ export type ProjectionReviewContext = {
   /** the durable selectors whose files moved since the PR last saw this projection */
   changedSelectors: string[];
   review: ReviewSurface;
+  /**
+   * Where GitHub has this projection's PR in a stack, when it's in one. The
+   * stack is what makes a set of projection PRs walkable as the single change
+   * they came from, so "which layer am I looking at" belongs in the same view
+   * as the rest of the review surface (docs/adr/0030).
+   */
+  stack: { number: number; url: string; position: number; size: number } | null;
 };
 
 export type ReviewContextReport = {
   branch: string;
   projections: ProjectionReviewContext[];
+  /** why stack membership is missing, when it is — unread is not the same as "in no stack" */
+  stacksUnavailable: string | null;
 };
 
 /** Injected so tests can assert the read-only boundary without a `gh` binary. */
 export type ReviewCommentReader = (repoRoot: string, prNumber: number) => ReviewComment[];
+export type StackReader = (repoRoot: string) => GhStack[];
 
 export async function collectReviewContext(opts: {
   git: GitBackend;
@@ -104,10 +114,12 @@ export async function collectReviewContext(opts: {
   /** skip the GitHub read entirely (offline, or when only the local state is wanted) */
   includeReview?: boolean;
   readComments?: ReviewCommentReader;
+  readStacks?: StackReader;
 }): Promise<ReviewContextReport> {
   const { git, db, repoRoot, branch, baseBranch, mergeBase, plan, resolved } = opts;
   const includeReview = opts.includeReview ?? true;
   const readComments = opts.readComments ?? ghListReviewComments;
+  const readStacks = opts.readStacks ?? ghListStacks;
   const wanted = opts.only ? resolved.projections.filter((p) => p.id === opts.only) : resolved.projections;
 
   const materialized = await materializeFlatFirst({
@@ -129,6 +141,21 @@ export async function collectReviewContext(opts: {
       return null;
     }
   };
+
+  // One read for every projection: the stacks endpoint returns each stack's
+  // whole membership, so joining by PR number here costs the same as asking
+  // about a single projection would.
+  let stacksUnavailable: string | null = includeReview ? null : "not requested (--no-review)";
+  const inStack = new Map<number, { number: number; url: string; position: number; size: number }>();
+  if (includeReview) {
+    try {
+      for (const stack of readStacks(repoRoot)) {
+        stack.prs.forEach((pr, i) => inStack.set(pr.number, { number: stack.number, url: stack.url, position: i + 1, size: stack.prs.length }));
+      }
+    } catch (e) {
+      stacksUnavailable = e instanceof Error ? e.message : String(e);
+    }
+  }
 
   const projections: ProjectionReviewContext[] = [];
   for (const projection of wanted) {
@@ -238,16 +265,18 @@ export async function collectReviewContext(opts: {
       changedFiles,
       changedSelectors,
       review,
+      stack: existing?.prNumber ? (inStack.get(existing.prNumber) ?? null) : null,
     });
   }
 
-  return { branch, projections };
+  return { branch, projections, stacksUnavailable };
 }
 
 export function reviewContextToJson(report: ReviewContextReport): object {
   return {
     branch: report.branch,
     readOnly: true,
+    stacksUnavailable: report.stacksUnavailable,
     projections: report.projections.map((p) => ({
       projection: p.projectionId,
       title: p.title,
@@ -262,6 +291,7 @@ export function reviewContextToJson(report: ReviewContextReport): object {
       changedFiles: p.changedFiles,
       changedSelectors: p.changedSelectors,
       review: p.review,
+      stack: p.stack,
     })),
   };
 }
@@ -276,6 +306,7 @@ const STATE_TEXT: Record<ProjectionReviewContext["state"], string> = {
 
 export function printReviewContext(report: ReviewContextReport): void {
   console.log(`REVIEW CONTEXT (${report.branch}, ${report.projections.length} projection(s)) — read-only:`);
+  if (report.stacksUnavailable) console.log(`  stack membership unavailable — ${report.stacksUnavailable}`);
   for (const p of report.projections) {
     console.log(`\n  ${p.projectionId} — ${p.title}`);
     if (p.intent) console.log(`    intent: ${p.intent}`);
@@ -290,6 +321,8 @@ export function printReviewContext(report: ReviewContextReport): void {
       console.log(
         `    base: ${c.recordedBase ?? "(unrecorded)"}${c.baseAgrees ? " — agrees with the manifest graph" : ` — the manifest graph implies ${c.manifestBase}`}`,
       );
+      if (p.stack) console.log(`    stack: #${p.stack.number}, layer ${p.stack.position} of ${p.stack.size} — ${p.stack.url}`);
+      else if (c.prNumber && !report.stacksUnavailable) console.log("    stack: not grouped into one — `drip stack link` would");
     } else {
       console.log("    PR: none — this projection has never been pushed or adopted");
     }

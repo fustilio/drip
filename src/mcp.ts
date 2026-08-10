@@ -11,7 +11,8 @@ import { loadProfiles } from "./profiles";
 import { resolveRepoRoot } from "./repo";
 import { collectReviewContext, reviewContextToJson } from "./review-context";
 import { sourceToJson } from "./source";
-import { addOverride, listOverrides, openStore, removeOverride } from "./store";
+import { collectStackStatus, stackStatusToJson } from "./stacks";
+import { addOverride, listCorrespondence, listOverrides, openStore, removeOverride } from "./store";
 import { loadPlan, runVerify } from "./workflow";
 
 // Exposes the same read/write surface as the CLI's plan/verify/override
@@ -195,6 +196,24 @@ server.tool(
         includeReview,
       });
       return textResult(reviewContextToJson(report));
+    } catch (e) {
+      return errorResult(e);
+    }
+  },
+);
+
+server.tool(
+  "drip_stack_status",
+  "Report how a branch's projection PRs chain, and what GitHub has grouped into a stack: each chain bottom-to-top, whether GitHub's stack already holds it " +
+    "(and what linking it would do — create, extend, nothing, or a divergence drip won't resolve), and for each PR its layer, state and whether drip opened it or adopted it. " +
+    "Read from correspondence and GitHub's stacks API, never by replanning. Strictly read-only: creates and changes no stack, touches no PR, records nothing. " +
+    "There is no link counterpart here for the same reason there is no push tool — creating a stack is a real side effect on someone's review surface and needs --yes from a human.",
+  { repo: z.string(), branch: z.string() },
+  async ({ repo, branch }) => {
+    try {
+      const repoRoot = resolveRepoRoot(git, repo);
+      const report = collectStackStatus({ repoRoot, branch, correspondence: listCorrespondence(openStore(repoRoot), branch) });
+      return textResult(stackStatusToJson(report));
     } catch (e) {
       return errorResult(e);
     }

@@ -60,7 +60,15 @@ An explicit decision that an atomic slice lands in no projection *for now*, reco
 
 **Reviewable stack**:
 A PR graph in which every base is a branch that has a PR on it. `--projection flat-first`'s generated integration base breaks that: it unions several prerequisites into a minted branch with no PR, so reviewers can't walk the prerequisites and a workflow filtered on the base branch never runs. Always reported; refused outright under `push --reviewable-stack`, whose remedy is to merge those prerequisites into one projection or declare one they all sit under. See docs/adr/0023.
-_Avoid_: stack (bare — `--projection stacked` is a different axis entirely)
+_Avoid_: stack (bare — `--projection stacked` and a **GitHub stack** are both different things; say which)
+
+**GitHub stack**:
+GitHub's own object grouping an ordered chain of PRs that form a base-to-head chain, shipped to public preview in July 2026: the PR UI shows the layers, and `gh stack merge <n>` lands the chain — or a prefix of it — atomically. Created from drip's PRs by `drip stack link` (or `push --link-stack`) through the stacks REST API, never through the `gh stack` extension, whose branch-management half rebases branches in place and keeps local tracking state that a derived projection branch must not have. Strictly linear: one parent, at most one child. Membership is read live and never persisted — GitHub is where it lives. See docs/adr/0030.
+_Avoid_: stack (bare), stacked PRs (ambiguous between GitHub's object and the `--projection stacked` mode)
+
+**PR chain**:
+What drip derives to decide what a GitHub stack could hold: a maximal linear run of pushed PRs, where each one's base is the head branch of the one below it. Derived from the bases drip *actually set*, not from the slice DAG, so a chain drip reports is one GitHub will accept. A fan-out truncates the chain and names the dependents rather than picking one to continue it; a projection on a generated integration base starts a new chain, since that branch has no PR to be a member.
+_Avoid_: stack (a chain is drip's local derivation; the stack is GitHub's object), path
 
 **Runnable check**:
 A command that was actually executed against a projection's own materialized tree. Distinct from a stated intention: `verificationReason` records a decision not to check, and under `--require-verification` that decision may not cover a projection containing code. drip only ever runs a check the repository named for itself — a root `tsconfig.json`, a root `typecheck` script, or a manifest `verification` entry — and merely *offers* the per-package scripts it discovers, since composing a workspace invocation and then failing someone's push on the result is a guess with consequences. See docs/adr/0023.

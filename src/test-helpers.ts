@@ -63,6 +63,15 @@ export function githubMock(overrides: Record<string, AnyMock> = {}): Record<stri
     ghListReviewComments: mock(() => []),
     ghReplyToReviewComment: mock(() => {}),
     ghPrState: mock(() => "OPEN"),
+    ghListStacks: mock(() => []),
+    ghCreateStack: mock((_repoRoot: string, prNumbers: number[]) => ({
+      number: 1,
+      url: "https://example.com/stacks/1",
+      base: "main",
+      open: true,
+      prs: prNumbers.map((n) => ({ number: n, state: "open", draft: false, merged: false, headRef: "" })),
+    })),
+    ghAddToStack: mock(() => ({ number: 1, url: "https://example.com/stacks/1", base: "main", open: true, prs: [] })),
     ...overrides,
   };
 }

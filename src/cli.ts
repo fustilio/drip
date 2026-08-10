@@ -6,6 +6,7 @@ import { planCommand } from "./commands/plan";
 import { pushCommand } from "./commands/push";
 import { reviewContextCommand } from "./commands/review-context";
 import { scoreCommand } from "./commands/score";
+import { stackRoutes } from "./commands/stack";
 import { materializeCommand, validatePlanCommand } from "./commands/validate";
 import { verifyCommand } from "./commands/verify";
 
@@ -32,6 +33,7 @@ export const app = buildApplication(
       materialize: materializeCommand,
       "review-context": reviewContextCommand,
       score: scoreCommand,
+      stack: stackRoutes,
       override: overrideRoutes,
       manifest: manifestRoutes,
       mcp: mcpCommand,
