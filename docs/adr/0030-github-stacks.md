@@ -34,11 +34,31 @@ against drip's branches would rebase commits drip is about to recreate, and
 `.git/gh-stack` would be a second, conflicting record of a stack whose real
 definition is the manifest.
 
-The one part of the extension built for a tool that owns its own branches is
-`gh stack link`, whose documented purpose is branches "managed by jj, Sapling,
-git-town, a separate worktree, or any workflow where the local `.git/gh-stack`
-file would be wrong or absent" — it groups PRs through the API and writes no
-local state. drip calls those same endpoints directly:
+That argument is against `sync`, `rebase` and `modify`, and it does not decide
+this on its own — because the extension has a command built for exactly drip's
+situation. `gh stack link` writes no local tracking state and documents its
+purpose as branches "managed by jj, Sapling, ghstack, git-town, etc." So the
+real question is `gh stack link` versus the endpoints it calls, and two things
+settle it:
+
+- **`link` retargets PRs it wasn't asked to retarget.** For every argument,
+  including PR numbers, it reads the PR and calls `UpdatePRBase` when the base
+  isn't the chain position it computed (`cmd/link.go`). drip may not do that: on
+  an **adopted** PR the base is a review decision someone else made, reported
+  every run and never changed (docs/adr/0020). `link` has no notion of adoption,
+  so handing it a chain delegates a decision drip has an ADR promising not to
+  take. This is the reason; the branch-management half is a side note.
+- **The read path can't use the extension at all.** `gh stack view --json` loads
+  `.git/gh-stack`, requires the current branch to be in a tracked stack, and
+  writes state back. drip needs "which stack holds PR #N" for branches nobody has
+  checked out, so `stack status` and `review-context` are REST whichever way the
+  write path goes. Using `link` would mean maintaining both.
+
+What `link` would *not* have done, contrary to a plausible reading: opened PRs
+or pushed branches. Both apply to branch arguments, and drip would pass PR
+numbers. The retarget is the whole of the conflict.
+
+drip therefore calls the endpoints directly:
 
 | Endpoint | Used for |
 |---|---|
@@ -133,10 +153,15 @@ separate question.
 
 ## Alternatives rejected
 
-- **Depend on the `gh stack` extension and drive it.** Its branch-management
-  half is actively hostile to derived branches, and `link` is the only command
-  drip wants — three REST calls, against a dependency that would have to be
-  installed, version-matched, and kept away from `.git/gh-stack`.
+- **Depend on the `gh stack` extension and drive `gh stack link`.** Rejected for
+  the retarget behaviour above, not for the extension's branch management, which
+  `link` doesn't do. Secondary costs: an install drip doesn't otherwise need,
+  version skew against a preview-era extension, and a read path that stays REST
+  regardless — so the extension would add a dependency without removing any code.
+  The cost of *not* depending on it is real and accepted: the stacks API is in
+  public preview and may change shape, and the extension would have absorbed that
+  where drip won't. Confined to three functions in `github.ts` to keep the blast
+  radius small.
 - **Linearize the DAG so everything becomes one stack.** Fabricates review
   dependencies that don't exist — the exact thing `flat-first` was built to stop
   (docs/adr/0016).
