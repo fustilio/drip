@@ -8,7 +8,9 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "build": "bun build --compile src/cli.ts --outfile dist/drip",
+    "build:mcp": "bun build --compile src/mcp.ts --outfile dist/drip-mcp"
   },
   "devDependencies": {
     "@types/bun": "latest",

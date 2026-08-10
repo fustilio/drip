@@ -2,13 +2,36 @@
 
 A tool for drip-feeding a mega branch back into main as thin, reviewable PRs. Slices are derived projections of the mega branch, not maintained branches — regenerated, never rebased.
 
-**Status:** M0 (feasibility spike) built. M1 (real CLI, `drip plan`/`drip verify`) built. M2 (`drip push`, real PRs via `gh`) built. M3 (content-addressed skip, squash-merge reconciliation, interdiff comments) built. M4 (comment anchoring, conservative exact-hash-only cut) built. M5's deterministic half (build-check caching, parallel per-slice builds) built. M5's AI half re-scoped away from a bundled provider to `plan --json` and an MCP server (`drip mcp`) for external tools (`docs/adr/0009`). Correctness is checked mechanically on every run and covered by 206 tests. **The M0 kill-gate blind-boundary scoring against real branches has not been run yet** — see `BUILD-PLAN.md` for what that means and why everything downstream is contingent on it. It is now a command rather than an afternoon of reading (`drip score`), and `docs/validation.md` records what has actually been measured and what drip may therefore claim. See `CONTEXT.md` for the domain model, `docs/review-unit-workflow.md` for how a mega branch becomes a reviewable PR set, `docs/review-feedback-loop.md` for what happens to that PR set afterwards (comments, pushes to PR branches, squash-merges — what drip reconciles and what it doesn't), `docs/pr-stacks.md` for the GitHub stacks integration end to end (what drip creates, what it owns, and which commands stay GitHub's), and `docs/adr/` for the architecture decisions.
+**Status:** M0 (feasibility spike) built. M1 (real CLI, `drip plan`/`drip verify`) built. M2 (`drip push`, real PRs via `gh`) built. M3 (content-addressed skip, squash-merge reconciliation, interdiff comments) built. M4 (comment anchoring, conservative exact-hash-only cut) built. M5's deterministic half (build-check caching, parallel per-slice builds) built. M5's AI half re-scoped away from a bundled provider to `plan --json` and an MCP server (`drip mcp`) for external tools (`docs/adr/0009`). Correctness is checked mechanically on every run and covered by 208 tests. **The M0 kill-gate blind-boundary scoring against real branches has not been run yet** — see `BUILD-PLAN.md` for what that means and why everything downstream is contingent on it. It is now a command rather than an afternoon of reading (`drip score`), and `docs/validation.md` records what has actually been measured and what drip may therefore claim. See `CONTEXT.md` for the domain model, `docs/review-unit-workflow.md` for how a mega branch becomes a reviewable PR set, `docs/review-feedback-loop.md` for what happens to that PR set afterwards (comments, pushes to PR branches, squash-merges — what drip reconciles and what it doesn't), `docs/pr-stacks.md` for the GitHub stacks integration end to end (what drip creates, what it owns, and which commands stay GitHub's), and `docs/adr/` for the architecture decisions.
+
+## Install
+
+drip runs on [Bun](https://bun.sh) and drives `git` and the [`gh` CLI](https://cli.github.com), both of which need to be on your PATH and authenticated for anything that touches GitHub.
+
+```bash
+git clone https://github.com/fustilio/drip && cd drip
+bun install
+bun link            # puts `drip` and `drip-mcp` on your PATH
+```
+
+That's the working install: `bun link` points at the checkout, so a `git pull` is the upgrade. Everything below is written as `drip <command>`, which is what you get from it.
+
+For a copy that doesn't need the checkout — another machine, a CI image, a container:
+
+```bash
+bun run build       # dist/drip, a standalone binary
+```
+
+It embeds the Bun runtime and drip's tree-sitter grammars, so it runs with no `node_modules` and no Bun install (`docs/adr/0031-embedded-wasm-assets.md`). It is not free-standing beyond that: `git` and `gh` are still spawned, and `verify`'s default build check is `bunx tsc --noEmit`, so that one command wants Bun anyway. `bun run build:mcp` does the same for the MCP server.
+
+drip is not published to npm, so there is no `npm i -g drip` or `bunx drip`.
+
+To run a command without installing anything, `bun src/cli.ts <command>` from the checkout works and is the same entry point `bun link` exposes.
 
 ## CLI
 
 ```bash
-bun install
-bun src/cli.ts <command> --help    # every command's flags, with the values each accepts
+drip <command> --help    # every command's flags, with the values each accepts
 ```
 
 | Command | What it does |
@@ -32,7 +55,7 @@ Flags are declared per command, so `--help` is generated rather than maintained 
 - **`--worktree`** — plans the **working tree** instead of committed history: staged, unstaged and untracked changes, on top of whatever the branch has already committed. The point is to partition a change *before* the commits that would make it reviewable exist, since the partition is what tells you what to commit. drip builds a real tree object from the working tree in a scratch index — your index and working tree are never touched — and everything downstream runs unchanged against it, so `verify --worktree` proves the slices reconstruct the working tree exactly.
 
   ```bash
-  bun src/cli.ts plan --worktree --base main --target-slices 3 --coarsen --emit-manifest
+  drip plan --worktree --base main --target-slices 3 --coarsen --emit-manifest
   ```
 
   The branch argument becomes optional (the checked-out branch names the plan, and naming a different one is an error, not a relabel). The plan stays base-relative — slicing only the uncommitted delta would produce slices that don't apply on the base. The source is always reported, in text and as a `source` object in `--json`, so a clean worktree says it planned committed history rather than letting you assume otherwise. `push --worktree` and `--assign-ids --worktree` are refused: one opens real PRs from content that exists only in your working tree, the other rewrites commits the work isn't in. `push` doesn't declare the flag at all, so the refusal is a parse error naming it rather than a check several steps in. `verify`, `score`, `validate-plan` and `materialize` all take it — the last two because a manifest is worth validating against work in progress, and because materialize's refs are ordinary objects in your own repository that nothing leaves. A manifest emitted from a worktree plan validates unchanged once the commits exist — its selectors are durable. See `docs/adr/0021-worktree-as-a-diff-source.md`.
@@ -41,10 +64,10 @@ Flags are declared per command, so `--help` is generated rather than maintained 
 - **`verify`** — runs `plan`, then checks the tree-hash invariant (`apply(slices in topological order) == tree(branch)`) and a per-slice standalone build check. The default command is whatever the repository declares for itself: `bunx tsc --noEmit` if a root `tsconfig.json` exists, else a root `typecheck` script if there is one, else `--build-cmd`. drip never composes a whole-repo command out of package-level pieces — in a workspace with no root check it says so, lists the per-package check scripts it found (ready to paste into a projection's `verification`), and warns that a projection can reconstruct the mega branch's tree and still not compile. See `docs/adr/0023-reviewable-stacks-and-runnable-checks.md`. With `--coarsen`, both checks run against the coarsened projections instead, proving the coarsening still reconstructs the mega-branch tree — and `--emit-manifest` works here too, so a skeleton can be written from projections that have just been verified rather than only planned.
 - **`override add|list|remove`** — boundary overrides (`force_merge` / `force_split`, keyed by `file::QualifiedSymbolPath`) persist in `.git/drip.db` and survive replanning:
   ```bash
-  bun src/cli.ts override add <branch> --kind force_merge --selector-a file::Symbol --selector-b file::Symbol [--note text] [--repo path]
-  bun src/cli.ts override add <branch> --kind force_split --selector-a file::Symbol [--note text] [--repo path]
-  bun src/cli.ts override list <branch> [--repo path]
-  bun src/cli.ts override remove <id> [--repo path]
+  drip override add <branch> --kind force_merge --selector-a file::Symbol --selector-b file::Symbol [--note text] [--repo path]
+  drip override add <branch> --kind force_split --selector-a file::Symbol [--note text] [--repo path]
+  drip override list <branch> [--repo path]
+  drip override remove <id> [--repo path]
   ```
 - **`push`** — refuses if `verify` fails. Materializes each slice as a `drip/<branch>/sliceN` branch and opens a PR via `gh` for each one that doesn't already have a correspondence entry (re-running updates the existing branch/PR instead of duplicating it — see `docs/adr/0006-slice-correspondence-key.md`). `--dry-run` previews without touching GitHub; otherwise `--yes` is required, since this and `stack link` are the only commands with real external side effects.
   - `--reclaim` overwrites a **drip-owned** branch that has moved on the remote. drip reads `git ls-remote` once per run and compares each branch against the sha it last wrote there, so a commit someone pushed onto a projection branch blocks that projection instead of being force-pushed away or sitting under an `unchanged` that never looked. The block names both shas and the two ways forward: fold the change into the mega branch and replan, or re-run with `--reclaim`. It never applies to an adopted branch — drip doesn't own that one, and the way back is `manifest adopt`. A drip-owned branch someone *deleted* is simply recreated, since that discards nothing. See `docs/adr/0028-remote-drift-on-owned-branches.md`.
@@ -100,7 +123,7 @@ Flags are declared per command, so `--help` is generated rather than maintained 
 - **`materialize`** — the same materialization `push` does, stopping at your own repository. Validates the manifest, then writes each projection's commit to a local ref (`drip/<branch>/<id>` — the name `push` would use on the remote) and, with `--output dir`, checks each one out into its own worktree at `dir/<id>`. It prints each projection's id, ref, computed base, commit sha, changed files and apply/widening status. **No remote ref is written, no PR is opened, closed or commented on, and no correspondence is recorded** — so a projection can be compared against a handwritten branch that already has reviewers on it, and the scope conflict resolved, before anything is adopted or force-pushed.
 
   ```bash
-  bun src/cli.ts materialize appeals --only report-tab-details --output ../projections
+  drip materialize appeals --only report-tab-details --output ../projections
   git diff drip/appeals/report-tab-details..tims-630-port-report-tab-sections
   ```
 
@@ -110,7 +133,7 @@ Flags are declared per command, so `--help` is generated rather than maintained 
 - **`manifest adopt|list|forget`** — binds a semantic projection to a PR that **already exists**, instead of opening a drip-owned one. Teams usually don't start from a mega branch: a few good, small, handwritten PRs exist first — with reviewers, comments and branch names people link to — and only later does an integration branch expose their combined dependency graph. Without adoption, `push --manifest` sees no correspondence for them and opens a parallel `drip/<branch>/<id>` set beside them.
 
   ```bash
-  bun src/cli.ts manifest adopt appeals --projection report-tab-details --pr 373 --head tims-630-port-report-tab-sections --yes
+  drip manifest adopt appeals --projection report-tab-details --pr 373 --head tims-630-port-report-tab-sections --yes
   ```
 
   Projection id, PR number and head branch are all required and cross-checked — adoption on two out of three would be a heuristic, and a wrong guess here becomes a future force-push over someone else's branch. The binding is recorded only if the branch's **effective diff**, replayed onto the mega branch's merge base, produces exactly the tree the projection materializes (itself plus its declared prerequisite closure). Anything else is refused with an interdiff; a branch carrying its own change but cut from the base branch rather than from its prerequisites is called out by name, since that reads identically to "wrong PR" in a raw diff and means something quite different.
@@ -119,7 +142,7 @@ Flags are declared per command, so `--help` is generated rather than maintained 
 - **`manifest discover`** — which open PRs *are* the projections in your manifest, and the exact command to adopt each one. Read-only: it lists open PRs, fetches each head, replays its effective diff onto the mega branch's merge base and compares the tree with what each unbound projection materializes. A candidate is a tree match and nothing else — no title similarity, no branch-name matching, no authorship. The commonest near miss (a branch carrying a projection's own change but cut from the base branch rather than from its prerequisites) is named as such rather than reported as "no candidate", two PRs carrying the same tree are both offered with the ambiguity stated, and drip's own branches and already-bound heads are skipped.
 
   ```bash
-  bun src/cli.ts manifest discover appeals
+  drip manifest discover appeals
   #   report-tab-details <- #373 tims-630-port-report-tab-sections — port report tab [exact tree match]
   #       drip manifest adopt appeals --projection report-tab-details --pr 373 --head tims-630-port-report-tab-sections --yes
   ```
@@ -131,9 +154,9 @@ Flags are declared per command, so `--help` is generated rather than maintained 
 - **`stack status` / `stack link`** — GitHub shipped stacked pull requests in July 2026, and a stack is exactly what `drip push --projection stacked` has always emitted: an ordered chain of PRs, each based on the head branch of the one below it. What was missing was the grouping object that makes GitHub show the layers and lets `gh stack merge` land the chain in one all-or-nothing operation.
 
   ```bash
-  bun src/cli.ts stack status appeals            # how drip's PRs chain, and what GitHub has grouped
-  bun src/cli.ts stack link appeals --dry-run    # the chains, without reading or writing GitHub
-  bun src/cli.ts stack link appeals --yes        # create/extend the stack
+  drip stack status appeals            # how drip's PRs chain, and what GitHub has grouped
+  drip stack link appeals --dry-run    # the chains, without reading or writing GitHub
+  drip stack link appeals --yes        # create/extend the stack
   ```
 
   **GitHub's convention first.** When the `gh stack` extension is installed, drip groups its PRs by running `gh stack link` — GitHub's own command for exactly this case, branches owned by another tool with no local tracking written. Without the extension drip calls the endpoints `link` itself calls, so an install drip can't make on your behalf never decides whether a push can finish; the report says which path ran. Three details keep delegating safe: PR *numbers* are passed rather than branch names (a branch argument would make `link` push it and open a PR — that's `drip push`'s job), `--base` is the chain's real bottom base (which makes `link`'s retarget path a no-op, since drip derives the chain *from* the bases), and an adopted member's live base is read first, because that's the one case where `link` would retarget a PR whose base is someone else's decision (`docs/adr/0020`).
@@ -150,9 +173,9 @@ Flags are declared per command, so `--help` is generated rather than maintained 
   { "version": 1, "units": [{ "id": "auth-refactor", "selectors": ["src/auth.ts::login", "src/auth.ts::logout"] }] }
   ```
   ```bash
-  bun src/cli.ts score appeals --expected hand-drawn.json --layer atomic       # the kill gate
-  bun src/cli.ts score appeals --expected hand-drawn.json --layer candidates   # --coarsen's output
-  bun src/cli.ts score appeals --expected hand-drawn.json --layer manifest     # the semantic projections
+  drip score appeals --expected hand-drawn.json --layer atomic       # the kill gate
+  drip score appeals --expected hand-drawn.json --layer candidates   # --coarsen's output
+  drip score appeals --expected hand-drawn.json --layer manifest     # the semantic projections
   ```
 
   Hand-drawn units are matched to drip units one-to-one (greatest overlap first, ties broken deterministically), so a split costs the smaller fragments and a merge costs one of the two units — a plurality match would score "drip merged two features into one PR" as a perfect result for both, which is the exact failure the gate exists to catch. Every disagreement is reported by selector, fallback groups are excluded unless `--include-fallback`, selectors that no longer exist are reported rather than dropped, and a partition that matches nothing fails rather than scoring 0/0 as a pass. `--threshold` moves the line; the default is two-thirds. Exit code 1 below it. See `docs/adr/0025-boundary-scoring-and-the-review-unit-workflow.md`, `docs/review-unit-workflow.md` and `docs/validation.md`.
@@ -207,7 +230,7 @@ The dashed hexagons are the external inputs. In short:
 ```bash
 git clone https://github.com/fustilio/drip-dummy dummy-repo
 cd dummy-repo && git checkout feature && cd ..  # branches other than the clone's default aren't checked out locally yet
-bun src/cli.ts verify feature --repo dummy-repo
+drip verify feature --repo dummy-repo
 ```
 
 ## Tests
@@ -216,7 +239,7 @@ bun src/cli.ts verify feature --repo dummy-repo
 bun test
 ```
 
-206 tests across 15 files. They run against real git in disposable temp repos (`src/test-helpers.ts`), not a fake `GitBackend` — see `docs/adr/0010-test-against-real-git.md` for why. Everything else runs real git plumbing, including a real `git push` to a local bare repo standing in for a remote, and — in the adoption suite — real handcrafted branches on that remote for drip to compare against.
+208 tests across 16 files. They run against real git in disposable temp repos (`src/test-helpers.ts`), not a fake `GitBackend` — see `docs/adr/0010-test-against-real-git.md` for why. Everything else runs real git plumbing, including a real `git push` to a local bare repo standing in for a remote, and — in the adoption suite — real handcrafted branches on that remote for drip to compare against.
 
 The one real external boundary, GitHub's API (`src/github.ts`), is mocked via `bun:test`'s `mock.module`. Those mocks go through `githubMock()` in `test-helpers.ts`, which supplies the **whole** export surface: bun's module mocks are global to the test process, so a partial one leaves module evaluation order deciding whether an unrelated file's `import { ghX } from "./github"` resolves at all.
 

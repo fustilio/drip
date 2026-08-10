@@ -4,4 +4,4 @@
 
 Fixed with `createRequire(import.meta.url)` and `require.resolve("tree-sitter-typescript/tree-sitter-tsx.wasm")` etc. — this resolves from `planner.ts`'s own location, i.e. drip's install directory, regardless of CWD or what the target repo has installed. Confirmed both packages ship their `.wasm` files as resolvable subpaths (no `exports` restriction blocking it).
 
-Not yet covered: a `bun build --compile` single-binary distribution, where there's no `node_modules` at all to resolve into. Flagged in the original issue as needing the same fix but out of scope here — this ADR covers the `bun add --global` / npm-install case.
+Not covered here: a `bun build --compile` single-binary distribution, where there's no `node_modules` at all to resolve into. Flagged in the original issue as needing the same fix but out of scope for this ADR, which covers the `bun add --global` / npm-install case. **Superseded by `docs/adr/0031-embedded-wasm-assets.md`**, which closes that case by importing the wasm files as embedded assets instead — subsuming this fix, since an import doesn't consult the CWD either.

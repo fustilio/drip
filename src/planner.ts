@@ -1,12 +1,18 @@
 import { Parser, Language, type Node } from "web-tree-sitter";
-import { createRequire } from "node:module";
+import runtimeWasm from "web-tree-sitter/web-tree-sitter.wasm" with { type: "file" };
+import tsxWasm from "tree-sitter-typescript/tree-sitter-tsx.wasm" with { type: "file" };
+import typescriptWasm from "tree-sitter-typescript/tree-sitter-typescript.wasm" with { type: "file" };
+import javascriptWasm from "tree-sitter-javascript/tree-sitter-javascript.wasm" with { type: "file" };
 import type { GitBackend } from "./git-backend";
 import type { Override } from "./store";
 
-// Resolve relative to this installed module, not the caller's CWD — a global
-// install of drip must not depend on the target repo having these grammar
-// packages in its own node_modules. See docs/adr/0012-wasm-asset-resolution.md.
-const requireFromHere = createRequire(import.meta.url);
+// These four wasm files are drip's own assets, never the target repo's, so they
+// are imported rather than resolved: `with { type: "file" }` yields a path to
+// the installed file when running from source and a path into the embedded
+// filesystem when running as a `bun build --compile` binary, which has no
+// node_modules to resolve into at all. Emscripten loads the tree-sitter runtime
+// itself, so `Parser.init` has to be pointed at it the same way.
+// See docs/adr/0031-embedded-wasm-assets.md.
 
 const DEF_TYPES = new Set([
   "function_declaration",
@@ -199,14 +205,14 @@ export function parseDiff(diffText: string): { files: FileSection[]; excluded: E
 
 async function loadLanguageFor(path: string): Promise<Language | null> {
   const wasm = path.endsWith(".tsx")
-    ? "tree-sitter-typescript/tree-sitter-tsx.wasm"
+    ? tsxWasm
     : path.endsWith(".ts")
-      ? "tree-sitter-typescript/tree-sitter-typescript.wasm"
+      ? typescriptWasm
       : /\.(js|jsx|mjs|cjs)$/.test(path)
-        ? "tree-sitter-javascript/tree-sitter-javascript.wasm"
+        ? javascriptWasm
         : null;
   if (!wasm) return null;
-  return Language.load(requireFromHere.resolve(wasm));
+  return Language.load(wasm);
 }
 
 function isDefinition(n: Node): boolean {
@@ -356,7 +362,7 @@ export async function computePlan(opts: {
     };
   }
 
-  await Parser.init();
+  await Parser.init({ locateFile: () => runtimeWasm });
   const langCache = new Map<string, Language | null>();
   const parser = new Parser();
 
