@@ -8,6 +8,7 @@ import type { GitBackend } from "./git-backend";
 import { materializeFlatFirst } from "./materialize";
 import { groupKeyOf, topoSort, type Hunk, type PlanResult } from "./planner";
 import type { PushUnits } from "./push";
+import { EMPTY_PROFILES, unknownProfileMessage, type ProfileSet } from "./profiles";
 import { gitPath } from "./repo";
 import { verifyTreeHash } from "./verify";
 import { runManifestVerification, type VerificationRun } from "./verification";
@@ -38,6 +39,11 @@ const ProjectionEntry = z.object({
   glue: z.array(z.string()).default([]),
   dependsOn: z.array(z.string()).default([]),
   verification: z.array(z.string()).default([]),
+  // A named command set from the repository's own profiles file, instead of
+  // repeating the same strings in every projection (issue #19). Resolved to
+  // ordinary commands during validation — nothing downstream knows the
+  // difference. Mutually exclusive with an inline `verification` list.
+  verificationProfile: z.string().nullable().optional(),
   // Declaring no checks is allowed, but it has to be a decision someone made
   // rather than a field nobody filled in (issue #10).
   verificationReason: z.string().nullable().optional(),
@@ -78,6 +84,11 @@ export type Finding = {
     | "no-verification"
     | "verification-waived"
     | "verification-failed"
+    // reusable verification profiles — see profiles.ts / docs/adr/0024
+    | "unknown-verification-profile"
+    | "verification-profile-conflict"
+    // a review candidate without stated intent is a bucket — see docs/adr/0025
+    | "no-intent"
     | "ordinal-selector"
     | "branch-mismatch"
     // adoption of a pre-existing PR — see adopt.ts / docs/adr/0020
@@ -101,7 +112,10 @@ export type ResolvedProjection = {
   files: string[];
   hunkCount: number;
   changedLines: number;
+  /** the commands that will run — resolved from `verificationProfile` when one is named */
   verification: string[];
+  /** the profile those commands came from, or null when they were listed inline */
+  verificationProfile: string | null;
   verificationReason: string | null;
   oversizeReason: string | null;
 };
@@ -234,6 +248,12 @@ export function resolveManifest(
     branch?: string;
     /** a projection containing code must declare a runnable check; a reason isn't enough (issue #14) */
     requireVerification?: boolean;
+    /** a projection must state what change it is, not just which slices it holds (issue #16) */
+    requireIntent?: boolean;
+    /** the repository's named verification command sets (issue #19); omit for none */
+    profiles?: ProfileSet;
+    /** only used to name the file a missing profiles document should live at */
+    repoRoot?: string;
   } = {},
 ): ResolvedManifest {
   const findings: Finding[] = [];
@@ -431,8 +451,53 @@ export function resolveManifest(
     // because the symbols it needs landed in a different one (issue #14).
     // Docs-, config- and lockfile-only projections keep the old rule — there
     // is nothing there for a typecheck to have an opinion about.
+    // --- verification commands: inline, or resolved from a named profile -----
+    // A profile is a lookup, not a merge: a projection that both names one and
+    // lists its own commands has two answers to "what runs here", and picking
+    // either silently is how a projection ends up running something its author
+    // didn't write. Resolution is reported alongside the commands, so the
+    // report never shows a command whose origin isn't visible.
+    const profiles = opts.profiles ?? EMPTY_PROFILES;
+    const profileName = entry.verificationProfile ?? null;
+    let commands = entry.verification;
+    let profileResolved: string | null = null;
+    if (profileName) {
+      if (entry.verification.length) {
+        add(
+          "error",
+          "verification-profile-conflict",
+          id,
+          `declares both verificationProfile '${profileName}' and its own verification commands — keep one: the profile for the shared case, the inline list for a one-off`,
+        );
+        commands = entry.verification;
+      } else {
+        const hit = profiles.byName.get(profileName);
+        if (!hit) {
+          add("error", "unknown-verification-profile", id, unknownProfileMessage(profiles, profileName, opts.repoRoot));
+          commands = [];
+        } else {
+          commands = hit.commands;
+          profileResolved = profileName;
+        }
+      }
+    }
+
+    // A projection is a claim about *what change this is*. Without that it's a
+    // set of slices with an id, which is the thing coarsening already produces
+    // and the reason the manifest layer exists at all (issue #16). A warning by
+    // default — an emitted skeleton is meant to be edited, not rejected — and
+    // an error under --require-intent or --strict.
+    if (!entry.intent?.trim()) {
+      add(
+        opts.requireIntent ? "error" : "warning",
+        "no-intent",
+        id,
+        "states no intent — say what behavioural change this PR is, in a sentence a reviewer can check the diff against",
+      );
+    }
+
     const codeFiles = files.filter(isCodeFile);
-    if (!entry.verification.length) {
+    if (!commands.length && !profileName) {
       if (opts.requireVerification && codeFiles.length) {
         add(
           "error",
@@ -457,7 +522,8 @@ export function resolveManifest(
       files,
       hunkCount: hunks.length,
       changedLines,
-      verification: entry.verification,
+      verification: commands,
+      verificationProfile: profileResolved,
       verificationReason: entry.verificationReason ?? null,
       oversizeReason: entry.oversizeReason ?? null,
     });
@@ -655,6 +721,7 @@ export function manifestReportToJson(resolved: ResolvedManifest, extra: Finding[
       hunks: p.hunkCount,
       changedLines: p.changedLines,
       verification: p.verification,
+      verificationProfile: p.verificationProfile,
       verificationReason: p.verificationReason,
       oversizeReason: p.oversizeReason,
     })),
@@ -679,7 +746,9 @@ export function printManifestReport(resolved: ResolvedManifest, extra: Finding[]
     if (p.intent) console.log(`    intent: ${p.intent}`);
     console.log(`    ${p.sliceIds.length} slice(s)${p.glueSliceIds.length ? ` (${p.glueSliceIds.length} glue)` : ""}, ${p.files.length} file(s), ${p.hunkCount} hunk(s), ${p.changedLines} changed line(s)`);
     if (p.dependsOn.length) console.log(`    requires: ${p.dependsOn.join(", ")}`);
-    if (p.verification.length) console.log(`    verify: ${p.verification.join(" && ")}`);
+    // The profile is named next to the commands it resolved to: a reader of
+    // this report should never have to open a second file to learn what runs.
+    if (p.verification.length) console.log(`    verify: ${p.verification.join(" && ")}${p.verificationProfile ? `  (profile: ${p.verificationProfile})` : ""}`);
     if (p.oversizeReason) console.log(`    oversize (accepted): ${p.oversizeReason}`);
   }
 

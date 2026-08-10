@@ -88,6 +88,34 @@ export function ghPrView(repoRoot: string, prNumber: number): PrRef {
   };
 }
 
+export type PrSummary = { number: number; url: string; title: string; headRefName: string; baseRefName: string };
+
+// Every open PR, for adoption discovery (issue #17). Read-only, and the only
+// thing discovery uses GitHub for: which branches currently have a live review
+// surface. What a projection *is* is then decided against git trees, never
+// against anything in this list.
+export function ghListOpenPrs(repoRoot: string, limit = 50): PrSummary[] {
+  let out: string;
+  try {
+    out = execFileSync(
+      "gh",
+      ["pr", "list", "--state", "open", "--limit", String(limit), "--json", "number,url,title,headRefName,baseRefName"],
+      { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] },
+    ).toString();
+  } catch (e: any) {
+    throw new DripError(`gh pr list failed: ${String(e.stderr ?? e.message ?? "").trim()}`);
+  }
+  const trimmed = out.trim();
+  if (!trimmed) return [];
+  return (JSON.parse(trimmed) as any[]).map((p) => ({
+    number: Number(p.number),
+    url: String(p.url ?? ""),
+    title: String(p.title ?? ""),
+    headRefName: String(p.headRefName ?? ""),
+    baseRefName: String(p.baseRefName ?? ""),
+  }));
+}
+
 export type ReviewComment = {
   id: number;
   path: string;

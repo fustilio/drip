@@ -199,8 +199,8 @@ test("a manifest validates against the working tree, not the branch tip", async 
     version: 1,
     sourceBranch: "feature",
     projections: [
-      { id: "helper", atomicSlices: ["helper.ts::shared"], verificationReason: "fixture" },
-      { id: "committed", atomicSlices: ["committed.ts::committedWork"], verificationReason: "fixture" },
+      { id: "helper", intent: "Extract the shared helper.", atomicSlices: ["helper.ts::shared"], verificationReason: "fixture" },
+      { id: "committed", intent: "Land the committed work.", atomicSlices: ["committed.ts::committedWork"], verificationReason: "fixture" },
     ],
   });
   const resolved = resolveManifest(worktreePlan, manifest, { branch: source.label });

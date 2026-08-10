@@ -7,7 +7,9 @@ import { DripError } from "./errors";
 import { loadManifest, manifestReportToJson, resolveManifest, validateManifestAgainstGit } from "./manifest";
 import { ShellGitBackend } from "./git-backend";
 import { planToJson } from "./planner";
+import { loadProfiles } from "./profiles";
 import { resolveRepoRoot } from "./repo";
+import { collectReviewContext, reviewContextToJson } from "./review-context";
 import { sourceToJson } from "./source";
 import { addOverride, listOverrides, openStore, removeOverride } from "./store";
 import { loadPlan, runVerify } from "./workflow";
@@ -128,19 +130,71 @@ server.tool(
       .boolean()
       .default(false)
       .describe("fail any projection that contains code and declares no verification command, even if it gives a verificationReason"),
+    requireIntent: z.boolean().default(false).describe("fail any projection that states no intent (by default that is a warning)"),
   },
-  async ({ repo, branch, base, manifestPath, runVerification, requireVerification }) => {
+  async ({ repo, branch, base, manifestPath, runVerification, requireVerification, requireIntent }) => {
     try {
       const repoRoot = resolveRepoRoot(git, repo);
       const { db, mergeBase, plan } = await loadPlan({ git, repoRoot, branch, baseBranch: base });
       if (plan.hunks.length === 0) return textResult({ ok: true, message: "no changes — nothing to validate" });
       if (!plan.order) return textResult(planToJson(plan));
 
-      const resolved = resolveManifest(plan, loadManifest(manifestPath), { branch, requireVerification });
+      const resolved = resolveManifest(plan, loadManifest(manifestPath), {
+        branch,
+        requireVerification,
+        requireIntent,
+        profiles: loadProfiles(repoRoot),
+        repoRoot,
+      });
       const checked = resolved.ok
         ? await validateManifestAgainstGit({ git, repoRoot, branch, mergeBase, plan, resolved, db, runVerification })
         : { findings: [], verification: [] };
       return textResult(manifestReportToJson(resolved, checked.findings, checked.verification));
+    } catch (e) {
+      return errorResult(e);
+    }
+  },
+);
+
+server.tool(
+  "drip_review_context",
+  "Report the review surface of a manifest's projections: identity and intent, the branch/PR each corresponds to (and whether drip opened it or adopted a pre-existing one), " +
+    "whether its recorded base still agrees with the manifest graph, whether the projection's content has moved since its PR last received it (with the selectors that changed), " +
+    "and the open review threads on it. Strictly read-only: it opens, closes, comments on and resolves nothing, pushes nothing, and records nothing — " +
+    "set includeReview false to skip the GitHub read entirely and report only what the repository itself knows.",
+  {
+    repo: z.string(),
+    branch: z.string(),
+    base: z.string().default("main"),
+    manifestPath: z.string().describe("path to the projections manifest JSON"),
+    projection: z.string().optional().describe("restrict the report to one projection id"),
+    includeReview: z.boolean().default(true).describe("read the PR's review comments; false reports local state only"),
+  },
+  async ({ repo, branch, base, manifestPath, projection, includeReview }) => {
+    try {
+      const repoRoot = resolveRepoRoot(git, repo);
+      const { db, mergeBase, plan } = await loadPlan({ git, repoRoot, branch, baseBranch: base });
+      if (plan.hunks.length === 0) return textResult({ ok: true, message: "no changes — no projections to report on" });
+      if (!plan.order) return textResult(planToJson(plan));
+
+      const resolved = resolveManifest(plan, loadManifest(manifestPath), { branch, profiles: loadProfiles(repoRoot), repoRoot });
+      if (!resolved.ok) return textResult(manifestReportToJson(resolved));
+      if (projection && !resolved.projections.some((p) => p.id === projection)) {
+        return errorResult(new DripError(`no projection '${projection}' in this manifest — known ids: ${resolved.projections.map((p) => p.id).join(", ")}`));
+      }
+      const report = await collectReviewContext({
+        git,
+        db,
+        repoRoot,
+        branch,
+        baseBranch: base,
+        mergeBase,
+        plan,
+        resolved,
+        only: projection ?? null,
+        includeReview,
+      });
+      return textResult(reviewContextToJson(report));
     } catch (e) {
       return errorResult(e);
     }

@@ -66,6 +66,30 @@ _Avoid_: stack (bare — `--projection stacked` is a different axis entirely)
 A command that was actually executed against a projection's own materialized tree. Distinct from a stated intention: `verificationReason` records a decision not to check, and under `--require-verification` that decision may not cover a projection containing code. drip only ever runs a check the repository named for itself — a root `tsconfig.json`, a root `typecheck` script, or a manifest `verification` entry — and merely *offers* the per-package scripts it discovers, since composing a workspace invocation and then failing someone's push on the result is a guess with consequences. See docs/adr/0023.
 _Avoid_: build check (that's the per-slice compiler run specifically), CI
 
+**Verification profile**:
+A named set of verification commands declared once for the repository, in `.drip/verification.json` (or the private `<gitdir>/drip/verification.json`), that a projection references by name instead of repeating the strings. Resolution is a lookup and never a merge — declaring both a profile and inline `verification` commands is an error, not a precedence rule — and the resolved commands are what runs, what `--require-verification` counts and what the PR body carries. drip never selects one for you: no default, no inference from the workspace. Reported next to the commands it produced, so what runs is never one file away. See docs/adr/0024.
+_Avoid_: preset, config (a profile names commands the repository already runs; it decides nothing)
+
+**Intent**:
+The sentence a projection states about what behavioural change it is — the thing a reviewer holds the diff against. The one field no layer below the manifest can produce: a projection without it is a set of slices with an id, which is what coarsening already gives you. Missing intent is a `no-intent` warning, an error under `--require-intent` or `--strict`. See docs/adr/0025.
+_Avoid_: description, summary (both invite restating the diff — "changes to report.ts" is not an intent)
+
+**Hand-drawn partition**:
+The grouping a human would have drawn, written down before looking at drip's output, as a versioned JSON file of unit ids and durable group-key selectors. The input to scoring, and deliberately not a repository artifact — the material worth scoring against is somebody's real branch, so the file lives wherever that branch does. Blind is load-bearing: a partition drawn after reading the plan measures how persuasive the plan is, not how right it is.
+_Avoid_: ground truth (it is one informed opinion, which is exactly what the gate asks about), expected output
+
+**Boundary agreement**:
+What `drip score` measures: the fraction of scored hunks that landed in the drip unit their hand-drawn unit was matched to, under a **one-to-one** match between hand-drawn and drip units. Injective on purpose — a plurality match would score "drip merged two features into one PR" as a perfect result for both, which is the failure the M0 kill gate exists to catch. Splits and merges each cost something and are named separately, and every disagreement is reported by selector. Fallback groups are excluded unless asked for. The gate is BUILD-PLAN's two-thirds; the layer (`atomic`, `candidates`, `manifest`) says which of drip's partitions is being scored. See docs/adr/0025 and docs/validation.md.
+_Avoid_: accuracy, score (bare — always say which layer and which threshold)
+
+**Adoption candidate**:
+An open PR whose branch, replayed onto the mega branch's merge base, produces exactly the tree a projection materializes — the same evidence `manifest adopt` requires, found for you instead of by you. Reported with the exact adopt command to review and run, never acted on. A branch carrying a projection's own change but not its prerequisite closure is a candidate of a different, named kind (`own-change-only`), because that shape reads identically to "wrong PR" in a raw diff and means something else entirely. Titles, branch names and authorship are never evidence. See docs/adr/0026.
+_Avoid_: match, suggestion (both imply drip has an opinion; it has a tree comparison)
+
+**Review context**:
+The joined, read-only view of one projection's review surface: its identity and intent, the branch and PR it corresponds to (and whether drip opened that or adopted someone else's), whether the recorded base still agrees with the manifest graph, whether the projection's content has moved since its PR last received it — with the selectors that moved — and the open threads on it. Read-only is a property of the code, not a promise: nothing in that path comments, replies, resolves, pushes or records, and the suite asserts it. What it cannot know it says: thread *resolution* state isn't exposed by the endpoint drip reads. See docs/adr/0027.
+_Avoid_: review state (implies drip knows whether threads are resolved — it doesn't), status
+
 **Tree-hash invariant**:
 The core correctness check: `apply(slices in topological order) == tree(mega branch)`, verified by comparing git tree hashes.
 

@@ -2,7 +2,7 @@
 
 A tool for drip-feeding a mega branch back into main as thin, reviewable PRs. Slices are derived projections of the mega branch, not maintained branches — regenerated, never rebased.
 
-**Status:** M0 (feasibility spike) built. M1 (real CLI, `drip plan`/`drip verify`) built. M2 (`drip push`, real PRs via `gh`) built. M3 (content-addressed skip, squash-merge reconciliation, interdiff comments) built. M4 (comment anchoring, conservative exact-hash-only cut) built. M5's deterministic half (build-check caching, parallel per-slice builds) built. M5's AI half re-scoped away from a bundled provider to `plan --json` and an MCP server (`drip mcp`) for external tools (`docs/adr/0009`). **The M0 kill-gate blind-boundary scoring against real branches has not been run yet** — see `BUILD-PLAN.md` for what that means and why everything downstream is contingent on it. See `CONTEXT.md` for the domain model, and `docs/adr/` for the architecture decisions.
+**Status:** M0 (feasibility spike) built. M1 (real CLI, `drip plan`/`drip verify`) built. M2 (`drip push`, real PRs via `gh`) built. M3 (content-addressed skip, squash-merge reconciliation, interdiff comments) built. M4 (comment anchoring, conservative exact-hash-only cut) built. M5's deterministic half (build-check caching, parallel per-slice builds) built. M5's AI half re-scoped away from a bundled provider to `plan --json` and an MCP server (`drip mcp`) for external tools (`docs/adr/0009`). **The M0 kill-gate blind-boundary scoring against real branches has not been run yet** — see `BUILD-PLAN.md` for what that means and why everything downstream is contingent on it. It is now a command rather than an afternoon of reading (`drip score`), and `docs/validation.md` records what has actually been measured and what drip may therefore claim. See `CONTEXT.md` for the domain model, `docs/review-unit-workflow.md` for how a mega branch becomes a reviewable PR set, and `docs/adr/` for the architecture decisions.
 
 ## CLI
 
@@ -10,12 +10,15 @@ A tool for drip-feeding a mega branch back into main as thin, reviewable PRs. Sl
 bun install
 bun src/cli.ts plan <branch>|--worktree [--repo path] [--base branch] [--timing] [--assign-ids] [--json] [--coarsen] [--target-slices n] [--emit-manifest [--manifest path] [--force]]
 bun src/cli.ts verify <branch>|--worktree [--repo path] [--base branch] [--timing] [--coarsen] [--target-slices n] [--build-cmd cmd] [--no-build-check]
-bun src/cli.ts push <branch> [--repo path] [--base branch] [--projection stacked|flat-first] [--manifest path] [--no-manifest-check] [--strict] [--require-verification] [--reviewable-stack] [--draft] [--build-cmd cmd] [--no-build-check] --yes | --dry-run
-bun src/cli.ts validate-plan <branch> [--manifest path] [--repo path] [--base branch] [--json] [--no-manifest-check] [--strict] [--require-verification]
-bun src/cli.ts materialize <branch> [--manifest path] [--repo path] [--base branch] [--projection flat-first|stacked] [--only id[,id]] [--output dir] [--force] [--json] [--no-manifest-check] [--strict] [--require-verification]
+bun src/cli.ts push <branch> [--repo path] [--base branch] [--projection stacked|flat-first] [--manifest path] [--no-manifest-check] [--strict] [--require-verification] [--require-intent] [--reviewable-stack] [--draft] [--build-cmd cmd] [--no-build-check] --yes | --dry-run
+bun src/cli.ts validate-plan <branch> [--manifest path] [--repo path] [--base branch] [--json] [--no-manifest-check] [--strict] [--require-verification] [--require-intent]
+bun src/cli.ts materialize <branch> [--manifest path] [--repo path] [--base branch] [--projection flat-first|stacked] [--only id[,id]] [--output dir] [--force] [--json] [--no-manifest-check] [--strict] [--require-verification] [--require-intent]
 bun src/cli.ts manifest adopt <branch> --projection id --pr n --head branch [--manifest path] [--repo path] [--base branch] [--remote name] [--json] [--yes]
+bun src/cli.ts manifest discover <branch> [--manifest path] [--repo path] [--base branch] [--remote name] [--limit n] [--json]
 bun src/cli.ts manifest list <branch> [--repo path]
 bun src/cli.ts manifest forget <branch> --projection id [--repo path]
+bun src/cli.ts review-context <branch> [--projection id] [--manifest path] [--repo path] [--base branch] [--no-review] [--json]
+bun src/cli.ts score <branch>|--worktree --expected path [--layer atomic|candidates|manifest] [--manifest path] [--target-slices n] [--threshold f] [--include-fallback] [--json] [--repo path] [--base branch]
 bun src/cli.ts mcp
 ```
 
@@ -69,6 +72,21 @@ bun src/cli.ts mcp
 
   **`verification` is executed, not documented.** Each projection's commands run against *its own materialized tree* — the prerequisite closure its PR would show — so a projection that applies cleanly and reconstructs the final tree, but isn't actually runnable because it's missing a fixture, an export or a route registration, fails here rather than in review. A failure blocks `validate-plan` and refuses `push`. Results are cached by the tree they ran against, so independent projections aren't re-checked when something unrelated moves, and captured output is written to `<gitdir>/drip/verification/<branch>/` and reported by path. A projection with no commands warns unless it sets `verificationReason`; `--strict` turns every warning into a failure (useful in CI), and `--no-manifest-check` skips execution entirely for local experimentation. See `docs/adr/0019-executable-verification.md`.
 
+  **Named verification profiles.** A repository usually has two or three real answers to "how do I check this" and every projection repeats one of them. Declare them once in `.drip/verification.json` (or `<gitdir>/drip/verification.json`) and reference one by name:
+
+  ```jsonc
+  // .drip/verification.json
+  { "version": 1, "profiles": { "typecheck": { "description": "the repo's own typecheck", "commands": ["pnpm typecheck"] } } }
+  ```
+  ```jsonc
+  // a projection
+  { "id": "report-tab-details", "verificationProfile": "typecheck", ... }
+  ```
+
+  Resolution is a lookup, not a merge: declaring both a profile and inline `verification` commands is an error rather than a silent choice between them, an unknown profile names the file it looked in and the profiles defined there, and a malformed profiles file fails on load even if nothing references it. The resolved commands are what runs, what `--require-verification` counts and what the PR body carries — the only place the indirection shows is the report, which prints the profile next to the commands it produced. drip never picks a profile for you: there is no default and no inference. See `docs/adr/0024-reusable-verification-profiles.md`.
+
+  **`--require-intent`** refuses a projection that states no `intent`. Without the flag that's a warning (an emitted skeleton is meant to be edited), and it says per projection which fields are still yours to write. A projection with no stated intent is a set of slices with an id — which is what coarsening already produces, and the reason the manifest layer exists at all. See `docs/adr/0025-boundary-scoring-and-the-review-unit-workflow.md`.
+
   **Where it lives.** With no `--manifest`, `validate-plan` looks in `.drip/projections/<branch>.json` (in the working tree, committable — an approved review plan is a document a team argues about and keeps) and then `<gitdir>/drip/projections/<branch>.json` (private to the clone). `drip plan <branch> --coarsen --emit-manifest` writes a valid starting skeleton there — every slice assigned, real selectors filled in — for you or an agent to give real ids, titles and intents; it refuses to overwrite without `--force`. `push` deliberately does **not** auto-discover: a manifest left lying around must never silently change what `push --yes` sends to GitHub, so it says one exists and pushes atomic slices unless you pass `--manifest`.
 
   Validated: every slice assigned exactly once or explicitly deferred with a reason; nothing deferred that another projection needs; the `dependsOn` graph acyclic; every atomic dependency crossing a boundary declared (widening is fine, dropping is not); each projection actually applies on its declared prerequisites; shared glue reachable from everyone who needs it; budgets respected unless `oversizeReason` says otherwise; and the whole graph still reconstructs the mega-branch tree — deferred slices included, so deferral can't silently lose work. `push --manifest` runs the same validation and refuses on any error; a projection's PR is keyed on its manifest `id`, so replanning underneath it doesn't cost the PR its identity or its review comments.
@@ -91,7 +109,32 @@ bun src/cli.ts mcp
   Projection id, PR number and head branch are all required and cross-checked — adoption on two out of three would be a heuristic, and a wrong guess here becomes a future force-push over someone else's branch. The binding is recorded only if the branch's **effective diff**, replayed onto the mega branch's merge base, produces exactly the tree the projection materializes (itself plus its declared prerequisite closure). Anything else is refused with an interdiff; a branch carrying its own change but cut from the base branch rather than from its prerequisites is called out by name, since that reads identically to "wrong PR" in a raw diff and means something quite different.
 
   Adoption never touches the remote — no push, no retarget, no comment. Afterwards, `push --manifest --projection flat-first` updates that PR through the normal correspondence path (interdiff comment, comment anchoring, squash-merge detection), and a *dependent's* base names the adopted branch rather than a drip-owned one. Three things change because drip doesn't own an adopted branch: it force-pushes **with a lease** (a reviewer's commit pushed in between blocks the push instead of vanishing), it skips whenever the branch already shows the projection's tree rather than on a content-hash match, and it **never retargets** the PR — a base that disagrees with the manifest graph is reported on every push, and changing it means changing it on the PR and re-running `manifest adopt`. `manifest list` shows every projection PR and whether drip opened it or adopted it; `manifest forget` drops a mis-binding without touching the PR. See `docs/adr/0020-adopting-existing-prs.md`.
-- **`mcp`** — starts an MCP stdio server exposing `drip_plan`, `drip_verify`, `drip_validate_plan`, `drip_override_list`, `drip_override_add`, `drip_override_remove` as tools, so an MCP client (an agent, an editor integration) can read plan/verify data and write override decisions without shelling out to the CLI. `drip_plan`/`drip_verify` take `worktree` too, so an agent can propose a partition from work in progress before any git state changes. No `push` or `manifest adopt` tool — one has real side effects and the other decides that drip may later force-push over a branch it doesn't own; both need `--yes` from a human. No AI provider inside drip anywhere — see `docs/adr/0009-ai-integration-external-not-bundled.md`.
+- **`manifest discover`** — which open PRs *are* the projections in your manifest, and the exact command to adopt each one. Read-only: it lists open PRs, fetches each head, replays its effective diff onto the mega branch's merge base and compares the tree with what each unbound projection materializes. A candidate is a tree match and nothing else — no title similarity, no branch-name matching, no authorship. The commonest near miss (a branch carrying a projection's own change but cut from the base branch rather than from its prerequisites) is named as such rather than reported as "no candidate", two PRs carrying the same tree are both offered with the ambiguity stated, and drip's own branches and already-bound heads are skipped.
+
+  ```bash
+  bun src/cli.ts manifest discover appeals
+  #   report-tab-details <- #373 tims-630-port-report-tab-sections — port report tab [exact tree match]
+  #       drip manifest adopt appeals --projection report-tab-details --pr 373 --head tims-630-port-report-tab-sections --yes
+  ```
+
+  Nothing is recorded, pushed or commented on; adoption stays an explicit `--yes` that re-checks all three of projection, PR and head branch. See `docs/adr/0026-guided-adoption-discovery.md`.
+- **`review-context`** — the state of a projection's review surface, joined from the three places it lives: what the manifest says the projection is, what the store says it corresponds to (branch, PR, adopted or drip-opened, recorded base vs the base the manifest graph implies now), whether its content has moved since its PR last received it (with the changed files and selectors), and the open review threads on it plus any comments drip previously couldn't relocate.
+
+  Read-only by construction — no comment, no reply, no resolve, no push, no correspondence write; the suite asserts every mutating GitHub call is never made and that neither the refs nor the store change across a run. An unreachable `gh` is reported as unavailable with the local half of the answer intact, `--no-review` skips the GitHub read entirely, and a recorded commit this clone doesn't have is reported as *unknown* rather than guessed at. Thread resolution state isn't exposed by the endpoint drip reads, and the report says so instead of implying it. See `docs/adr/0027-read-only-review-context.md`.
+- **`score`** — measures drip's boundaries against a partition you drew by hand. This is the M0 kill gate from `BUILD-PLAN.md` ("are the proposed boundaries ones you'd have drawn? if under two-thirds are, stop") as a command rather than an impression, and the same instrument one layer up for review candidates.
+
+  ```jsonc
+  // hand-drawn.json — kept wherever the branch it describes lives, never in this repo
+  { "version": 1, "units": [{ "id": "auth-refactor", "selectors": ["src/auth.ts::login", "src/auth.ts::logout"] }] }
+  ```
+  ```bash
+  bun src/cli.ts score appeals --expected hand-drawn.json --layer atomic       # the kill gate
+  bun src/cli.ts score appeals --expected hand-drawn.json --layer candidates   # --coarsen's output
+  bun src/cli.ts score appeals --expected hand-drawn.json --layer manifest     # the semantic projections
+  ```
+
+  Hand-drawn units are matched to drip units one-to-one (greatest overlap first, ties broken deterministically), so a split costs the smaller fragments and a merge costs one of the two units — a plurality match would score "drip merged two features into one PR" as a perfect result for both, which is the exact failure the gate exists to catch. Every disagreement is reported by selector, fallback groups are excluded unless `--include-fallback`, selectors that no longer exist are reported rather than dropped, and a partition that matches nothing fails rather than scoring 0/0 as a pass. `--threshold` moves the line; the default is two-thirds. Exit code 1 below it. See `docs/adr/0025-boundary-scoring-and-the-review-unit-workflow.md`, `docs/review-unit-workflow.md` and `docs/validation.md`.
+- **`mcp`** — starts an MCP stdio server exposing `drip_plan`, `drip_verify`, `drip_validate_plan`, `drip_review_context`, `drip_override_list`, `drip_override_add`, `drip_override_remove` as tools, so an MCP client (an agent, an editor integration) can read plan/verify data and write override decisions without shelling out to the CLI. `drip_plan`/`drip_verify` take `worktree` too, so an agent can propose a partition from work in progress before any git state changes. `drip_review_context` is the read-only view of a projection's PR, branch, drift and open threads (docs/adr/0027) — there is no write counterpart, for the same reason there is no `push` or `manifest adopt` tool: one has real side effects and the other decides that drip may later force-push over a branch it doesn't own, and both need `--yes` from a human. No AI provider inside drip anywhere — see `docs/adr/0009-ai-integration-external-not-bundled.md`.
 
 ## M0 spike
 

@@ -10,6 +10,7 @@ import {
 } from "./adopt";
 import { assignChangeIds } from "./change-id";
 import { computeProjections, printProjections, projectionsToJson } from "./coarsen";
+import { discoverAdoptionCandidates, discoveryToJson, printDiscoveryReport } from "./discover";
 import {
   emitManifest,
   findManifest,
@@ -28,10 +29,13 @@ import {
 import { materializeProjections, materializeToJson, printMaterializeReport } from "./materialize-local";
 import { DripError } from "./errors";
 import { ShellGitBackend, type GitBackend } from "./git-backend";
-import { ghPrView } from "./github";
-import { planToJson, printPlan, type PlanResult } from "./planner";
+import { ghListOpenPrs, ghPrView } from "./github";
+import { planToJson, printPlan, type Hunk, type PlanResult } from "./planner";
 import { push, type PushUnits } from "./push";
+import { loadProfiles } from "./profiles";
 import { resolveRepoRoot } from "./repo";
+import { collectReviewContext, printReviewContext, reviewContextToJson } from "./review-context";
+import { loadExpectedPartition, printScoreReport, scoreBoundaries, scoreToJson, type ScoreLayer } from "./score";
 import { describeSource, sourceToJson } from "./source";
 import { addOverride, deleteCorrespondence, listOverrides, openStore, recordTiming, removeOverride } from "./store";
 import type { VerificationRun } from "./verification";
@@ -43,12 +47,12 @@ function usage(): never {
     "usage: drip plan <branch>|--worktree [--repo path] [--base branch] [--timing] [--assign-ids] [--json] [--coarsen] [--target-slices n] [--emit-manifest [--manifest path] [--force]]",
   );
   console.error("       drip verify <branch>|--worktree [--repo path] [--base branch] [--timing] [--coarsen] [--target-slices n] [--build-cmd cmd] [--no-build-check]");
-  console.error("       drip validate-plan <branch> [--manifest path] [--repo path] [--base branch] [--json] [--no-manifest-check] [--strict] [--require-verification]");
+  console.error("       drip validate-plan <branch> [--manifest path] [--repo path] [--base branch] [--json] [--no-manifest-check] [--strict] [--require-verification] [--require-intent]");
   console.error(
-    "       drip materialize <branch> [--manifest path] [--repo path] [--base branch] [--projection flat-first|stacked] [--only id[,id]] [--output dir] [--force] [--json] [--no-manifest-check] [--strict] [--require-verification]",
+    "       drip materialize <branch> [--manifest path] [--repo path] [--base branch] [--projection flat-first|stacked] [--only id[,id]] [--output dir] [--force] [--json] [--no-manifest-check] [--strict] [--require-verification] [--require-intent]",
   );
   console.error(
-    "       drip push <branch> [--repo path] [--base branch] [--projection stacked|flat-first] [--manifest path] [--no-manifest-check] [--strict] [--require-verification] [--reviewable-stack] [--draft] [--build-cmd cmd] [--no-build-check] --yes | --dry-run",
+    "       drip push <branch> [--repo path] [--base branch] [--projection stacked|flat-first] [--manifest path] [--no-manifest-check] [--strict] [--require-verification] [--require-intent] [--reviewable-stack] [--draft] [--build-cmd cmd] [--no-build-check] --yes | --dry-run",
   );
   console.error(
     "       drip override add <branch> --kind force_merge|force_split --selector-a file::Symbol [--selector-b file::Symbol] [--note text] [--repo path]",
@@ -58,8 +62,17 @@ function usage(): never {
   console.error(
     "       drip manifest adopt <branch> --projection id --pr n --head branch [--manifest path] [--repo path] [--base branch] [--remote name] [--json] [--yes]",
   );
+  console.error(
+    "       drip manifest discover <branch> [--manifest path] [--repo path] [--base branch] [--remote name] [--limit n] [--json]",
+  );
   console.error("       drip manifest list <branch> [--repo path]");
   console.error("       drip manifest forget <branch> --projection id [--repo path]");
+  console.error(
+    "       drip review-context <branch> [--projection id] [--manifest path] [--repo path] [--base branch] [--no-review] [--json]",
+  );
+  console.error(
+    "       drip score <branch>|--worktree --expected path [--layer atomic|candidates|manifest] [--manifest path] [--target-slices n] [--threshold f] [--include-fallback] [--json] [--repo path] [--base branch]",
+  );
   console.error("       drip mcp   (starts an MCP stdio server exposing plan/verify/override as tools)");
   process.exit(2);
 }
@@ -197,11 +210,19 @@ async function checkManifest(opts: {
   runVerification: boolean;
   /** a projection containing code must declare a runnable check (issue #14) */
   requireVerification: boolean;
+  /** a projection must state its intent, not just its members (issue #16) */
+  requireIntent: boolean;
   /** what the projections must reconstruct — the working tree under --worktree */
   sourceRef?: string;
 }) {
   const { git, repoRoot, branch, mergeBase, plan, db, sourceRef } = opts;
-  const resolved = resolveManifest(plan, loadManifest(opts.manifestPath), { branch, requireVerification: opts.requireVerification });
+  const resolved = resolveManifest(plan, loadManifest(opts.manifestPath), {
+    branch,
+    requireVerification: opts.requireVerification,
+    requireIntent: opts.requireIntent,
+    profiles: loadProfiles(repoRoot),
+    repoRoot,
+  });
   const checked = resolved.ok
     ? await validateManifestAgainstGit({ git, repoRoot, branch, mergeBase, plan, resolved, db, sourceRef, runVerification: opts.runVerification })
     : { findings: [] as Finding[], verification: [] as VerificationRun[] };
@@ -212,7 +233,7 @@ async function checkManifest(opts: {
 // that already exists, rather than opening a new one. See docs/adr/0020.
 async function runManifestCommand(git: GitBackend, positionals: string[], values: Record<string, unknown>) {
   const [, sub, branch] = positionals;
-  if (sub !== "adopt" && sub !== "list" && sub !== "forget") usage();
+  if (sub !== "adopt" && sub !== "list" && sub !== "forget" && sub !== "discover") usage();
   if (!branch) throw new DripError(`drip manifest ${sub} requires the mega branch: drip manifest ${sub} <branch> ...`);
 
   const repoRoot = resolveRepoRoot(git, (values.repo as string | undefined) ?? process.cwd());
@@ -227,6 +248,46 @@ async function runManifestCommand(git: GitBackend, positionals: string[], values
     for (const r of rows) {
       console.log(`  ${r.projectionId} -> ${r.branch}${r.prNumber ? ` #${r.prNumber}` : ""} [${r.adopted ? "adopted" : "drip"}] base: ${r.baseRef ?? "?"}${r.prUrl ? ` ${r.prUrl}` : ""}`);
     }
+    return;
+  }
+
+  // --- discover: which open PRs could be adopted, and the command to do it ---
+  // Read-only, and deliberately not a mode of `adopt`: adopt takes a decision
+  // and writes correspondence, this takes none and writes nothing (issue #17).
+  if (sub === "discover") {
+    const jsonOut = !!values.json;
+    const baseBranch = values.base as string;
+    const { db, mergeBase, plan } = await loadPlan({ git, repoRoot, branch, baseBranch });
+    if (!plan.hunks.length) throw new DripError(`no changes between ${baseBranch} and ${branch} — there are no projections to find PRs for`);
+    if (!plan.order) throw new DripError("cannot discover against a cyclic slice DAG — resolve the cycle first");
+
+    const resolved = resolveManifest(plan, loadManifest(resolveManifestPath(repoRoot, branch, values.manifest as string | undefined, jsonOut)), {
+      branch,
+      profiles: loadProfiles(repoRoot),
+      repoRoot,
+    });
+    if (!resolved.ok) {
+      if (!jsonOut) printManifestReport(resolved);
+      throw new DripError("manifest validation failed — the projections to find PRs for aren't well-defined yet");
+    }
+
+    const limit = values.limit === undefined ? 50 : Number(values.limit);
+    if (!Number.isInteger(limit) || limit <= 0) throw new DripError(`--limit must be a positive whole number, got '${values.limit}'`);
+
+    const report = await discoverAdoptionCandidates({
+      git,
+      db,
+      repoRoot,
+      branch,
+      baseBranch,
+      mergeBase,
+      plan,
+      resolved,
+      remote: (values.remote as string | undefined) ?? "origin",
+      prs: ghListOpenPrs(repoRoot, limit),
+    });
+    if (jsonOut) console.log(JSON.stringify(discoveryToJson(report)));
+    else printDiscoveryReport(report);
     return;
   }
 
@@ -256,7 +317,11 @@ async function runManifestCommand(git: GitBackend, positionals: string[], values
     throw new DripError("cannot adopt against a cyclic slice DAG — resolve the cycle first");
   }
 
-  const resolved = resolveManifest(plan, loadManifest(resolveManifestPath(repoRoot, branch, values.manifest as string | undefined, jsonOut)), { branch });
+  const resolved = resolveManifest(plan, loadManifest(resolveManifestPath(repoRoot, branch, values.manifest as string | undefined, jsonOut)), {
+    branch,
+    profiles: loadProfiles(repoRoot),
+    repoRoot,
+  });
   if (!resolved.ok) {
     // Adoption binds a real PR to a projection, so the manifest that defines
     // that projection has to hold together first — otherwise the thing being
@@ -322,16 +387,30 @@ async function main() {
       // issue #14: two guards between "a valid patch DAG" and "a reviewable,
       // CI-verifiable GitHub stack".
       "require-verification": { type: "boolean", default: false },
+      // issue #16: a projection that states no intent is a bucket of slices
+      // with a name, not a review unit.
+      "require-intent": { type: "boolean", default: false },
       "reviewable-stack": { type: "boolean", default: false },
       // `materialize` only: which projections to write, and where to check
       // them out. Repeatable and comma-separated both work.
       only: { type: "string", multiple: true },
+      // `manifest discover` only: how many open PRs to examine (issue #17).
+      limit: { type: "string" },
       output: { type: "string" },
       json: { type: "boolean", default: false },
       coarsen: { type: "boolean", default: false },
       worktree: { type: "boolean", default: false },
       "target-slices": { type: "string" },
       manifest: { type: "string" },
+      // `score` only: the hand-drawn partition to measure drip's boundaries
+      // against, which layer to measure, and the gate (issues #15, #16).
+      expected: { type: "string" },
+      layer: { type: "string" },
+      threshold: { type: "string" },
+      "include-fallback": { type: "boolean", default: false },
+      // `review-context` only: skip the GitHub read and report just what the
+      // repository itself knows (issue #18).
+      "no-review": { type: "boolean", default: false },
       "no-manifest-check": { type: "boolean", default: false },
       strict: { type: "boolean", default: false },
       "emit-manifest": { type: "boolean", default: false },
@@ -363,7 +442,13 @@ async function main() {
   }
 
   const isCommand =
-    command === "plan" || command === "verify" || command === "push" || command === "validate-plan" || command === "materialize";
+    command === "plan" ||
+    command === "verify" ||
+    command === "push" ||
+    command === "validate-plan" ||
+    command === "materialize" ||
+    command === "score" ||
+    command === "review-context";
   const worktree = !!values.worktree;
   if (!command || !isCommand || (!branchArg && !worktree)) usage();
 
@@ -372,7 +457,9 @@ async function main() {
   const baseBranch = values.base!;
   const started = Date.now();
 
-  const jsonOut = !!values.json && (command === "plan" || command === "validate-plan" || command === "materialize");
+  const jsonOut =
+    !!values.json &&
+    (command === "plan" || command === "validate-plan" || command === "materialize" || command === "score" || command === "review-context");
 
   // Worktree mode is a *planning* source: it describes work that isn't
   // committed yet, so anything that rewrites history or publishes to GitHub
@@ -412,6 +499,104 @@ async function main() {
     return;
   }
 
+  // Both `score --layer candidates` and `plan/verify --coarsen` take the same
+  // budget, so it's parsed once here rather than per command.
+  const targetSlices = values["target-slices"] === undefined ? undefined : Number(values["target-slices"]);
+  if (targetSlices !== undefined && !Number.isInteger(targetSlices)) {
+    throw new DripError(`--target-slices must be a whole number, got '${values["target-slices"]}'`);
+  }
+
+  // --- review-context: what state a projection's review surface is in --------
+  // Read-only in the strongest sense available here: it reads the manifest, the
+  // store and (unless --no-review) GitHub's comment listing, and has no code
+  // path that writes any of the three (issue #18).
+  if (command === "review-context") {
+    if (!plan.order) {
+      printPlan(plan);
+      throw new DripError("cannot report review context against a cyclic slice DAG — resolve the cycle first");
+    }
+    const manifestPath = resolveManifestPath(repoRoot, branch, values.manifest, jsonOut);
+    const resolved = resolveManifest(plan, loadManifest(manifestPath), { branch, profiles: loadProfiles(repoRoot), repoRoot });
+    if (!resolved.ok) {
+      if (!jsonOut) printManifestReport(resolved);
+      throw new DripError("manifest validation failed — there is no well-defined projection to report on");
+    }
+    const only = (values.projection as string | undefined) ?? null;
+    if (only && !resolved.projections.some((p) => p.id === only)) {
+      throw new DripError(`no projection '${only}' in this manifest — known ids: ${resolved.projections.map((p) => p.id).join(", ")}`);
+    }
+    const report = await collectReviewContext({
+      git,
+      db,
+      repoRoot,
+      branch,
+      baseBranch,
+      mergeBase,
+      plan,
+      resolved,
+      only,
+      includeReview: !values["no-review"],
+    });
+    if (jsonOut) console.log(JSON.stringify(reviewContextToJson(report)));
+    else printReviewContext(report);
+    return;
+  }
+
+  // --- score: drip's boundaries against a hand-drawn partition ---------------
+  // The M0 kill gate, and the same question one layer up for review candidates
+  // (issues #15, #16). Reads one file and the plan; writes nothing anywhere.
+  if (command === "score") {
+    const expectedPath = values.expected;
+    if (!expectedPath) {
+      throw new DripError(
+        "score needs the partition to measure against: --expected <path> to a v1 hand-drawn partition " +
+          '({"version":1,"units":[{"id":"...","selectors":["file::Symbol"]}]}). Keep that file wherever the branch it describes lives.',
+      );
+    }
+    if (!plan.order) {
+      printPlan(plan);
+      throw new DripError("cannot score a cyclic slice DAG — resolve the cycle first");
+    }
+    const layer = (values.layer ?? "atomic") as ScoreLayer;
+    if (layer !== "atomic" && layer !== "candidates" && layer !== "manifest") {
+      throw new DripError(`--layer must be 'atomic', 'candidates' or 'manifest', got '${values.layer}'`);
+    }
+    const threshold = values.threshold === undefined ? undefined : Number(values.threshold);
+    if (threshold !== undefined && (!Number.isFinite(threshold) || threshold < 0 || threshold > 1)) {
+      throw new DripError(`--threshold must be a fraction between 0 and 1, got '${values.threshold}'`);
+    }
+
+    // Each layer hands over the units it already produces — scoring never has
+    // its own idea of what drip's partition is.
+    let units: { order: string[]; slices: Map<string, Hunk[]> };
+    if (layer === "atomic") {
+      units = { order: plan.order.map((id) => `slice${plan.idToNum.get(id)}`), slices: new Map(plan.order.map((id) => [`slice${plan.idToNum.get(id)}`, plan.slices.get(id)!])) };
+    } else if (layer === "candidates") {
+      const coarse = computeProjections(plan, { targetSlices });
+      units = { order: coarse.order, slices: new Map(coarse.projections.map((p) => [p.label, p.sliceIds.flatMap((s) => plan.slices.get(s)!)])) };
+    } else {
+      const manifestPath = resolveManifestPath(repoRoot, branch, values.manifest, jsonOut);
+      const resolved = resolveManifest(plan, loadManifest(manifestPath), { branch, profiles: loadProfiles(repoRoot), repoRoot });
+      if (!resolved.ok) {
+        if (!jsonOut) printManifestReport(resolved);
+        throw new DripError("cannot score against a manifest that doesn't validate — fix it first");
+      }
+      units = { order: resolved.order, slices: resolved.units };
+    }
+
+    const result = scoreBoundaries({
+      units,
+      expected: loadExpectedPartition(expectedPath),
+      layer,
+      includeFallback: !!values["include-fallback"],
+      threshold,
+    });
+    if (jsonOut) console.log(JSON.stringify(scoreToJson(result)));
+    else printScoreReport(result);
+    if (!result.pass) process.exit(1);
+    return;
+  }
+
   // --- validate-plan / materialize: manifest commands with no remote effects ---
   // Both read the manifest, so discovering the conventional location is safe
   // and saves typing the same path every run — unlike `push`, where discovery
@@ -433,6 +618,7 @@ async function main() {
       sourceRef: source.ref,
       runVerification: !values["no-manifest-check"],
       requireVerification: !!values["require-verification"],
+      requireIntent: !!values["require-intent"],
     });
     const failed = manifestFailed(resolved, checked.findings, !!values.strict);
 
@@ -492,10 +678,6 @@ async function main() {
   // Coarsening needs an acyclic DAG, so it can only run after the plan is
   // known good — the cycle report below still comes out either way.
   const wantCoarsen = !!values.coarsen;
-  const targetSlices = values["target-slices"] === undefined ? undefined : Number(values["target-slices"]);
-  if (targetSlices !== undefined && !Number.isInteger(targetSlices)) {
-    throw new DripError(`--target-slices must be a whole number, got '${values["target-slices"]}'`);
-  }
 
   if (!jsonOut) printPlan(plan);
 
@@ -553,6 +735,7 @@ async function main() {
       sourceRef: source.ref,
       runVerification: !values["no-manifest-check"],
       requireVerification: !!values["require-verification"],
+      requireIntent: !!values["require-intent"],
     });
     printManifestReport(resolved, checked.findings, checked.verification, !!values.strict);
     if (manifestFailed(resolved, checked.findings, !!values.strict)) {

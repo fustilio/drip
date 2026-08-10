@@ -8,6 +8,7 @@ import {
   findManifest,
   ManifestSchema,
   manifestCandidates,
+  manifestReportToJson,
   resolveManifest,
   unitsFromManifest,
   validateManifestAgainstGit,
@@ -16,6 +17,7 @@ import {
   type Manifest,
 } from "./manifest";
 import { computePlan, type PlanResult } from "./planner";
+import { loadProfiles, type ProfileSet } from "./profiles";
 import { openStore } from "./store";
 import { commit, git, makeTempRepo } from "./test-helpers";
 import { verifyTreeHash } from "./verify";
@@ -61,16 +63,17 @@ const manifest = (overrides: Partial<Manifest> = {}): Manifest =>
     version: 1,
     sourceBranch: "feature",
     projections: [
-      { id: "formatter", atomicSlices: ["src/appeals/format.ts::formatAppeal"], verificationReason: NO_CHECKS },
+      { id: "formatter", intent: "Trim whitespace when formatting an appeal.", atomicSlices: ["src/appeals/format.ts::formatAppeal"], verificationReason: NO_CHECKS },
       {
         id: "report",
+        intent: "Upper-case the rendered report.",
         atomicSlices: ["src/appeals/report.ts::renderReport"],
         glue: ["src/appeals/report.ts::(file)"],
         dependsOn: ["formatter"],
         verificationReason: NO_CHECKS,
       },
-      { id: "inbox", atomicSlices: ["src/inbox/columns.ts::columns"], verificationReason: NO_CHECKS },
-      { id: "docs", atomicSlices: ["README.md::(file)"], verificationReason: NO_CHECKS },
+      { id: "inbox", intent: "Add the second inbox column.", atomicSlices: ["src/inbox/columns.ts::columns"], verificationReason: NO_CHECKS },
+      { id: "docs", intent: "Document the fixture.", atomicSlices: ["README.md::(file)"], verificationReason: NO_CHECKS },
     ],
     ...overrides,
   });
@@ -199,9 +202,13 @@ test("an emitted skeleton is a valid manifest that validates clean against the p
   expect(() => ManifestSchema.parse(JSON.parse(JSON.stringify(emitted)))).not.toThrow();
 
   const resolved = resolveManifest(p, emitted, { branch: "feature" });
-  // A skeleton legitimately has no verification commands yet — that's the one
-  // thing it can't invent, and the warning is how the author is told to.
-  expect(resolved.findings.every((f) => f.code === "no-verification" && f.severity === "warning")).toBe(true);
+  // A skeleton legitimately has neither verification commands nor intent yet —
+  // those are the two things it can't invent (docs/adr/0018, docs/adr/0025),
+  // and the warnings are how the author is told which fields are still theirs.
+  expect(resolved.findings.every((f) => ["no-verification", "no-intent"].includes(f.code) && f.severity === "warning")).toBe(true);
+  expect(resolved.findings.filter((f) => f.code === "no-intent").map((f) => f.projection).sort()).toEqual(
+    emitted.projections.map((x) => x.id).sort(),
+  );
   expect(resolved.ok).toBe(true);
   // Every atomic slice accounted for — a skeleton that dropped one would be a
   // trap, since the author would have to notice the omission themselves.
@@ -409,4 +416,130 @@ test("declaring no checks warns, and --strict turns that warning into a failure"
   expect(warning!.severity).toBe("warning");
   expect(warning!.projection).toBe("docs");
   expect(resolved.ok).toBe(true); // a warning alone doesn't fail a normal run
+});
+
+// --- reusable verification profiles (issue #19, docs/adr/0024) ---------------
+
+// The profiles file lives in the working tree like the manifest does. Written
+// per test and removed afterwards, so no other test in this file sees one.
+function withProfiles<T>(body: unknown, fn: (profiles: ProfileSet) => T): T {
+  const path = join(repoRoot, ".drip", "verification.json");
+  mkdirSync(join(repoRoot, ".drip"), { recursive: true });
+  writeFileSync(path, JSON.stringify(body, null, 2));
+  try {
+    return fn(loadProfiles(repoRoot));
+  } finally {
+    rmSync(path, { force: true });
+  }
+}
+
+const PROFILES = {
+  version: 1,
+  profiles: {
+    typecheck: { description: "the repo's own root typecheck", commands: ["bun run typecheck"] },
+    "appeals-tests": { commands: ["bun run typecheck", "bun test src/appeals"] },
+  },
+};
+
+test("a projection resolves its commands from a named profile, and the report says which", async () => {
+  const p = await plan();
+  const m = manifest();
+  const report = m.projections.find((x) => x.id === "report")!;
+  report.verificationReason = null;
+  report.verificationProfile = "appeals-tests";
+
+  const resolved = withProfiles(PROFILES, (profiles) => resolveManifest(p, m, { branch: "feature", profiles, repoRoot }));
+  expect(resolved.findings).toEqual([]);
+  const resolvedReport = resolved.projections.find((x) => x.id === "report")!;
+  // Resolved to real commands — everything downstream (execution, the PR body,
+  // --require-verification) sees ordinary strings and knows nothing of profiles.
+  expect(resolvedReport.verification).toEqual(["bun run typecheck", "bun test src/appeals"]);
+  expect(resolvedReport.verificationProfile).toBe("appeals-tests");
+  const json = manifestReportToJson(resolved) as { projections: Array<{ id: string; verificationProfile: string | null }> };
+  expect(json.projections.find((x) => x.id === "report")!.verificationProfile).toBe("appeals-tests");
+});
+
+test("a profile satisfies --require-verification exactly as inline commands do", async () => {
+  const p = await plan();
+  const m = manifest();
+  for (const projection of m.projections) {
+    if (projection.id === "docs") continue;
+    projection.verificationReason = null;
+    projection.verificationProfile = "typecheck";
+  }
+  const resolved = withProfiles(PROFILES, (profiles) =>
+    resolveManifest(p, m, { branch: "feature", requireVerification: true, profiles, repoRoot }),
+  );
+  expect(resolved.findings).toEqual([]);
+});
+
+test("an unknown profile fails with the file it looked in and the names it found", async () => {
+  const p = await plan();
+  const m = manifest();
+  m.projections.find((x) => x.id === "report")!.verificationProfile = "typechek";
+  const resolved = withProfiles(PROFILES, (profiles) => resolveManifest(p, m, { branch: "feature", profiles, repoRoot }));
+  const finding = resolved.findings.find((f) => f.code === "unknown-verification-profile")!;
+  expect(finding.severity).toBe("error");
+  expect(finding.message).toContain(join(".drip", "verification.json"));
+  expect(finding.message).toContain("appeals-tests, typecheck");
+  expect(resolved.ok).toBe(false);
+});
+
+test("a profile referenced in a repo that declares none says where to create it", async () => {
+  const p = await plan();
+  const m = manifest();
+  m.projections.find((x) => x.id === "report")!.verificationProfile = "typecheck";
+  // No profiles file at all — loadProfiles returns the empty set rather than throwing.
+  const resolved = resolveManifest(p, m, { branch: "feature", profiles: loadProfiles(repoRoot), repoRoot });
+  const finding = resolved.findings.find((f) => f.code === "unknown-verification-profile")!;
+  expect(finding.message).toContain("declares no profiles");
+  expect(finding.message).toContain(join(repoRoot, ".drip", "verification.json"));
+});
+
+test("declaring both a profile and inline commands is refused, not silently merged", async () => {
+  const p = await plan();
+  const m = manifest();
+  const report = m.projections.find((x) => x.id === "report")!;
+  report.verificationProfile = "typecheck";
+  report.verification = ["bun test src/appeals"];
+  const resolved = withProfiles(PROFILES, (profiles) => resolveManifest(p, m, { branch: "feature", profiles, repoRoot }));
+  expect(codes(resolved)).toContain("verification-profile-conflict");
+  expect(resolved.ok).toBe(false);
+});
+
+test("a malformed profiles file fails loudly, even before anything references it", () => {
+  expect(() => withProfiles({ version: 1, profiles: { ts: { commands: [] } } }, (x) => x)).toThrow(/do not match the v1 schema/);
+  expect(() => withProfiles({ version: 2, profiles: {} }, (x) => x)).toThrow(/do not match the v1 schema/);
+});
+
+test("a manifest with no profile field is unaffected by a profiles file existing", async () => {
+  const p = await plan();
+  const resolved = withProfiles(PROFILES, (profiles) => resolveManifest(p, manifest(), { branch: "feature", profiles, repoRoot }));
+  expect(resolved.findings).toEqual([]);
+  expect(resolved.projections.every((x) => x.verificationProfile === null)).toBe(true);
+});
+
+// --- stated intent (issue #16, docs/adr/0025) -------------------------------
+
+test("a projection with no intent warns by default and fails under --require-intent", async () => {
+  const p = await plan();
+  const m = manifest();
+  m.projections.find((x) => x.id === "report")!.intent = undefined;
+
+  const lenient = resolveManifest(p, m, { branch: "feature" });
+  const warning = lenient.findings.find((f) => f.code === "no-intent")!;
+  expect(warning.severity).toBe("warning");
+  expect(warning.projection).toBe("report");
+  expect(lenient.ok).toBe(true);
+
+  const strict = resolveManifest(p, m, { branch: "feature", requireIntent: true });
+  expect(strict.findings.find((f) => f.code === "no-intent")!.severity).toBe("error");
+  expect(strict.ok).toBe(false);
+});
+
+test("whitespace is not intent", async () => {
+  const p = await plan();
+  const m = manifest();
+  m.projections.find((x) => x.id === "report")!.intent = "   ";
+  expect(codes(resolveManifest(p, m, { branch: "feature" }))).toContain("no-intent");
 });

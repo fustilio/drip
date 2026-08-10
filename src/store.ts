@@ -237,6 +237,19 @@ export function wasCommentProcessed(db: Database, prCommentId: number): boolean 
   return !!db.query("SELECT 1 FROM comment_anchors WHERE pr_comment_id = ?").get(prCommentId);
 }
 
+export type CommentAnchor = { prCommentId: number; status: "unchanged" | "orphaned" };
+
+// Every review comment drip has already reconciled for a unit, with what
+// happened to it. Read-only, for reporting a projection's review surface
+// (issue #18): an `orphaned` row is a comment drip could not confidently
+// relocate and replied to, which is the one piece of unresolved review context
+// drip itself knows about.
+export function listCommentAnchors(db: Database, branch: string, sliceSignature: string): CommentAnchor[] {
+  return db
+    .query("SELECT pr_comment_id as prCommentId, status FROM comment_anchors WHERE branch = ? AND slice_signature = ? ORDER BY pr_comment_id")
+    .all(branch, sliceSignature) as CommentAnchor[];
+}
+
 export function markCommentProcessed(db: Database, prCommentId: number, branch: string, sliceSignature: string, status: "unchanged" | "orphaned"): void {
   db.query(
     "INSERT OR IGNORE INTO comment_anchors (pr_comment_id, branch, slice_signature, status) VALUES (?, ?, ?, ?)",
