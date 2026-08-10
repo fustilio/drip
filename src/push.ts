@@ -7,6 +7,7 @@ import type { GitBackend } from "./git-backend";
 import { ghCreatePr, ghPrClose, ghPrComment, ghPrSetBase } from "./github";
 import { buildSlicePatch, materializeFlatFirst, materializeSliceCommits, type FlatFirstSlice, type ProjectionMode } from "./materialize";
 import type { Hunk, PlanResult } from "./planner";
+import { unitBranchName } from "./refs";
 import { computeContentHash, computeSliceSignature } from "./signature";
 import { deleteCorrespondence, getCorrespondence, upsertCorrespondence, type Correspondence } from "./store";
 
@@ -16,9 +17,6 @@ import { deleteCorrespondence, getCorrespondence, upsertCorrespondence, type Cor
 // it (docs/adr/0020 for adopted branches, docs/adr/0028 for drip-owned ones).
 export type SliceStatus = "created" | "updated" | "unchanged" | "squash-merged" | "dry-run" | "blocked";
 
-// The branch drip mints for a unit it owns. Adopted units keep their own
-// branch name instead — see branchNameOf in push() and docs/adr/0020.
-export const dripBranchName = (branch: string, label: string) => `drip/${branch}/${label}`;
 
 export type PushResult = {
   sliceLabel: string;
@@ -126,15 +124,14 @@ export async function push(opts: {
   const units = opts.units ?? unitsFromPlan(plan, branch);
   const label = units.label;
 
-  // Where a unit's branch lives. Normally the drip-owned name, but an adopted
-  // projection (docs/adr/0020) keeps the handcrafted branch its PR is already
-  // on — including when a *dependent's* base is computed from it, which is why
-  // this is resolved through correspondence rather than recomputed per call.
+  // Memoized only: the rule itself is unitBranchName's (src/refs.ts). A
+  // dependent's base is resolved through here too, so the lookup happens
+  // several times per unit in a stack.
   const branchCache = new Map<string, string>();
   const sliceBranch = (id: string) => {
     let name = branchCache.get(id);
     if (name === undefined) {
-      name = getCorrespondence(db, branch, units.signature(id))?.sliceBranch ?? dripBranchName(branch, label(id));
+      name = unitBranchName(db, branch, units.signature(id), label(id));
       branchCache.set(id, name);
     }
     return name;

@@ -8,7 +8,7 @@ import type { PrSummary } from "./github";
 import type { ResolvedManifest } from "./manifest";
 import { buildSlicePatch, materializeFlatFirst } from "./materialize";
 import type { PlanResult } from "./planner";
-import { dripBranchName } from "./push";
+import { dripBranchName } from "./refs";
 
 // Guided adoption (issue #17).
 //

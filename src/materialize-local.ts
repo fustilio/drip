@@ -7,7 +7,7 @@ import type { GitBackend } from "./git-backend";
 import type { ResolvedManifest } from "./manifest";
 import { materializeFlatFirst, materializeSliceCommits, type ProjectionMode } from "./materialize";
 import type { PlanResult } from "./planner";
-import { dripBranchName } from "./push";
+import { dripBranchName } from "./refs";
 
 // Local materialization of a validated manifest (issue #13).
 //

@@ -25,6 +25,7 @@ import {
   verificationUnits,
   writeManifest,
   type Finding,
+  type ResolvedManifest,
 } from "./manifest";
 import { materializeProjections, materializeToJson, printMaterializeReport } from "./materialize-local";
 import { DripError } from "./errors";
@@ -195,6 +196,53 @@ function resolveManifestPath(repoRoot: string, branch: string, explicit: string 
   return path;
 }
 
+// Every command that consumes a plan refuses a cyclic one, and the cycle
+// diagnostics (docs/adr/0013) are what makes the refusal useful — "resolve the
+// cycle first" alone doesn't say which slices are in it. Printing them had
+// drifted per command: `discover` printed nothing, and three others printed to
+// stdout even under --json, where the caller is parsing that stream.
+function requireAcyclicPlan(plan: PlanResult, verb: string, jsonOut: boolean): string[] {
+  if (!plan.order) {
+    if (!jsonOut) printPlan(plan);
+    throw new DripError(`cannot ${verb} against a cyclic slice DAG — resolve the cycle first`);
+  }
+  return plan.order;
+}
+
+// The read-only half of the manifest path: find it, load it, resolve it against
+// the plan, and refuse if it doesn't hold together. `validate-plan`,
+// `materialize` and `push --manifest` want the git-backed checks on top of this
+// (checkManifest below); `discover`, `adopt`, `review-context` and
+// `score --layer manifest` only need the projections to be well-defined before
+// they read them.
+function requireValidManifest(opts: {
+  repoRoot: string;
+  branch: string;
+  plan: PlanResult;
+  manifestPath: string | undefined;
+  jsonOut: boolean;
+  /** what can't proceed while the manifest is broken, in the caller's own terms */
+  because: string;
+}): ResolvedManifest {
+  const { repoRoot, branch, plan, jsonOut } = opts;
+  const resolved = resolveManifest(plan, loadManifest(resolveManifestPath(repoRoot, branch, opts.manifestPath, jsonOut)), {
+    branch,
+    profiles: loadProfiles(repoRoot),
+    repoRoot,
+  });
+  if (!resolved.ok) {
+    if (!jsonOut) printManifestReport(resolved);
+    throw new DripError(`manifest validation failed — ${opts.because}`);
+  }
+  return resolved;
+}
+
+/** A projection id the caller named that this manifest doesn't define. */
+function requireProjection(resolved: ResolvedManifest, id: string): void {
+  if (resolved.projections.some((p) => p.id === id)) return;
+  throw new DripError(`no projection '${id}' in this manifest — known ids: ${resolved.projections.map((p) => p.id).join(", ")}`);
+}
+
 // Resolve a manifest against the plan and run the git-backed checks — the step
 // `validate-plan`, `materialize` and `push --manifest` all share. The git
 // checks only run once the manifest is structurally coherent; on a broken graph
@@ -259,17 +307,16 @@ async function runManifestCommand(git: GitBackend, positionals: string[], values
     const baseBranch = values.base as string;
     const { db, mergeBase, plan } = await loadPlan({ git, repoRoot, branch, baseBranch });
     if (!plan.hunks.length) throw new DripError(`no changes between ${baseBranch} and ${branch} — there are no projections to find PRs for`);
-    if (!plan.order) throw new DripError("cannot discover against a cyclic slice DAG — resolve the cycle first");
+    requireAcyclicPlan(plan, "discover", jsonOut);
 
-    const resolved = resolveManifest(plan, loadManifest(resolveManifestPath(repoRoot, branch, values.manifest as string | undefined, jsonOut)), {
-      branch,
-      profiles: loadProfiles(repoRoot),
+    const resolved = requireValidManifest({
       repoRoot,
+      branch,
+      plan,
+      manifestPath: values.manifest as string | undefined,
+      jsonOut,
+      because: "the projections to find PRs for aren't well-defined yet",
     });
-    if (!resolved.ok) {
-      if (!jsonOut) printManifestReport(resolved);
-      throw new DripError("manifest validation failed — the projections to find PRs for aren't well-defined yet");
-    }
 
     const limit = values.limit === undefined ? 50 : Number(values.limit);
     if (!Number.isInteger(limit) || limit <= 0) throw new DripError(`--limit must be a positive whole number, got '${values.limit}'`);
@@ -312,26 +359,20 @@ async function runManifestCommand(git: GitBackend, positionals: string[], values
   const jsonOut = !!values.json;
   const { db, mergeBase, plan } = await loadPlan({ git, repoRoot, branch, baseBranch });
   if (!plan.hunks.length) throw new DripError(`no changes between ${baseBranch} and ${branch} — there is no projection to adopt a PR into`);
-  if (!plan.order) {
-    if (!jsonOut) printPlan(plan);
-    throw new DripError("cannot adopt against a cyclic slice DAG — resolve the cycle first");
-  }
+  requireAcyclicPlan(plan, "adopt", jsonOut);
 
-  const resolved = resolveManifest(plan, loadManifest(resolveManifestPath(repoRoot, branch, values.manifest as string | undefined, jsonOut)), {
-    branch,
-    profiles: loadProfiles(repoRoot),
+  // Adoption binds a real PR to a projection, so the manifest that defines that
+  // projection has to hold together first — otherwise the thing being bound
+  // isn't well-defined.
+  const resolved = requireValidManifest({
     repoRoot,
+    branch,
+    plan,
+    manifestPath: values.manifest as string | undefined,
+    jsonOut,
+    because: "fix it before binding a PR to one of its projections",
   });
-  if (!resolved.ok) {
-    // Adoption binds a real PR to a projection, so the manifest that defines
-    // that projection has to hold together first — otherwise the thing being
-    // bound isn't well-defined.
-    if (!jsonOut) printManifestReport(resolved);
-    throw new DripError("manifest validation failed — fix it before binding a PR to one of its projections");
-  }
-  if (!resolved.projections.some((p) => p.id === projectionId)) {
-    throw new DripError(`no projection '${projectionId}' in this manifest — known ids: ${resolved.projections.map((p) => p.id).join(", ")}`);
-  }
+  requireProjection(resolved, projectionId);
 
   const check = await checkAdoption({
     git,
@@ -514,20 +555,17 @@ async function main() {
   // store and (unless --no-review) GitHub's comment listing, and has no code
   // path that writes any of the three (issue #18).
   if (command === "review-context") {
-    if (!plan.order) {
-      printPlan(plan);
-      throw new DripError("cannot report review context against a cyclic slice DAG — resolve the cycle first");
-    }
-    const manifestPath = resolveManifestPath(repoRoot, branch, values.manifest, jsonOut);
-    const resolved = resolveManifest(plan, loadManifest(manifestPath), { branch, profiles: loadProfiles(repoRoot), repoRoot });
-    if (!resolved.ok) {
-      if (!jsonOut) printManifestReport(resolved);
-      throw new DripError("manifest validation failed — there is no well-defined projection to report on");
-    }
+    requireAcyclicPlan(plan, "report review context", jsonOut);
+    const resolved = requireValidManifest({
+      repoRoot,
+      branch,
+      plan,
+      manifestPath: values.manifest,
+      jsonOut,
+      because: "there is no well-defined projection to report on",
+    });
     const only = (values.projection as string | undefined) ?? null;
-    if (only && !resolved.projections.some((p) => p.id === only)) {
-      throw new DripError(`no projection '${only}' in this manifest — known ids: ${resolved.projections.map((p) => p.id).join(", ")}`);
-    }
+    if (only) requireProjection(resolved, only);
     const report = await collectReviewContext({
       git,
       db,
@@ -556,10 +594,7 @@ async function main() {
           '({"version":1,"units":[{"id":"...","selectors":["file::Symbol"]}]}). Keep that file wherever the branch it describes lives.',
       );
     }
-    if (!plan.order) {
-      printPlan(plan);
-      throw new DripError("cannot score a cyclic slice DAG — resolve the cycle first");
-    }
+    const order = requireAcyclicPlan(plan, "score", jsonOut);
     const layer = (values.layer ?? "atomic") as ScoreLayer;
     if (layer !== "atomic" && layer !== "candidates" && layer !== "manifest") {
       throw new DripError(`--layer must be 'atomic', 'candidates' or 'manifest', got '${values.layer}'`);
@@ -573,17 +608,19 @@ async function main() {
     // its own idea of what drip's partition is.
     let units: { order: string[]; slices: Map<string, Hunk[]> };
     if (layer === "atomic") {
-      units = { order: plan.order.map((id) => `slice${plan.idToNum.get(id)}`), slices: new Map(plan.order.map((id) => [`slice${plan.idToNum.get(id)}`, plan.slices.get(id)!])) };
+      units = { order: order.map((id) => `slice${plan.idToNum.get(id)}`), slices: new Map(order.map((id) => [`slice${plan.idToNum.get(id)}`, plan.slices.get(id)!])) };
     } else if (layer === "candidates") {
       const coarse = computeProjections(plan, { targetSlices });
       units = { order: coarse.order, slices: new Map(coarse.projections.map((p) => [p.label, p.sliceIds.flatMap((s) => plan.slices.get(s)!)])) };
     } else {
-      const manifestPath = resolveManifestPath(repoRoot, branch, values.manifest, jsonOut);
-      const resolved = resolveManifest(plan, loadManifest(manifestPath), { branch, profiles: loadProfiles(repoRoot), repoRoot });
-      if (!resolved.ok) {
-        if (!jsonOut) printManifestReport(resolved);
-        throw new DripError("cannot score against a manifest that doesn't validate — fix it first");
-      }
+      const resolved = requireValidManifest({
+        repoRoot,
+        branch,
+        plan,
+        manifestPath: values.manifest,
+        jsonOut,
+        because: "there is no well-defined partition to score against",
+      });
       units = { order: resolved.order, slices: resolved.units };
     }
 
@@ -606,10 +643,7 @@ async function main() {
   // would decide what gets sent to GitHub.
   if (command === "validate-plan" || command === "materialize") {
     const manifestPath = resolveManifestPath(repoRoot, branch, values.manifest, jsonOut);
-    if (!plan.order) {
-      printPlan(plan);
-      throw new DripError(`cannot ${command === "materialize" ? "materialize" : "validate"} against a cyclic slice DAG — resolve the cycle first`);
-    }
+    requireAcyclicPlan(plan, command === "materialize" ? "materialize" : "validate", jsonOut);
     const { resolved, checked } = await checkManifest({
       git,
       repoRoot,

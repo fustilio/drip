@@ -9,7 +9,7 @@ import type { PrRef, PrSummary } from "./github";
 import { ManifestSchema, resolveManifest, type Manifest } from "./manifest";
 import { computePlan } from "./planner";
 import { openStore } from "./store";
-import { commit, git, gitOutput, makeBareRemote, makeTempRepo } from "./test-helpers";
+import { commit, git, githubMock, gitOutput, makeBareRemote, makeTempRepo } from "./test-helpers";
 
 // issue #17: finding which existing PRs a projection could be adopted into.
 //
@@ -22,7 +22,7 @@ const ghCreatePr = mock((_opts: unknown) => ({ number: 0, url: "" }));
 const ghPrClose = mock(() => {});
 const ghPrComment = mock(() => {});
 const ghPrSetBase = mock(() => {});
-mock.module("./github", () => ({ ghCreatePr, ghPrClose, ghPrComment, ghPrSetBase, ghPrState: mock(() => "OPEN") }));
+mock.module("./github", () => githubMock({ ghCreatePr, ghPrClose, ghPrComment, ghPrSetBase }));
 
 const backend = new ShellGitBackend();
 let repoRoot: string;

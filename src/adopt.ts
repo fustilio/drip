@@ -8,7 +8,7 @@ import type { PrRef } from "./github";
 import { manifestSignature, type Finding, type ResolvedManifest } from "./manifest";
 import { buildSlicePatch, materializeFlatFirst } from "./materialize";
 import type { PlanResult } from "./planner";
-import { dripBranchName } from "./push";
+import { dripBranchName, unitBranchName } from "./refs";
 import { computeContentHash } from "./signature";
 import { getCorrespondence, listCorrespondence, upsertCorrespondence } from "./store";
 
@@ -52,10 +52,11 @@ export type AdoptionCheck = {
 /** How much interdiff to carry back for the report. A whole diverged branch is not a diagnostic. */
 const INTERDIFF_LIMIT = 20000;
 
-// The branch a projection's PR lives on: the adopted one when there is a
-// correspondence, else the name push would mint for it.
+// The branch a projection's PR lives on. Same rule push resolves a unit's
+// branch by, so the two can't drift into disagreeing about where an adopted
+// projection lives; this one just spells the signature as a projection id.
 export function projectionBranch(db: Database, branch: string, projectionId: string): string {
-  return getCorrespondence(db, branch, manifestSignature(projectionId))?.sliceBranch ?? dripBranchName(branch, projectionId);
+  return unitBranchName(db, branch, manifestSignature(projectionId), projectionId);
 }
 
 // The adopted branch lives on the remote — that's the premise of the whole

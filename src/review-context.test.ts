@@ -8,7 +8,7 @@ import { ManifestSchema, manifestSignature, resolveManifest, type Manifest } fro
 import { computePlan, type PlanResult } from "./planner";
 import { collectReviewContext } from "./review-context";
 import { markCommentProcessed, openStore, upsertCorrespondence } from "./store";
-import { commit, git, gitOutput, makeBareRemote, makeTempRepo } from "./test-helpers";
+import { commit, git, githubMock, gitOutput, makeBareRemote, makeTempRepo } from "./test-helpers";
 
 // issue #18: read-only review context for a projection.
 //
@@ -23,17 +23,18 @@ const ghPrClose = mock(() => {});
 const ghPrComment = mock(() => {});
 const ghPrSetBase = mock(() => {});
 const ghReplyToReviewComment = mock(() => {});
-mock.module("./github", () => ({
-  ghCreatePr,
-  ghPrClose,
-  ghPrComment,
-  ghPrSetBase,
-  ghReplyToReviewComment,
-  ghPrState: mock(() => "OPEN"),
-  ghListReviewComments: mock(() => {
-    throw new Error("collectReviewContext must not reach the real gh listing in tests");
+mock.module("./github", () =>
+  githubMock({
+    ghCreatePr,
+    ghPrClose,
+    ghPrComment,
+    ghPrSetBase,
+    ghReplyToReviewComment,
+    ghListReviewComments: mock(() => {
+      throw new Error("collectReviewContext must not reach the real gh listing in tests");
+    }),
   }),
-}));
+);
 
 const backend = new ShellGitBackend();
 let repoRoot: string;

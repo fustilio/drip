@@ -5,7 +5,7 @@ import { ShellGitBackend } from "./git-backend";
 import { computePlan } from "./planner";
 import type { Correspondence } from "./store";
 import { addOverride, getCorrespondence, openStore, upsertCorrespondence } from "./store";
-import { commit, git, gitOutput, makeBareRemote, makeTempRepo } from "./test-helpers";
+import { commit, git, githubMock, gitOutput, makeBareRemote, makeTempRepo } from "./test-helpers";
 
 function correspondence(contentHash: string): Correspondence {
   return {
@@ -64,7 +64,7 @@ const ghCreatePr = mock((_opts: unknown) => ({ number: 42, url: "https://example
 const ghPrClose = mock((_repoRoot: string, _prNumber: number, _comment: string) => {});
 const ghPrComment = mock((_repoRoot: string, _prNumber: number, _body: string) => {});
 const ghPrSetBase = mock((_repoRoot: string, _prNumber: number, _base: string) => {});
-mock.module("./github", () => ({ ghCreatePr, ghPrClose, ghPrComment, ghPrSetBase, ghPrState: mock(() => "OPEN") }));
+mock.module("./github", () => githubMock({ ghCreatePr, ghPrClose, ghPrComment, ghPrSetBase }));
 
 const reconcileComments = mock(async (_opts: unknown) => ({ unchanged: 0, orphaned: 0 }));
 mock.module("./anchors", () => ({ reconcileComments }));

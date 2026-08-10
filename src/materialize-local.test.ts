@@ -7,18 +7,12 @@ import { ManifestSchema, manifestSignature, resolveManifest, type Manifest } fro
 import { materializeProjections } from "./materialize-local";
 import { computePlan } from "./planner";
 import { openStore, upsertCorrespondence } from "./store";
-import { commit, git, gitOutput, makeBareRemote, makeTempRepo } from "./test-helpers";
+import { commit, git, githubMock, gitOutput, makeBareRemote, makeTempRepo } from "./test-helpers";
 
 // materialize is the one command that produces a projection's commits without
 // going anywhere near GitHub (issue #13), so every test here also asserts the
 // negative: nothing on the remote, nothing through `gh`.
-const gh = {
-  ghCreatePr: mock((_opts: unknown) => ({ number: 42, url: "https://example.com/pull/42" })),
-  ghPrClose: mock(() => {}),
-  ghPrComment: mock(() => {}),
-  ghPrSetBase: mock(() => {}),
-  ghPrState: mock(() => "OPEN"),
-};
+const gh = githubMock();
 mock.module("./github", () => gh);
 
 const backend = new ShellGitBackend();

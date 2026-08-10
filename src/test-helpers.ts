@@ -1,3 +1,4 @@
+import { mock, type Mock } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -36,4 +37,32 @@ export function makeBareRemote(prefix: string): { remoteRoot: string; cleanup: (
   const remoteRoot = mkdtempSync(join(tmpdir(), prefix));
   git(["init", "-q", "--bare"], remoteRoot);
   return { remoteRoot, cleanup: () => rmSync(remoteRoot, { recursive: true, force: true }) };
+}
+
+type AnyMock = Mock<(...args: any[]) => any>;
+
+/**
+ * The complete `./github` surface, for `mock.module("./github", () => githubMock({...}))`.
+ *
+ * Every export, every time, with the caller's own mocks spread over the top.
+ * Bun's module mocks are global to the test *process*, so a partial one leaves
+ * module evaluation order to decide whether some other file's
+ * `import { ghX } from "./github"` resolves at all — four suites each mocked a
+ * different subset, and a change to an unrelated import graph was enough to
+ * make anchors.ts fail to load in whichever suite happened to evaluate it
+ * first. Filling in the whole surface makes that unorderable.
+ */
+export function githubMock(overrides: Record<string, AnyMock> = {}): Record<string, AnyMock> {
+  return {
+    ghCreatePr: mock((_opts: unknown) => ({ number: 42, url: "https://example.com/pull/42" })),
+    ghPrComment: mock(() => {}),
+    ghPrSetBase: mock(() => {}),
+    ghPrClose: mock(() => {}),
+    ghPrView: mock(() => ({ number: 42, url: "https://example.com/pull/42", state: "OPEN", headRefName: "", baseRefName: "main" })),
+    ghListOpenPrs: mock(() => []),
+    ghListReviewComments: mock(() => []),
+    ghReplyToReviewComment: mock(() => {}),
+    ghPrState: mock(() => "OPEN"),
+    ...overrides,
+  };
 }

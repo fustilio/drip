@@ -8,7 +8,7 @@ import type { PrRef } from "./github";
 import { ManifestSchema, manifestSignature, resolveManifest, unitsFromManifest, type Manifest } from "./manifest";
 import { computePlan } from "./planner";
 import { getCorrespondence, openStore } from "./store";
-import { commit, git, gitOutput, makeBareRemote, makeTempRepo } from "./test-helpers";
+import { commit, git, githubMock, gitOutput, makeBareRemote, makeTempRepo } from "./test-helpers";
 
 // issue #11: adopting handcrafted PRs into a semantic projection manifest.
 //
@@ -20,7 +20,7 @@ const ghCreatePr = mock((_opts: unknown) => ({ number: 42, url: "https://example
 const ghPrClose = mock((_repoRoot: string, _prNumber: number, _comment: string) => {});
 const ghPrComment = mock((_repoRoot: string, _prNumber: number, _body: string) => {});
 const ghPrSetBase = mock((_repoRoot: string, _prNumber: number, _base: string) => {});
-mock.module("./github", () => ({ ghCreatePr, ghPrClose, ghPrComment, ghPrSetBase, ghPrState: mock(() => "OPEN") }));
+mock.module("./github", () => githubMock({ ghCreatePr, ghPrClose, ghPrComment, ghPrSetBase }));
 
 const reconcileComments = mock(async (_opts: unknown) => ({ unchanged: 0, orphaned: 0 }));
 mock.module("./anchors", () => ({ reconcileComments }));
