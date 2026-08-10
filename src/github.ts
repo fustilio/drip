@@ -254,6 +254,52 @@ function ghStacksApi(repoRoot: string, args: string[], body?: unknown): unknown 
   return trimmed ? JSON.parse(trimmed) : null;
 }
 
+/**
+ * Is the `gh stack` extension installed?
+ *
+ * Checked once per run, because it decides which of two write paths drip takes:
+ * `gh stack link` when it's there, the REST endpoints when it isn't. Detection
+ * is a list rather than a probe — running the real command to see whether it
+ * exists would have side effects if it did.
+ */
+export function ghStackExtensionAvailable(repoRoot: string): boolean {
+  try {
+    const out = execFileSync("gh", ["extension", "list"], { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] }).toString();
+    return /(^|\s|\/)gh-stack(\s|$)/m.test(out);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Groups PRs into a stack with GitHub's own command — the convention, when the
+ * user has it installed.
+ *
+ * PR *numbers* are passed, never branch names: a branch argument would make
+ * `link` push it and open a PR for it, both of which are `drip push`'s job and
+ * neither of which may happen as a side effect of grouping.
+ *
+ * `--base` is the bottom member's *actual* base, which matters more than it
+ * looks. `link` retargets any PR whose base isn't its position in the chain it
+ * computed, and drip derives the chain from the bases already on the PRs — so
+ * passing the real bottom base makes every expected base equal the current one
+ * and the retarget path never fires. Defaulting it (to the repository's default
+ * branch) would invite exactly the retarget drip must not do to an adopted PR.
+ */
+export function ghStackLink(opts: { repoRoot: string; base: string; prNumbers: number[]; remote?: string }): void {
+  try {
+    execFileSync(
+      "gh",
+      ["stack", "link", "--base", opts.base, ...(opts.remote ? ["--remote", opts.remote] : []), ...opts.prNumbers.map(String)],
+      { cwd: opts.repoRoot, stdio: ["ignore", "pipe", "pipe"] },
+    );
+  } catch (e: any) {
+    throw new DripError(
+      `gh stack link failed for PRs ${opts.prNumbers.join(", ")} on ${opts.base}: ${String(e.stderr ?? e.message ?? "").trim()}`,
+    );
+  }
+}
+
 /** Every stack in the repository, with its ordered members. One read serves a whole report. */
 export function ghListStacks(repoRoot: string): GhStack[] {
   const raw = ghStacksApi(repoRoot, ["repos/{owner}/{repo}/stacks"]);

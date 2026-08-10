@@ -1,9 +1,39 @@
 import { expect, mock, test } from "bun:test";
 import type { GhStack } from "./github";
-import { collectStackStatus, linearChains, linkStacks, nodesFromCorrespondence, planStackLink, type StackChain, type StackNode } from "./stacks";
+import {
+  collectStackStatus,
+  linearChains,
+  linkStacks,
+  nodesFromCorrespondence,
+  planStackLink,
+  renderChain,
+  type StackChain,
+  type StackNode,
+  type StacksApi,
+} from "./stacks";
 import type { Correspondence } from "./store";
 
-const node = (id: string, prNumber: number, base: string): StackNode => ({ id, branch: `drip/mega/${id}`, prNumber, base });
+const node = (id: string, prNumber: number, base: string, adopted = false): StackNode => ({
+  id,
+  branch: `drip/mega/${id}`,
+  prNumber,
+  base,
+  adopted,
+});
+
+// The REST fallback: no `gh stack` extension installed.
+const restApi = (over: Partial<StacksApi> = {}): StacksApi => ({
+  list: mock(() => [] as GhStack[]),
+  create: mock((_r: string, prs: number[]) => stack(12, prs.map((n) => [n] as [number]))),
+  add: mock((_r: string, n: number, prs: number[]) => stack(n, prs.map((p) => [p] as [number]))),
+  extensionAvailable: mock(() => false),
+  link: mock(() => {}),
+  readPr: mock(() => ({ number: 0, url: "", state: "OPEN" as const, headRefName: "", baseRefName: "main", title: "" })),
+  ...over,
+});
+
+// The conventional path: `gh stack link` is available.
+const extensionApi = (over: Partial<StacksApi> = {}): StacksApi => restApi({ extensionAvailable: mock(() => true), ...over });
 
 const stack = (number: number, prs: Array<[number, { merged?: boolean; closed?: boolean }?]>): GhStack => ({
   number,
@@ -149,31 +179,80 @@ test("extra PRs above drip's chain are left alone, not treated as a conflict", (
 
 // --- The write path: one list read, then at most one write per chain.
 
-test("linkStacks creates once and reports the new stack number", () => {
-  const api = {
-    list: mock(() => [] as GhStack[]),
-    create: mock((_r: string, prs: number[]) => stack(12, prs.map((n) => [n] as [number]))),
-    add: mock(() => stack(12, [])),
-  };
+test("with the extension installed, linking goes through `gh stack link` — GitHub's own command", () => {
+  const api = extensionApi({ list: mock(() => [] as GhStack[]) });
+  let listed = 0;
+  api.list = mock(() => (++listed === 1 ? [] : [stack(12, [[1], [2]])]));
   const results = linkStacks({
     repoRoot: "/repo",
     chains: [chainOf(node("a", 1, "main"), node("b", 2, "drip/mega/a"))],
     dryRun: false,
     api,
   });
-  expect(api.list).toHaveBeenCalledTimes(1);
-  expect(api.create).toHaveBeenCalledTimes(1);
-  expect(api.add).not.toHaveBeenCalled();
-  expect(results[0]!.status).toBe("created");
+  expect(api.link).toHaveBeenCalledWith({ repoRoot: "/repo", base: "main", prNumbers: [1, 2], remote: undefined });
+  expect(api.create).not.toHaveBeenCalled();
+  expect(results[0]!.via).toBe("gh stack link");
   expect(results[0]!.stackNumber).toBe(12);
 });
 
-test("linkStacks extends an existing stack instead of creating a second one", () => {
-  const api = {
-    list: mock(() => [stack(7, [[1], [2]])]),
-    create: mock(() => stack(0, [])),
-    add: mock((_r: string, n: number, prs: number[]) => stack(n, [[1], [2], ...prs.map((p) => [p] as [number])])),
-  };
+test("`link` is passed the chain's real base, which is what stops it retargeting anything", () => {
+  // link retargets any PR whose base isn't its chain position. drip derives the
+  // chain *from* the bases, so passing the bottom's real base makes every
+  // expected base equal the current one and the retarget path never fires.
+  const api = extensionApi();
+  linkStacks({
+    repoRoot: "/repo",
+    chains: [chainOf(node("a", 1, "release-2.1"), node("b", 2, "drip/mega/a"))],
+    dryRun: false,
+    api,
+  });
+  expect(api.link).toHaveBeenCalledWith({ repoRoot: "/repo", base: "release-2.1", prNumbers: [1, 2], remote: undefined });
+});
+
+test("an adopted PR whose base moved on GitHub blocks the link instead of being retargeted", () => {
+  const api = extensionApi({
+    readPr: mock(() => ({ number: 2, url: "", state: "OPEN" as const, headRefName: "team/b", baseRefName: "somewhere-else", title: "" })),
+  });
+  const results = linkStacks({
+    repoRoot: "/repo",
+    chains: [chainOf(node("a", 1, "main"), node("b", 2, "drip/mega/a", true))],
+    dryRun: false,
+    api,
+  });
+  expect(api.link).not.toHaveBeenCalled();
+  expect(results[0]!.status).toBe("diverged");
+  expect(results[0]!.note).toContain("does not retarget an adopted PR");
+});
+
+test("an adopted PR still on the base drip recorded links normally", () => {
+  const api = extensionApi({
+    readPr: mock(() => ({ number: 2, url: "", state: "OPEN" as const, headRefName: "team/b", baseRefName: "drip/mega/a", title: "" })),
+  });
+  linkStacks({
+    repoRoot: "/repo",
+    chains: [chainOf(node("a", 1, "main"), node("b", 2, "drip/mega/a", true))],
+    dryRun: false,
+    api,
+  });
+  expect(api.link).toHaveBeenCalled();
+});
+
+test("without the extension, the REST endpoints create the stack instead", () => {
+  const api = restApi();
+  const results = linkStacks({
+    repoRoot: "/repo",
+    chains: [chainOf(node("a", 1, "main"), node("b", 2, "drip/mega/a"))],
+    dryRun: false,
+    api,
+  });
+  expect(api.link).not.toHaveBeenCalled();
+  expect(api.create).toHaveBeenCalledTimes(1);
+  expect(results[0]!.via).toBe("stacks API");
+  expect(results[0]!.stackNumber).toBe(12);
+});
+
+test("without the extension, a stack holding a prefix is extended rather than recreated", () => {
+  const api = restApi({ list: mock(() => [stack(7, [[1], [2]])]) });
   const results = linkStacks({
     repoRoot: "/repo",
     chains: [chainOf(node("a", 1, "main"), node("b", 2, "drip/mega/a"), node("c", 3, "drip/mega/b"))],
@@ -185,29 +264,36 @@ test("linkStacks extends an existing stack instead of creating a second one", ()
   expect(results[0]!.status).toBe("extended");
 });
 
-test("a diverged chain writes nothing at all", () => {
-  const api = {
-    list: mock(() => [stack(7, [[2], [1]])]),
-    create: mock(() => stack(0, [])),
-    add: mock(() => stack(7, [])),
-  };
+test("a diverged chain writes nothing, by either path", () => {
+  for (const api of [restApi({ list: mock(() => [stack(7, [[2], [1]])]) }), extensionApi({ list: mock(() => [stack(7, [[2], [1]])]) })]) {
+    const results = linkStacks({
+      repoRoot: "/repo",
+      chains: [chainOf(node("a", 1, "main"), node("b", 2, "drip/mega/a"))],
+      dryRun: false,
+      api,
+    });
+    expect(api.create).not.toHaveBeenCalled();
+    expect(api.add).not.toHaveBeenCalled();
+    expect(api.link).not.toHaveBeenCalled();
+    expect(results[0]!.status).toBe("diverged");
+  }
+});
+
+test("an already-correct stack costs no write call at all", () => {
+  const api = extensionApi({ list: mock(() => [stack(7, [[1], [2]])]) });
   const results = linkStacks({
     repoRoot: "/repo",
     chains: [chainOf(node("a", 1, "main"), node("b", 2, "drip/mega/a"))],
     dryRun: false,
     api,
   });
-  expect(api.create).not.toHaveBeenCalled();
-  expect(api.add).not.toHaveBeenCalled();
-  expect(results[0]!.status).toBe("diverged");
+  expect(api.link).not.toHaveBeenCalled();
+  expect(results[0]!.status).toBe("unchanged");
+  expect(results[0]!.via).toBeNull();
 });
 
-test("dry-run reads nothing and writes nothing", () => {
-  const api = {
-    list: mock(() => [] as GhStack[]),
-    create: mock(() => stack(0, [])),
-    add: mock(() => stack(0, [])),
-  };
+test("dry-run reads nothing and writes nothing, extension or not", () => {
+  const api = extensionApi();
   const results = linkStacks({
     repoRoot: "/repo",
     chains: [chainOf(node("a", 1, "main"), node("b", 2, "drip/mega/a"))],
@@ -215,9 +301,14 @@ test("dry-run reads nothing and writes nothing", () => {
     api,
   });
   expect(api.list).not.toHaveBeenCalled();
-  expect(api.create).not.toHaveBeenCalled();
+  expect(api.extensionAvailable).not.toHaveBeenCalled();
+  expect(api.link).not.toHaveBeenCalled();
   expect(results[0]!.status).toBe("dry-run");
   expect(results[0]!.note).toContain("not read");
+});
+
+test("a chain renders in gh stack's own notation, trunk first", () => {
+  expect(renderChain(chainOf(node("auth", 1, "main"), node("api", 2, "drip/mega/auth")))).toBe("(main) <- auth#1 <- api#2");
 });
 
 // --- Reading correspondence, and the read-only status view.
@@ -241,6 +332,7 @@ test("a manifest projection keeps its id as its label; an atomic slice falls bac
     row({ sliceSignature: "9f2c1a", sliceBranch: "drip/mega/slice3", prNumber: 2, baseRef: "drip/mega/report-tab" }),
   ]);
   expect(nodes.map((n) => n.id)).toEqual(["report-tab", "slice3"]);
+  expect(nodes.every((n) => !n.adopted)).toBe(true);
 });
 
 test("correspondence without a PR is separated out rather than becoming a chain node", () => {

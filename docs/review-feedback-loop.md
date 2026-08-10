@@ -94,8 +94,9 @@ Nothing in this loop runs unattended. Specifically:
 - **No polling, no webhooks, no daemon.** Every reconciliation is a side effect
   of a `drip push` you ran.
 - **`push` and `stack link` are the only commands with remote side effects**,
-  and both require `--yes`. `push` writes branches and PRs; `stack link` writes
-  nothing but stack membership. `materialize`, `validate-plan`,
+  and both require `--yes`. `push` writes branches, PRs and — by default, as
+  `gh stack submit` does — the stack that groups them; `--no-link-stack` opts
+  out. `stack link` writes nothing but stack membership. `materialize`, `validate-plan`,
   `manifest discover`, `stack status` and `review-context` write nothing remote
   at all.
 - **`push` does not auto-discover a manifest.** A manifest lying in
@@ -105,7 +106,10 @@ Nothing in this loop runs unattended. Specifically:
   appends to one. A stack whose members disagree with drip's chain is reported
   `diverged` and left exactly as it is — dissolving a grouping is a decision
   about someone's review surface, and `gh stack unstack` is theirs to run.
-- **drip never merges a stack.** `gh stack merge <n> --yes` is printed, not run.
+- **drip never merges a stack, and never navigates one for you.**
+  `gh stack merge <n> --yes` and `gh stack checkout <n>` are printed, not run —
+  and drip writes no `.git/gh-stack`, so `gh stack sync` and `rebase` never
+  find drip's derived branches to act on.
 - **Adoption is never inferred.** `manifest discover` proposes candidates on
   exact tree match and prints the command; binding still needs projection id,
   PR number and head branch, cross-checked, with `--yes`.
