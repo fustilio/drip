@@ -1,5 +1,17 @@
-import { ghAddToStack, ghCreateStack, ghListStacks, ghPrView, ghStackExtensionAvailable, ghStackLink, type GhStack, type PrRef } from "./github";
-import type { Correspondence } from "./store";
+import {
+  ghAddToStack,
+  ghCreateStack,
+  ghListStacks,
+  ghPrView,
+  ghStackExtensionAvailable,
+  ghStackLink,
+  ghStackUnstack,
+  ghUnstack,
+  type GhStack,
+  type PrRef,
+} from "./github";
+import type { Database } from "bun:sqlite";
+import { isStackOwned, recordStackOwnership, type Correspondence } from "./store";
 
 // GitHub stacks (docs/adr/0030).
 //
@@ -147,6 +159,8 @@ export type StackLinkResult = {
   added: number[];
   /** which command did the grouping; null when nothing was written */
   via: LinkVia | null;
+  /** did drip create the stack this chain landed in (recorded, not inferred) */
+  owned: boolean;
   note: string | null;
 };
 
@@ -161,7 +175,7 @@ const isPrefix = (prefix: number[], full: number[]) => prefix.length <= full.len
  * decision is the part worth being sure about, and `linkStacks` below is then
  * only the two API calls it names.
  */
-export function planStackLink(chain: StackChain, stacks: GhStack[]): Omit<StackLinkResult, "chain" | "via"> {
+export function planStackLink(chain: StackChain, stacks: GhStack[]): Omit<StackLinkResult, "chain" | "via" | "owned"> {
   const wanted = chain.members.map((m) => m.prNumber);
   const holding = stacks.filter((s) => s.prs.some((p) => wanted.includes(p.number)));
 
@@ -205,10 +219,12 @@ export function planStackLink(chain: StackChain, stacks: GhStack[]): Omit<StackL
     stackNumber: stack.number,
     stackUrl: stack.url,
     added: [],
+    // Deliberately just the facts: what GitHub holds, what drip's chain is, and
+    // why appending can't reconcile them. The *remedy* differs by who created
+    // the stack, and only the caller has that record — see `linkStacks`.
     note:
       `stack #${stack.number} holds ${open.map((n) => `#${n}`).join(", ") || "(nothing open)"} but drip's chain is ` +
-      `${wanted.map((n) => `#${n}`).join(", ")} — the stacks API only appends, so drip can't reorder or remove a member. ` +
-      "Unstack it (`gh stack unstack " + stack.number + "`) and re-run to recreate it from drip's chain.",
+      `${wanted.map((n) => `#${n}`).join(", ")} — the stacks API only appends, so a member can't be reordered or removed.`,
   };
 }
 
@@ -223,6 +239,8 @@ export type StacksApi = {
   link: (opts: { repoRoot: string; base: string; prNumbers: number[]; remote?: string }) => void;
   /** live PR read, used only to protect an adopted PR's base (see `linkStacks`) */
   readPr: (repoRoot: string, prNumber: number) => PrRef;
+  /** dissolve a stack — only ever called for one drip created, and only under --reclaim */
+  unstack: (repoRoot: string, stackNumber: number, viaExtension: boolean) => void;
 };
 
 export const realStacksApi: StacksApi = {
@@ -232,6 +250,7 @@ export const realStacksApi: StacksApi = {
   extensionAvailable: ghStackExtensionAvailable,
   link: ghStackLink,
   readPr: ghPrView,
+  unstack: (repoRoot, stackNumber, viaExtension) => (viaExtension ? ghStackUnstack(repoRoot, stackNumber) : ghUnstack(repoRoot, stackNumber)),
 };
 
 /** Which command actually did the grouping — reported, because the two differ in what they'd do. */
@@ -290,12 +309,25 @@ function adoptedBaseConflict(chain: StackChain, repoRoot: string, readPr: Stacks
  */
 export function linkStacks(opts: {
   repoRoot: string;
+  /** the mega branch — what a stack drip creates is recorded against (the mothership owns it) */
+  branch: string;
+  db: Database;
   chains: StackChain[];
   dryRun: boolean;
+  /**
+   * Rebuild a stack **drip created** whose composition on GitHub no longer
+   * matches what the mega branch implies: unstack it, then group the chain
+   * again. Exactly the rule `push --reclaim` already applies to a drip-owned
+   * branch (docs/adr/0028) — the mega branch is the source of truth, and
+   * overwriting drip's own derived object from it needs permission but not an
+   * argument. A stack drip did not create is never rebuilt, with or without
+   * the flag.
+   */
+  reclaim?: boolean;
   remote?: string;
   api?: StacksApi;
 }): StackLinkResult[] {
-  const { repoRoot, chains, dryRun } = opts;
+  const { repoRoot, branch, db, chains, dryRun } = opts;
   const api = opts.api ?? realStacksApi;
   if (dryRun) {
     return chains.map((chain) => ({
@@ -305,55 +337,95 @@ export function linkStacks(opts: {
       stackUrl: null,
       added: [],
       via: null,
+      owned: false,
       note: "GitHub was not read: whether this chain is already a stack is decided on the real run",
     }));
   }
 
   const useExtension = api.extensionAvailable(repoRoot);
   let stacks = api.list(repoRoot);
+
+  // Groups the whole chain and records that drip owns the result. Both write
+  // paths end here, so ownership can't be recorded on one and forgotten on the
+  // other.
+  const group = (chain: StackChain, planned: Omit<StackLinkResult, "chain" | "via" | "owned">): StackLinkResult => {
+    let via: LinkVia;
+    let now: GhStack | null;
+    if (useExtension) {
+      api.link({ repoRoot, base: chain.base, prNumbers: chain.members.map((m) => m.prNumber), remote: opts.remote });
+      via = "gh stack link";
+      // `gh stack link` prints for humans and returns no machine-readable
+      // stack, so the number — which the report, `gh stack merge` and the
+      // ownership record all need — has to be read back.
+      stacks = api.list(repoRoot);
+      now = stacks.find((st) => chain.members.every((m) => st.prs.some((p) => p.number === m.prNumber))) ?? null;
+    } else {
+      now =
+        planned.status === "extended" && planned.stackNumber
+          ? api.add(repoRoot, planned.stackNumber, planned.added)
+          : api.create(repoRoot, chain.members.map((m) => m.prNumber));
+      via = "stacks API";
+      // The endpoints return the stack they just wrote, so no second read: keep
+      // the local list in step for the chains still to come.
+      const at = stacks.findIndex((st) => st.number === now!.number);
+      if (at >= 0) stacks[at] = now;
+      else stacks.push(now);
+    }
+    const stackNumber = now?.number ?? planned.stackNumber;
+    // The record is the point of this whole branch: a stack drip created is one
+    // drip may later rebuild from the mega branch, and nothing on GitHub says
+    // who made it.
+    if (stackNumber) recordStackOwnership(db, branch, stackNumber, chain.members[0]!.prNumber);
+    return { chain, ...planned, stackNumber, stackUrl: now?.url ?? planned.stackUrl, via, owned: true };
+  };
+
   const results: StackLinkResult[] = [];
   for (const chain of chains) {
     const planned = planStackLink(chain, stacks);
-    if (planned.status !== "created" && planned.status !== "extended") {
-      results.push({ chain, ...planned, via: null });
+    const owned = !!planned.stackNumber && isStackOwned(db, branch, planned.stackNumber);
+
+    if (planned.status === "unchanged") {
+      results.push({ chain, ...planned, via: null, owned });
       continue;
     }
 
-    if (useExtension) {
-      // `gh stack link` is additive and idempotent over the whole chain, so
-      // `created` and `extended` are the same call: hand it the chain and let
-      // GitHub's own command reconcile. Only the adopted-base guard stands
-      // between drip and delegating entirely.
-      const conflict = adoptedBaseConflict(chain, repoRoot, api.readPr);
-      if (conflict) {
-        results.push({ chain, status: "diverged", stackNumber: planned.stackNumber, stackUrl: planned.stackUrl, added: [], via: null, note: conflict });
+    if (planned.status === "diverged") {
+      // The mega branch defines what the stack should hold. Rebuilding drip's
+      // own stack from it is therefore always *available* — but never silent,
+      // and never extended to a stack someone else made.
+      if (!opts.reclaim || !owned || !planned.stackNumber) {
+        const why = !planned.stackNumber
+          ? null
+          : owned
+            ? "drip created this stack, so `--reclaim` will dissolve it and rebuild the chain from the mega branch."
+            : `drip did not create this stack, so \`--reclaim\` does not apply to it — \`gh stack unstack ${planned.stackNumber}\` is yours to run if that's what you want.`;
+        results.push({ chain, ...planned, via: null, owned, note: [planned.note, why].filter(Boolean).join(" ") });
         continue;
       }
-      api.link({ repoRoot, base: chain.base, prNumbers: chain.members.map((m) => m.prNumber), remote: opts.remote });
-      // Read back rather than parse `link`'s human output: the stack number is
-      // what every later line of the report (and `gh stack merge`) needs.
+      const stacksBefore = stacks;
+      api.unstack(repoRoot, planned.stackNumber, useExtension);
       stacks = api.list(repoRoot);
-      const now = stacks.find((st) => chain.members.every((m) => st.prs.some((p) => p.number === m.prNumber))) ?? null;
+      const rebuilt = group(chain, planStackLink(chain, stacks));
       results.push({
-        chain,
-        ...planned,
-        stackNumber: now?.number ?? planned.stackNumber,
-        stackUrl: now?.url ?? planned.stackUrl,
-        via: "gh stack link",
+        ...rebuilt,
+        note: `--reclaim dissolved stack #${planned.stackNumber} (it held ${openMembers(
+          stacksBefore.find((st) => st.number === planned.stackNumber)!,
+        )
+          .map((n) => `#${n}`)
+          .join(", ")}) and rebuilt it from the mega branch`,
       });
       continue;
     }
 
-    if (planned.status === "created") {
-      const created = api.create(repoRoot, chain.members.map((m) => m.prNumber));
-      results.push({ chain, ...planned, stackNumber: created.number, stackUrl: created.url, via: "stacks API" });
-      stacks.push(created);
-    } else {
-      const updated = api.add(repoRoot, planned.stackNumber!, planned.added);
-      results.push({ chain, ...planned, stackNumber: updated.number, stackUrl: updated.url, via: "stacks API" });
-      const at = stacks.findIndex((st) => st.number === updated.number);
-      if (at >= 0) stacks[at] = updated;
+    // created / extended
+    if (useExtension) {
+      const conflict = adoptedBaseConflict(chain, repoRoot, api.readPr);
+      if (conflict) {
+        results.push({ chain, status: "diverged", stackNumber: planned.stackNumber, stackUrl: planned.stackUrl, added: [], via: null, owned, note: conflict });
+        continue;
+      }
     }
+    results.push(group(chain, planned));
   }
   return results;
 }
@@ -402,8 +474,10 @@ export type StackStatusMember = {
 
 export type StackStatusChain = {
   chain: StackChain;
+  /** did drip create the stack this chain sits in — the record, not a guess */
+  owned: boolean;
   /** exactly what `drip stack link` would do to this chain, computed the same way */
-  planned: Omit<StackLinkResult, "chain" | "via">;
+  planned: Omit<StackLinkResult, "chain" | "via" | "owned">;
   members: StackStatusMember[];
 };
 
@@ -427,6 +501,8 @@ export function collectStackStatus(opts: {
   repoRoot: string;
   branch: string;
   correspondence: Correspondence[];
+  /** read-only here: consulted for ownership, never written */
+  db: Database;
   api?: Pick<StacksApi, "list">;
 }): StackStatusReport {
   const api = opts.api ?? realStacksApi;
@@ -451,13 +527,16 @@ export function collectStackStatus(opts: {
     branch: opts.branch,
     available,
     unavailableReason,
-    chains: chains.map((chain) => ({
+    chains: chains.map((chain) => {
+      const planned = available
+        ? planStackLink(chain, stacks)
+        : { status: "dry-run" as const, stackNumber: null, stackUrl: null, added: [], note: "the stacks API could not be read" };
+      return {
       chain,
+      owned: !!planned.stackNumber && isStackOwned(opts.db, opts.branch, planned.stackNumber),
       // With no live read there is nothing to compare against, so the decision
       // is reported as the dry-run it is rather than as a confident "created".
-      planned: available
-        ? planStackLink(chain, stacks)
-        : { status: "dry-run" as const, stackNumber: null, stackUrl: null, added: [], note: "the stacks API could not be read" },
+      planned,
       members: chain.members.map((m) => {
         const at = placement.get(m.prNumber);
         return {
@@ -472,7 +551,8 @@ export function collectStackStatus(opts: {
           draft: at ? at.pr.draft : null,
         };
       }),
-    })),
+      };
+    }),
     solitary,
     withoutPr: unpushed.map((c) => ({ branch: c.sliceBranch, signature: c.sliceSignature })),
   };
@@ -490,8 +570,8 @@ export function printStackStatus(report: StackStatusReport): void {
   console.log(`STACKS (${report.branch}, ${report.chains.length} chain(s)) — read-only:`);
   if (!report.available) console.log(`  GitHub stack state unavailable — ${report.unavailableReason}`);
 
-  for (const { chain, planned, members } of report.chains) {
-    const header = planned.stackNumber ? `stack #${planned.stackNumber}` : "chain";
+  for (const { chain, planned, members, owned } of report.chains) {
+    const header = planned.stackNumber ? `stack #${planned.stackNumber} [${owned ? "drip" : "not drip's"}]` : "chain";
     console.log(`\n  ${header} — ${PLANNED_TEXT[planned.status]}${planned.stackUrl ? ` ${planned.stackUrl}` : ""}`);
     console.log(`    ${renderChain(chain)}`);
     for (const m of members) {
@@ -528,8 +608,9 @@ export function stackStatusToJson(report: StackStatusReport): object {
     readOnly: true,
     available: report.available,
     unavailableReason: report.unavailableReason,
-    chains: report.chains.map(({ chain, planned, members }) => ({
+    chains: report.chains.map(({ chain, planned, members, owned }) => ({
       base: chain.base,
+      owned,
       wouldLink: planned.status,
       stackNumber: planned.stackNumber,
       stackUrl: planned.stackUrl,
@@ -574,6 +655,7 @@ export function stackLinksToJson(results: StackLinkResult[]): object[] {
   return results.map((r) => ({
     status: r.status,
     via: r.via,
+    owned: r.owned,
     stackNumber: r.stackNumber,
     stackUrl: r.stackUrl,
     base: r.chain.base,

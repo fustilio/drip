@@ -212,7 +212,8 @@ server.tool(
   async ({ repo, branch }) => {
     try {
       const repoRoot = resolveRepoRoot(git, repo);
-      const report = collectStackStatus({ repoRoot, branch, correspondence: listCorrespondence(openStore(repoRoot), branch) });
+      const db = openStore(repoRoot);
+      const report = collectStackStatus({ repoRoot, branch, correspondence: listCorrespondence(db, branch), db });
       return textResult(stackStatusToJson(report));
     } catch (e) {
       return errorResult(e);

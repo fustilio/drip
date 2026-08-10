@@ -1,4 +1,5 @@
-import { expect, mock, test } from "bun:test";
+import { afterAll, expect, mock, test } from "bun:test";
+import { rmSync } from "node:fs";
 import type { GhStack } from "./github";
 import {
   collectStackStatus,
@@ -11,7 +12,20 @@ import {
   type StackNode,
   type StacksApi,
 } from "./stacks";
-import type { Correspondence } from "./store";
+import { isStackOwned, listOwnedStacks, openStore, recordStackOwnership, type Correspondence } from "./store";
+import { makeTempRepo } from "./test-helpers";
+
+// A real SQLite store in a throwaway repo: ownership is a durable record, and
+// asserting it against a fake would prove nothing about what survives a run.
+function memStore() {
+  const { repoRoot } = makeTempRepo("drip-stacks-");
+  stores.push(repoRoot);
+  return openStore(repoRoot);
+}
+const stores: string[] = [];
+afterAll(() => {
+  for (const d of stores) rmSync(d, { recursive: true, force: true });
+});
 
 const node = (id: string, prNumber: number, base: string, adopted = false): StackNode => ({
   id,
@@ -29,6 +43,7 @@ const restApi = (over: Partial<StacksApi> = {}): StacksApi => ({
   extensionAvailable: mock(() => false),
   link: mock(() => {}),
   readPr: mock(() => ({ number: 0, url: "", state: "OPEN" as const, headRefName: "", baseRefName: "main", title: "" })),
+  unstack: mock(() => {}),
   ...over,
 });
 
@@ -159,7 +174,9 @@ test("a different order on GitHub -> diverged, and drip does not restructure it"
   const planned = planStackLink(chain, [stack(7, [[2], [1]])]);
   expect(planned.status).toBe("diverged");
   expect(planned.added).toEqual([]);
-  expect(planned.note).toContain("unstack");
+  // The plan states the facts; the remedy depends on who created the stack and
+  // is added by linkStacks, which is the layer that has the ownership record.
+  expect(planned.note).toContain("only appends");
 });
 
 test("PRs spread across two stacks -> diverged, since the API only ever adds", () => {
@@ -185,6 +202,8 @@ test("with the extension installed, linking goes through `gh stack link` — Git
   api.list = mock(() => (++listed === 1 ? [] : [stack(12, [[1], [2]])]));
   const results = linkStacks({
     repoRoot: "/repo",
+    branch: "mega",
+    db: memStore(),
     chains: [chainOf(node("a", 1, "main"), node("b", 2, "drip/mega/a"))],
     dryRun: false,
     api,
@@ -202,6 +221,8 @@ test("`link` is passed the chain's real base, which is what stops it retargeting
   const api = extensionApi();
   linkStacks({
     repoRoot: "/repo",
+    branch: "mega",
+    db: memStore(),
     chains: [chainOf(node("a", 1, "release-2.1"), node("b", 2, "drip/mega/a"))],
     dryRun: false,
     api,
@@ -215,6 +236,8 @@ test("an adopted PR whose base moved on GitHub blocks the link instead of being 
   });
   const results = linkStacks({
     repoRoot: "/repo",
+    branch: "mega",
+    db: memStore(),
     chains: [chainOf(node("a", 1, "main"), node("b", 2, "drip/mega/a", true))],
     dryRun: false,
     api,
@@ -230,6 +253,8 @@ test("an adopted PR still on the base drip recorded links normally", () => {
   });
   linkStacks({
     repoRoot: "/repo",
+    branch: "mega",
+    db: memStore(),
     chains: [chainOf(node("a", 1, "main"), node("b", 2, "drip/mega/a", true))],
     dryRun: false,
     api,
@@ -241,6 +266,8 @@ test("without the extension, the REST endpoints create the stack instead", () =>
   const api = restApi();
   const results = linkStacks({
     repoRoot: "/repo",
+    branch: "mega",
+    db: memStore(),
     chains: [chainOf(node("a", 1, "main"), node("b", 2, "drip/mega/a"))],
     dryRun: false,
     api,
@@ -255,6 +282,8 @@ test("without the extension, a stack holding a prefix is extended rather than re
   const api = restApi({ list: mock(() => [stack(7, [[1], [2]])]) });
   const results = linkStacks({
     repoRoot: "/repo",
+    branch: "mega",
+    db: memStore(),
     chains: [chainOf(node("a", 1, "main"), node("b", 2, "drip/mega/a"), node("c", 3, "drip/mega/b"))],
     dryRun: false,
     api,
@@ -268,6 +297,8 @@ test("a diverged chain writes nothing, by either path", () => {
   for (const api of [restApi({ list: mock(() => [stack(7, [[2], [1]])]) }), extensionApi({ list: mock(() => [stack(7, [[2], [1]])]) })]) {
     const results = linkStacks({
       repoRoot: "/repo",
+      branch: "mega",
+      db: memStore(),
       chains: [chainOf(node("a", 1, "main"), node("b", 2, "drip/mega/a"))],
       dryRun: false,
       api,
@@ -283,6 +314,8 @@ test("an already-correct stack costs no write call at all", () => {
   const api = extensionApi({ list: mock(() => [stack(7, [[1], [2]])]) });
   const results = linkStacks({
     repoRoot: "/repo",
+    branch: "mega",
+    db: memStore(),
     chains: [chainOf(node("a", 1, "main"), node("b", 2, "drip/mega/a"))],
     dryRun: false,
     api,
@@ -296,6 +329,8 @@ test("dry-run reads nothing and writes nothing, extension or not", () => {
   const api = extensionApi();
   const results = linkStacks({
     repoRoot: "/repo",
+    branch: "mega",
+    db: memStore(),
     chains: [chainOf(node("a", 1, "main"), node("b", 2, "drip/mega/a"))],
     dryRun: true,
     api,
@@ -350,6 +385,7 @@ test("stack status joins drip's chain with GitHub's placement, and writes nothin
       row({ sliceSignature: "manifest:a", sliceBranch: "drip/mega/a", prNumber: 1, baseRef: "main" }),
       row({ sliceSignature: "manifest:b", sliceBranch: "drip/mega/b", prNumber: 2, baseRef: "drip/mega/a", adopted: true }),
     ],
+    db: memStore(),
     api,
   });
   expect(report.available).toBe(true);
@@ -371,10 +407,92 @@ test("an unreadable stacks API degrades to 'not compared' instead of claiming th
     repoRoot: "/repo",
     branch: "mega",
     correspondence: [row({ sliceSignature: "manifest:a", prNumber: 1, baseRef: "main" }), row({ sliceSignature: "manifest:b", sliceBranch: "drip/mega/b", prNumber: 2, baseRef: "drip/mega/a" })],
+    db: memStore(),
     api,
   });
   expect(report.available).toBe(false);
   expect(report.unavailableReason).toContain("not enabled");
   expect(report.chains[0]!.planned.status).toBe("dry-run");
   expect(report.chains[0]!.members.every((m) => m.stackNumber === null)).toBe(true);
+});
+
+// --- Ownership: which stacks drip made, and what that permits.
+
+test("creating a stack records that drip owns it", () => {
+  const db = memStore();
+  const api = restApi();
+  linkStacks({ repoRoot: "/repo", branch: "mega", db, chains: [chainOf(node("a", 1, "main"), node("b", 2, "drip/mega/a"))], dryRun: false, api });
+  expect(listOwnedStacks(db, "mega").map((o) => [o.stackNumber, o.bottomPr])).toEqual([[12, 1]]);
+  // ...and against a different mega branch, the same stack isn't drip's to rebuild.
+  expect(isStackOwned(db, "other-mega", 12)).toBe(false);
+});
+
+test("a diverged stack drip owns is rebuilt under --reclaim, and only then", () => {
+  const db = memStore();
+  const chain = chainOf(node("a", 1, "main"), node("b", 2, "drip/mega/a"));
+  const diverged = stack(7, [[2], [1]]);
+  const api = restApi({ list: mock(() => [diverged]) });
+
+  // First: recorded as drip's, but no --reclaim → reported, nothing written.
+  recordStackOwnership(db, "mega", 7, 1);
+  const held = linkStacks({ repoRoot: "/repo", branch: "mega", db, chains: [chain], dryRun: false, api });
+  expect(api.unstack).not.toHaveBeenCalled();
+  expect(held[0]!.status).toBe("diverged");
+  expect(held[0]!.owned).toBe(true);
+  expect(held[0]!.note).toContain("--reclaim");
+
+  // Then: with --reclaim → dissolved and rebuilt from the mega branch.
+  let listed = 0;
+  api.list = mock(() => (++listed <= 1 ? [diverged] : []));
+  const rebuilt = linkStacks({ repoRoot: "/repo", branch: "mega", db, chains: [chain], dryRun: false, api, reclaim: true });
+  expect(api.unstack).toHaveBeenCalledWith("/repo", 7, false);
+  expect(api.create).toHaveBeenCalledTimes(1);
+  expect(rebuilt[0]!.status).toBe("created");
+  expect(rebuilt[0]!.note).toContain("rebuilt it from the mega branch");
+});
+
+test("--reclaim does not apply to a stack drip did not create", () => {
+  const db = memStore(); // nothing recorded: this stack is somebody else's
+  const api = restApi({ list: mock(() => [stack(7, [[2], [1]])]) });
+  const results = linkStacks({
+    repoRoot: "/repo",
+    branch: "mega",
+    db,
+    chains: [chainOf(node("a", 1, "main"), node("b", 2, "drip/mega/a"))],
+    dryRun: false,
+    api,
+    reclaim: true,
+  });
+  expect(api.unstack).not.toHaveBeenCalled();
+  expect(api.create).not.toHaveBeenCalled();
+  expect(results[0]!.owned).toBe(false);
+  expect(results[0]!.note).toContain("does not apply");
+});
+
+test("stack status reports whether drip owns the stack it found", () => {
+  const db = memStore();
+  recordStackOwnership(db, "mega", 7, 1);
+  const report = collectStackStatus({
+    repoRoot: "/repo",
+    branch: "mega",
+    correspondence: [
+      row({ sliceSignature: "manifest:a", sliceBranch: "drip/mega/a", prNumber: 1, baseRef: "main" }),
+      row({ sliceSignature: "manifest:b", sliceBranch: "drip/mega/b", prNumber: 2, baseRef: "drip/mega/a" }),
+    ],
+    db,
+    api: { list: mock(() => [stack(7, [[1], [2]])]) },
+  });
+  expect(report.chains[0]!.owned).toBe(true);
+
+  const unowned = collectStackStatus({
+    repoRoot: "/repo",
+    branch: "mega",
+    correspondence: [
+      row({ sliceSignature: "manifest:a", sliceBranch: "drip/mega/a", prNumber: 1, baseRef: "main" }),
+      row({ sliceSignature: "manifest:b", sliceBranch: "drip/mega/b", prNumber: 2, baseRef: "drip/mega/a" }),
+    ],
+    db: memStore(),
+    api: { list: mock(() => [stack(7, [[1], [2]])]) },
+  });
+  expect(unowned.chains[0]!.owned).toBe(false);
 });

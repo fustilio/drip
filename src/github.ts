@@ -177,15 +177,17 @@ export function ghReplyToReviewComment(repoRoot: string, prNumber: number, comme
 // what was missing is the grouping object itself, which is what these
 // endpoints create.
 //
-// drip calls the REST API directly rather than shelling out to the `gh stack`
-// extension. The extension's other commands keep local tracking state in
-// `.git/gh-stack` and *rebase* the branches in place, which is the opposite of
-// how drip treats a projection branch (derived, regenerated, never rebased —
-// see CONTEXT.md "Slice"). The one part of the extension that fits a tool
-// which owns its own branches is `gh stack link`, whose whole job is "group
-// these PRs, keep no local state" — and that is these three calls. Not
-// depending on the extension also means one less thing to have installed, and
-// no `.git/gh-stack` file for `gh stack sync` to later act on.
+// Grouping runs through GitHub's own `gh stack link` when the extension is
+// installed, and through the endpoints that command calls when it isn't — so
+// the conventional path is the default and the absence of an extension drip
+// can't install never blocks a push. Both are here for that reason.
+//
+// What stays out is the extension's branch management: `init`, `add`, `rebase`,
+// `sync` and `modify` move branches and track them in `.git/gh-stack`, and a
+// projection branch is derived — regenerated on each push, never rebased (see
+// CONTEXT.md "Slice"). drip writes no `.git/gh-stack`, so none of those act on
+// its branches by accident; `gh stack checkout <n>` is how someone opts into
+// local navigation deliberately.
 // See docs/adr/0030-github-stacks.md.
 
 export type GhStackPr = {
@@ -314,6 +316,26 @@ export function ghListStacks(repoRoot: string): GhStack[] {
  */
 export function ghCreateStack(repoRoot: string, prNumbers: number[]): GhStack {
   return parseStack(ghStacksApi(repoRoot, ["--method", "POST", "repos/{owner}/{repo}/stacks"], { pull_requests: prNumbers }));
+}
+
+/**
+ * Dissolves a stack. The only call in this module that *removes* a grouping,
+ * and it is reachable only for a stack drip created and only under `--reclaim`
+ * — the same rule that governs force-pushing a drip-owned branch
+ * (docs/adr/0028). GitHub decides what can actually be unstacked: PRs queued
+ * for merge or with auto-merge on stay put, and the stack survives with them.
+ */
+export function ghUnstack(repoRoot: string, stackNumber: number): void {
+  ghStacksApi(repoRoot, ["--method", "POST", `repos/{owner}/{repo}/stacks/${stackNumber}/unstack`]);
+}
+
+/** `gh stack unstack <n>` — the same effect through GitHub's own command. */
+export function ghStackUnstack(repoRoot: string, stackNumber: number): void {
+  try {
+    execFileSync("gh", ["stack", "unstack", String(stackNumber)], { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] });
+  } catch (e: any) {
+    throw new DripError(`gh stack unstack ${stackNumber} failed: ${String(e.stderr ?? e.message ?? "").trim()}`);
+  }
 }
 
 /** Appends PRs to the top of an existing stack. Additive: this never removes a member. */

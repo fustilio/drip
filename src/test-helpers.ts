@@ -66,6 +66,8 @@ export function githubMock(overrides: Record<string, AnyMock> = {}): Record<stri
     ghListStacks: mock(() => []),
     ghStackExtensionAvailable: mock(() => false),
     ghStackLink: mock(() => {}),
+    ghUnstack: mock(() => {}),
+    ghStackUnstack: mock(() => {}),
     ghCreateStack: mock((_repoRoot: string, prNumbers: number[]) => ({
       number: 1,
       url: "https://example.com/stacks/1",

@@ -127,6 +127,30 @@ opinion about them either.
 in the same spirit as the hidden-base warning: a stack drip could have made and
 didn't is not something to discover later.
 
+### Record that drip made the stack; read membership live
+
+drip now puts three kinds of object on a review surface — a branch, a PR, and a
+stack — and the first two already carry ownership in `correspondence`, because
+every rule about force-pushing, retargeting and reclaiming depends on knowing
+which of them drip created (docs/adr/0020, 0028). The stack gets the same
+treatment: `stack_ownership` records `(mega branch, stack number)` when drip
+creates one.
+
+What is **not** recorded is membership. That lives on GitHub, is read live on
+every report, and a cached copy could only ever be wrong. The record is exactly
+the one bit GitHub doesn't carry: who made this stack.
+
+The distinction pays for itself immediately, at `diverged`. Without it, every
+divergence is a dead end — drip can't restructure, because the API only adds and
+dissolving somebody's grouping isn't drip's call. With it, the two cases
+separate the way they already do for branches: a stack **drip created** is a
+derived object whose definition is the mega branch, so `--reclaim` may dissolve
+and rebuild it; a stack **someone else created** is never dissolved, flag or no
+flag. It is the same flag `push` already uses for a drip-owned branch that
+moved, and the same sentence underneath: discarding what drip didn't create
+needs a person, rebuilding what drip did create from the mothership needs
+permission but not an argument.
+
 ### Reading is a separate, read-only surface
 
 `drip stack status <branch>` joins drip's chains with GitHub's placement — which
@@ -167,6 +191,10 @@ separate question.
   effects beyond stack membership.
 - **One extra API read** for `review-context` and `stack status`; at most one
   write per chain for `link`.
+- **A third owned object to keep straight.** Branch, PR, stack — each with a
+  record of whether drip made it, each with the same rule about what may be
+  overwritten. That is a cost, and the alternative was a divergence with no
+  remedy.
 
 ## Alternatives rejected
 
@@ -193,9 +221,12 @@ separate question.
   (docs/adr/0016).
 - **Pick a branch of a fork to continue the chain.** Deterministic and
   meaningless: the choice would decide who reviews what, on no evidence.
-- **Persist stack numbers in `.git/drip.db`.** A second record to drift from
-  GitHub's, for something one list call answers live. Membership is read where
-  it lives, the same way adoption evidence is.
+- **Persist nothing at all about stacks.** This ADR said so first, and it was
+  half right: *membership* must not be cached, since GitHub owns it and a copy
+  could only be stale. But provenance isn't membership. Without a record of
+  which stacks drip created, `diverged` has no way out that isn't either
+  guessing or refusing forever — and drip already keeps exactly this record for
+  branches and PRs. Corrected: ownership recorded, membership read live.
 - **Link by default on every push.** A stack is a real object on someone's
   review surface. It follows drip's existing rule that remote side effects are
   asked for, not inferred — and the report makes the un-taken option visible.

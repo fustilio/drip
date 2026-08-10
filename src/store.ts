@@ -91,6 +91,23 @@ export function openStore(repoRoot: string): Database {
       UNIQUE(branch, slice_signature)
     )
   `);
+  // Stack provenance (docs/adr/0030). Deliberately *not* a mirror of GitHub's
+  // stack membership — that lives on GitHub and is read live, because a cached
+  // copy could only ever be wrong. What's recorded here is the one fact GitHub
+  // does not carry: whether drip created this stack. It is the same
+  // drip-owned/adopted distinction correspondence already makes for branches
+  // and PRs (docs/adr/0020, 0028), applied to the third object drip puts on
+  // someone's review surface, so a stack drip made can be rebuilt from the
+  // mega branch and a stack someone else made never is.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS stack_ownership (
+      branch TEXT NOT NULL,
+      stack_number INTEGER NOT NULL,
+      bottom_pr INTEGER,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(branch, stack_number)
+    )
+  `);
   // Issue #10: manifest verification commands are real process runs, often a
   // package typecheck or a targeted test suite. Keyed by the tree the command
   // ran against, so an independent projection isn't re-verified because some
@@ -187,6 +204,33 @@ export function upsertCorrespondence(db: Database, c: Correspondence): void {
 
 export function deleteCorrespondence(db: Database, branch: string, sliceSignature: string): void {
   db.query("DELETE FROM correspondence WHERE branch = ? AND slice_signature = ?").run(branch, sliceSignature);
+}
+
+/** A stack drip created for this mega branch — provenance, not a membership cache. */
+export type OwnedStack = { branch: string; stackNumber: number; bottomPr: number | null; createdAt: string };
+
+export function recordStackOwnership(db: Database, branch: string, stackNumber: number, bottomPr: number | null): void {
+  db.query(
+    `INSERT INTO stack_ownership (branch, stack_number, bottom_pr) VALUES (?, ?, ?)
+     ON CONFLICT(branch, stack_number) DO UPDATE SET bottom_pr = excluded.bottom_pr`,
+  ).run(branch, stackNumber, bottomPr);
+}
+
+export function listOwnedStacks(db: Database, branch: string): OwnedStack[] {
+  return db
+    .query(
+      "SELECT branch, stack_number as stackNumber, bottom_pr as bottomPr, created_at as createdAt FROM stack_ownership WHERE branch = ? ORDER BY stack_number",
+    )
+    .all(branch) as OwnedStack[];
+}
+
+export function isStackOwned(db: Database, branch: string, stackNumber: number): boolean {
+  return !!db.query("SELECT 1 FROM stack_ownership WHERE branch = ? AND stack_number = ?").get(branch, stackNumber);
+}
+
+/** Drop the record, for a stack that was dissolved on GitHub or bound by mistake. */
+export function forgetStackOwnership(db: Database, branch: string, stackNumber: number): void {
+  db.query("DELETE FROM stack_ownership WHERE branch = ? AND stack_number = ?").run(branch, stackNumber);
 }
 
 export function listOverrides(db: Database, branch: string): Override[] {

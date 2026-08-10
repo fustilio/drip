@@ -4,8 +4,8 @@ A tool for drip-feeding a mega branch back into main as thin, reviewable PRs. Sl
 
 ## Language
 
-**Mega branch**:
-The durable source of truth — a git branch containing a coherent but large, unreviewable diff against its target (e.g. `main`). Identified as the input branch diffed against its merge-base with the target.
+**Mega branch** (the mothership):
+The durable source of truth — a git branch containing a coherent but large, unreviewable diff against its target (e.g. `main`). Identified as the input branch diffed against its merge-base with the target. Everything downstream is derived from it and rebuildable from it: slice branches, projection PRs, and the GitHub stack that groups them. That is what makes `--reclaim` safe on anything drip owns, and why a change existing only on a projection branch is a change the next replan cannot see.
 _Avoid_: feature branch, source branch
 
 **Diff source**:
@@ -65,6 +65,10 @@ _Avoid_: stack (bare — `--projection stacked` and a **GitHub stack** are both 
 **GitHub stack**:
 GitHub's own object grouping an ordered chain of PRs that form a base-to-head chain, shipped to public preview in July 2026: the PR UI shows the layers, and `gh stack merge <n>` lands the chain — or a prefix of it — atomically. Created from drip's PRs by `gh stack link` when the extension is installed — GitHub's own command for branches another tool owns — and by the endpoints it calls when it isn't. `drip push` links by default (`--no-link-stack` opts out); `drip stack link` does it on its own. drip writes no `.git/gh-stack`, so `gh stack sync`/`rebase`/`modify` never act on branches it regenerates; `gh stack checkout <n>` is how a stack becomes locally navigable. Strictly linear: one parent, at most one child. Membership is read live and never persisted — GitHub is where it lives. See docs/adr/0030.
 _Avoid_: stack (bare), stacked PRs (ambiguous between GitHub's object and the `--projection stacked` mode)
+
+**Stack ownership**:
+Whether drip created a given GitHub stack, recorded in `.git/drip.db` as `(mega branch, stack number)`. The same drip-owned/adopted distinction correspondence already makes for branches and PRs, applied to the third object drip puts on a review surface. Deliberately *not* a copy of the stack's membership — that lives on GitHub and is read live; the record is the one fact GitHub doesn't carry. What it buys: a diverged stack drip created may be dissolved and rebuilt from the mega branch under `--reclaim`, and one drip didn't create never may. See docs/adr/0030.
+_Avoid_: stack cache, stack state (both imply drip mirrors what GitHub holds)
 
 **PR chain**:
 What drip derives to decide what a GitHub stack could hold: a maximal linear run of pushed PRs, where each one's base is the head branch of the one below it. Derived from the bases drip *actually set*, not from the slice DAG, so a chain drip reports is one GitHub will accept. A fan-out truncates the chain and names the dependents rather than picking one to continue it; a projection on a generated integration base starts a new chain, since that branch has no PR to be a member.

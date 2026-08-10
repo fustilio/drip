@@ -111,3 +111,8 @@ each layer earns its existence: a partition that scores 50% against the atomic
 slices and 100% against the manifest projections is the manifest layer doing
 exactly the job it was added for. See `docs/validation.md` for the method,
 the threshold, and the ledger of what has actually been scored.
+
+Once the PRs exist, `docs/pr-stacks.md` covers grouping them into a GitHub stack
+— what drip creates, what it records as its own, and which commands stay
+GitHub's — and `docs/review-feedback-loop.md` covers what arrives from outside
+afterwards.

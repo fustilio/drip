@@ -182,7 +182,10 @@ export const pushCommand = buildCommand({
         );
         for (const chain of chains) console.log(`    ${renderChain(chain)}`);
       } else {
-        printStackLinks(linkStacks({ repoRoot: ctx.repoRoot, chains, dryRun: flags.dryRun }), flags.dryRun);
+        printStackLinks(
+          linkStacks({ repoRoot: ctx.repoRoot, branch: ctx.branch, db: ctx.db, chains, dryRun: flags.dryRun, reclaim: flags.reclaim }),
+          flags.dryRun,
+        );
       }
 
       const blocked = results.filter((r) => r.status === "blocked");
@@ -207,7 +210,7 @@ export const pushCommand = buildCommand({
       reviewableStack: { kind: "boolean", brief: "refuse any projection needing a generated integration base", default: false },
       noLinkStack: { kind: "boolean", brief: "push the PRs without grouping them into a GitHub stack", default: false },
       draft: { kind: "boolean", brief: "open drip-owned PRs as drafts", default: false },
-      reclaim: { kind: "boolean", brief: "overwrite a drip-owned branch that has moved on the remote", default: false },
+      reclaim: { kind: "boolean", brief: "rebuild what drip owns — a branch that moved, a stack that diverged — from the mega branch", default: false },
       ...buildCheckFlags,
       yes: { kind: "boolean", brief: "confirm: this opens real PRs on GitHub", default: false },
       dryRun: { kind: "boolean", brief: "preview without touching GitHub", default: false },

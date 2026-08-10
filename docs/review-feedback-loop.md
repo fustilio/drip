@@ -54,6 +54,7 @@ that drift without changing anything.
 | **More commits on the mega branch** | Replans from scratch. A manifest projection keeps its PR because correspondence is keyed on the manifest `id`; an atomic slice keeps its PR only while its symbol composition is stable. | Next plan/push | `review-context` reports content drift per projection, with the changed files and selectors |
 | **A PR added to drip's stack on GitHub** | Reported. `stack link` is additive and never removes, so an extra open PR above drip's chain is left alone and named; a PR interleaved *into* the chain makes it `diverged` and drip writes nothing. | `drip stack status`, and the next `stack link` | The chain's status line |
 | **The stack unstacked on GitHub** | Nothing. The PRs and their bases are untouched by unstacking, so drip's next `stack link` simply creates the stack again. | Next `stack link` | `created`, rather than `unchanged` |
+| **The stack's members reordered on GitHub** | `diverged`, and nothing is written. If drip created that stack, `--reclaim` dissolves it and rebuilds the chain from the mega branch; if it didn't, the way out is `gh stack unstack <n>`, which is not drip's to run. | `drip stack link` / next push | The chain's status line, naming which case applies |
 | **A stack member merged** | Excluded from the chain comparison — a merged PR stays in its stack forever, so comparing against the open members is what stops a second lap reporting a conflict that isn't one. | Every `stack status` / `stack link` | The member's line: `merged` |
 | **Base branch advances independently** | The merge-base moves and everything is recomputed against it. The tree-hash invariant is unaffected. | Next plan | Normal plan output |
 | **Content moved under an existing PR** | Posts an interdiff comment (previous force-push → this one), because GitHub renders nothing for a force-push. | Next push | The interdiff comment on the PR |
@@ -174,4 +175,5 @@ change across a run (docs/adr/0027).
 - `docs/adr/0016-flat-first-projection.md` — how a projection's base is chosen
 - `docs/adr/0020-adopting-existing-prs.md` — the ownership rule in full
 - `docs/adr/0027-read-only-review-context.md` — why the read surface is separate
-- `docs/adr/0030-github-stacks.md` — how drip's PR chain becomes a stack on GitHub
+- `docs/pr-stacks.md` — the GitHub stacks integration end to end
+- `docs/adr/0030-github-stacks.md` — the decisions behind it

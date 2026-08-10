@@ -25,11 +25,8 @@ const statusCommand = buildCommand({
   loader: async () =>
     command((flags: { repo?: string; json: boolean }, branch: string) => {
       const repoRoot = resolveRepo(flags.repo);
-      const report = collectStackStatus({
-        repoRoot,
-        branch,
-        correspondence: listCorrespondence(openStore(repoRoot), branch),
-      });
+      const db = openStore(repoRoot);
+      const report = collectStackStatus({ repoRoot, branch, correspondence: listCorrespondence(db, branch), db });
       if (flags.json) console.log(JSON.stringify(stackStatusToJson(report)));
       else printStackStatus(report);
     }),
@@ -42,12 +39,13 @@ const statusCommand = buildCommand({
 
 const linkCommand = buildCommand({
   loader: async () =>
-    command((flags: { repo?: string; json: boolean; yes: boolean; dryRun: boolean }, branch: string) => {
+    command((flags: { repo?: string; json: boolean; yes: boolean; dryRun: boolean; reclaim: boolean }, branch: string) => {
       if (!flags.dryRun && !flags.yes) {
         throw new DripError("stack link creates a real stack on GitHub — pass --yes to confirm, or --dry-run to preview first");
       }
       const repoRoot = resolveRepo(flags.repo);
-      const { nodes } = nodesFromCorrespondence(listCorrespondence(openStore(repoRoot), branch));
+      const db = openStore(repoRoot);
+      const { nodes } = nodesFromCorrespondence(listCorrespondence(db, branch));
       const { chains, solitary } = linearChains(nodes);
       if (!chains.length) {
         const detail = solitary.length ? ` (${solitary.map((s) => `#${s.node.prNumber}: ${s.reason}`).join("; ")})` : "";
@@ -55,7 +53,7 @@ const linkCommand = buildCommand({
         return;
       }
 
-      const results = linkStacks({ repoRoot, chains, dryRun: flags.dryRun });
+      const results = linkStacks({ repoRoot, branch, db, chains, dryRun: flags.dryRun, reclaim: flags.reclaim });
       if (flags.json) console.log(JSON.stringify(stackLinksToJson(results)));
       else printStackLinks(results, flags.dryRun);
 
@@ -70,6 +68,11 @@ const linkCommand = buildCommand({
       repo: repoFlag,
       json: jsonFlag,
       yes: { kind: "boolean", brief: "confirm: this creates a real stack on GitHub", default: false },
+      reclaim: {
+        kind: "boolean",
+        brief: "dissolve and rebuild a stack drip created whose composition has diverged",
+        default: false,
+      },
       dryRun: { kind: "boolean", brief: "preview the chains without reading or writing GitHub", default: false },
     },
   },
