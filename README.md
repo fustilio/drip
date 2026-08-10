@@ -2,7 +2,7 @@
 
 A tool for drip-feeding a mega branch back into main as thin, reviewable PRs. Slices are derived projections of the mega branch, not maintained branches — regenerated, never rebased.
 
-**Status:** M0 (feasibility spike) built. M1 (real CLI, `drip plan`/`drip verify`) built. M2 (`drip push`, real PRs via `gh`) built. M3 (content-addressed skip, squash-merge reconciliation, interdiff comments) built. M4 (comment anchoring, conservative exact-hash-only cut) built. M5's deterministic half (build-check caching, parallel per-slice builds) built. M5's AI half re-scoped away from a bundled provider to `plan --json` and an MCP server (`drip mcp`) for external tools (`docs/adr/0009`). **The M0 kill-gate blind-boundary scoring against real branches has not been run yet** — see `BUILD-PLAN.md` for what that means and why everything downstream is contingent on it. It is now a command rather than an afternoon of reading (`drip score`), and `docs/validation.md` records what has actually been measured and what drip may therefore claim. See `CONTEXT.md` for the domain model, `docs/review-unit-workflow.md` for how a mega branch becomes a reviewable PR set, and `docs/adr/` for the architecture decisions.
+**Status:** M0 (feasibility spike) built. M1 (real CLI, `drip plan`/`drip verify`) built. M2 (`drip push`, real PRs via `gh`) built. M3 (content-addressed skip, squash-merge reconciliation, interdiff comments) built. M4 (comment anchoring, conservative exact-hash-only cut) built. M5's deterministic half (build-check caching, parallel per-slice builds) built. M5's AI half re-scoped away from a bundled provider to `plan --json` and an MCP server (`drip mcp`) for external tools (`docs/adr/0009`). **The M0 kill-gate blind-boundary scoring against real branches has not been run yet** — see `BUILD-PLAN.md` for what that means and why everything downstream is contingent on it. It is now a command rather than an afternoon of reading (`drip score`), and `docs/validation.md` records what has actually been measured and what drip may therefore claim. See `CONTEXT.md` for the domain model, `docs/review-unit-workflow.md` for how a mega branch becomes a reviewable PR set, `docs/review-feedback-loop.md` for what happens to that PR set afterwards (comments, pushes to PR branches, squash-merges — what drip reconciles and what it doesn't), and `docs/adr/` for the architecture decisions.
 
 ## CLI
 
@@ -135,6 +135,44 @@ bun src/cli.ts mcp
 
   Hand-drawn units are matched to drip units one-to-one (greatest overlap first, ties broken deterministically), so a split costs the smaller fragments and a merge costs one of the two units — a plurality match would score "drip merged two features into one PR" as a perfect result for both, which is the exact failure the gate exists to catch. Every disagreement is reported by selector, fallback groups are excluded unless `--include-fallback`, selectors that no longer exist are reported rather than dropped, and a partition that matches nothing fails rather than scoring 0/0 as a pass. `--threshold` moves the line; the default is two-thirds. Exit code 1 below it. See `docs/adr/0025-boundary-scoring-and-the-review-unit-workflow.md`, `docs/review-unit-workflow.md` and `docs/validation.md`.
 - **`mcp`** — starts an MCP stdio server exposing `drip_plan`, `drip_verify`, `drip_validate_plan`, `drip_review_context`, `drip_override_list`, `drip_override_add`, `drip_override_remove` as tools, so an MCP client (an agent, an editor integration) can read plan/verify data and write override decisions without shelling out to the CLI. `drip_plan`/`drip_verify` take `worktree` too, so an agent can propose a partition from work in progress before any git state changes. `drip_review_context` is the read-only view of a projection's PR, branch, drift and open threads (docs/adr/0027) — there is no write counterpart, for the same reason there is no `push` or `manifest adopt` tool: one has real side effects and the other decides that drip may later force-push over a branch it doesn't own, and both need `--yes` from a human. No AI provider inside drip anywhere — see `docs/adr/0009-ai-integration-external-not-bundled.md`.
+
+## The loop after the first push
+
+Splitting a mega branch is the easy half. The PRs then sit in front of people who comment on them, push to them, merge them and retarget them, while you keep committing to the mega branch underneath. Everything drip does about that happens on the **next `drip push`** — there is no daemon, no webhook and no background process.
+
+```mermaid
+flowchart LR
+    MEGA["mega branch"] --> PLAN["drip plan --coarsen<br/>drip validate-plan"]
+    PLAN --> PUSH["drip push<br/>--manifest --yes"]
+    PUSH --> PRS["projection PRs<br/>on GitHub"]
+    PLAN -.-> MAT["drip materialize<br/>local refs, nothing remote"]
+    MAT -. "compare before pushing" .-> PUSH
+
+    EW{{"more commits on the mega branch"}} --> MEGA
+    EC{{"review comment on a hunk"}} --> PRS
+    EB{{"commit pushed to a PR branch"}} --> PRS
+    ER{{"PR base retargeted by hand"}} --> PRS
+    EM{{"projection squash-merged into base"}} --> PRS
+
+    PRS -- "the next push reconciles all of it<br/>nothing happens before that" --> PUSH
+    PRS -.-> RC["drip review-context<br/>read-only, any time"]
+
+    classDef external stroke-dasharray: 5 3
+    class EC,EB,EM,ER,EW external
+```
+
+The dashed hexagons are the external inputs. In short:
+
+| External input | What the next `drip push` does |
+|---|---|
+| Review comment on a hunk | Exact hunk-hash match → left alone. No match → a threaded reply saying the code moved and couldn't be confidently relocated. |
+| Commit pushed to an **adopted** branch | `--force-with-lease` refuses the push; the projection is `blocked` and its dependents are refused with it. |
+| Commit pushed to a **drip-opened** branch | Nothing protects it — drip owns that branch. See the warning in `docs/review-feedback-loop.md`. |
+| Projection squash-merged into base | Detected by reverse-apply, dropped from the stack, PR closed, later projections re-based past it. |
+| PR base retargeted by hand | drip-opened → retargeted back to what the manifest implies. Adopted → reported every run, never changed. |
+| More commits on the mega branch | Replan. A manifest projection keeps its PR (correspondence is keyed on the manifest `id`); an atomic slice keeps its PR only while its symbol composition is stable. |
+
+`docs/review-feedback-loop.md` has the annotated version: which ADR governs each behaviour, the drip-owned vs adopted ownership rule that explains most of them, and the loop's known blind spots.
 
 ## M0 spike
 

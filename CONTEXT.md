@@ -118,5 +118,13 @@ _Avoid_: build, generate, export
 Binding a semantic projection to a PR and branch that already existed — handwritten, with its own reviewers, comments and name — instead of opening a drip-owned one. Explicit and evidence-based: `drip manifest adopt` takes the projection id, PR number and head branch, and records correspondence only after the branch's effective diff, replayed onto the mega branch's merge base, produces exactly the projection's materialized tree. Never inferred from titles or similarity, never pushes anything, and leaves an adopted branch under lease afterwards — drip doesn't own it. See docs/adr/0020.
 _Avoid_: import, claim, takeover
 
+**Branch ownership**:
+Which of two rules a projection's remote branch is maintained under, and the thing most of drip's post-push behaviour follows from. A **drip-opened** branch (`drip/<branch>/<id>`) is drip's property: force-pushed with no lease, retargeted freely, regenerated rather than rebased. An **adopted** branch is someone else's: force-pushed with `--force-with-lease` against the recorded sha, skipped on tree equality rather than content hash, and never retargeted. The distinction is recorded per correspondence row, not inferred per push. See docs/adr/0020 and docs/review-feedback-loop.md.
+_Avoid_: managed, controlled, drip branch (all hide that the other kind exists)
+
+**Reconciliation**:
+What a `drip push` does about everything that happened to the PRs since the last one — squash-merge detection, the interdiff comment, comment anchoring, base retargeting, the adopted-branch lease. Always a side effect of a push a person ran: drip has no daemon, no webhook and no polling, so between two pushes the PRs and drip's idea of them drift freely and only `drip review-context` will say so. See docs/review-feedback-loop.md.
+_Avoid_: sync, refresh, update (all imply something continuous)
+
 **Slice signature**:
 A slice's identity key for correspondence purposes in M2: the sorted, joined list of group keys the slice unions together — `file::QualifiedSymbolPath` for symbol groups, the fallback selector for fallback groups. An intermediate stand-in for real content-addressing (M3) — see `docs/adr/0006-slice-correspondence-key.md`.

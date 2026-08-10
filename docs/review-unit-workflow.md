@@ -40,6 +40,13 @@ a validated review plan                      every check in docs/adr/0018 + runn
   drip push --manifest [--reviewable-stack] [--draft]
 ```
 
+This path runs in one direction and stops at the first push. It is not the whole
+story: once the PRs exist, reviewers comment on them, people push commits to
+them, projections get squash-merged and you keep committing to the mega branch
+underneath. What drip does with each of those — and what it deliberately doesn't
+— is `docs/review-feedback-loop.md`, which picks up exactly where this diagram
+ends.
+
 ## What each layer is allowed to decide
 
 | Layer | Decides | Cannot decide |
