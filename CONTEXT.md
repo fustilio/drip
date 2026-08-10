@@ -59,7 +59,7 @@ A small non-feature change a projection needs to stay buildable and testable: an
 An explicit decision that an atomic slice lands in no projection *for now*, recorded with a reason. Deferred slices are excluded from what's pushed but still included in the tree-hash check, so deferral decides which PR something lands in and never whether it survives.
 
 **Reviewable stack**:
-A PR graph in which every base is a branch that has a PR on it. `--projection flat-first`'s generated integration base breaks that: it unions several prerequisites into a minted branch with no PR, so reviewers can't walk the prerequisites and a workflow filtered on the base branch never runs. Always reported; refused outright under `push --reviewable-stack`, whose remedy is to merge those prerequisites into one projection or declare one they all sit under. See docs/adr/0023.
+A PR graph in which every base is something a reviewer can open — the repository's default branch, a branch itself under review as a PR, or a prerequisite projection's own PR branch. `push --reviewable-stack` refuses everything else, before anything is materialized: a generated integration base (a minted union branch with no PR — always reported, flag or not), a `--base` that is a commit, a tag or a remote-tracking ref rather than a branch, and a branch that exists but nothing reviews. That last one is the published stand-in: a branch minted by hand to be a base is the same hidden base as one drip mints. The remedy is never a new branch — merge the prerequisites into one projection, or declare a projection they sit under and depend on that. See docs/adr/0023 and docs/adr/0032.
 _Avoid_: stack (bare — `--projection stacked` and a **GitHub stack** are both different things; say which)
 
 **GitHub stack**:

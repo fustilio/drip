@@ -226,5 +226,6 @@ precondition for anything.
 - `docs/adr/0020-adopting-existing-prs.md` — the ownership rule for branches and PRs
 - `docs/adr/0028-remote-drift-on-owned-branches.md` — `--reclaim` for branches
 - `docs/adr/0023-reviewable-stacks-and-runnable-checks.md` — `--reviewable-stack`
+- `docs/adr/0032-reviewable-bases.md` — what else that flag refuses: non-branch and unreviewed bases
 - `docs/adr/0016-flat-first-projection.md` — why the graph is a DAG in the first place
 - `docs/review-feedback-loop.md` — what happens to the PRs after they exist

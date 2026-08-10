@@ -59,6 +59,7 @@ export function githubMock(overrides: Record<string, AnyMock> = {}): Record<stri
     ghPrSetBase: mock(() => {}),
     ghPrClose: mock(() => {}),
     ghPrView: mock(() => ({ number: 42, url: "https://example.com/pull/42", state: "OPEN", headRefName: "", baseRefName: "main" })),
+    ghDefaultBranch: mock(() => "main"),
     ghListOpenPrs: mock(() => []),
     ghListReviewComments: mock(() => []),
     ghReplyToReviewComment: mock(() => {}),

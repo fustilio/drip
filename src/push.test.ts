@@ -64,7 +64,13 @@ const ghCreatePr = mock((_opts: unknown) => ({ number: 42, url: "https://example
 const ghPrClose = mock((_repoRoot: string, _prNumber: number, _comment: string) => {});
 const ghPrComment = mock((_repoRoot: string, _prNumber: number, _body: string) => {});
 const ghPrSetBase = mock((_repoRoot: string, _prNumber: number, _base: string) => {});
-mock.module("./github", () => githubMock({ ghCreatePr, ghPrClose, ghPrComment, ghPrSetBase }));
+// The two reads `--reviewable-stack` makes: which branch is the one everything
+// merges into, and which branches are already under review (docs/adr/0032).
+let defaultBranch: string | null = "main";
+let openPrs: Array<{ number: number; url: string; title: string; headRefName: string; baseRefName: string }> = [];
+const ghDefaultBranch = mock((_repoRoot: string) => defaultBranch);
+const ghListOpenPrs = mock((_repoRoot: string) => openPrs);
+mock.module("./github", () => githubMock({ ghCreatePr, ghPrClose, ghPrComment, ghPrSetBase, ghDefaultBranch, ghListOpenPrs }));
 
 const reconcileComments = mock(async (_opts: unknown) => ({ unchanged: 0, orphaned: 0 }));
 mock.module("./anchors", () => ({ reconcileComments }));
@@ -90,6 +96,8 @@ beforeEach(() => {
   ghPrClose.mockClear();
   ghPrComment.mockClear();
   reconcileComments.mockClear();
+  defaultBranch = "main";
+  openPrs = [];
 });
 
 afterEach(() => {
@@ -282,6 +290,9 @@ function makeFlatFixture(opts: { withDependent?: boolean } = {}) {
   writeFileSync(join(root, "helper.ts"), `export function shared(x: number) {\n  return x + 1;\n}\n`);
   writeFileSync(join(root, "helper2.ts"), `export function other(x: number) {\n  return x + 10;\n}\n`);
   commit(root, "init");
+  // The base branch exists on the remote, as it does anywhere a PR could be
+  // opened — `--reviewable-stack` checks that before it checks anything else.
+  git(["push", "-q", "origin", "main"], root);
 
   git(["checkout", "-q", "-b", "feature"], root);
   writeFileSync(join(root, "helper.ts"), `export function shared(x: number) {\n  return x + 2;\n}\n`);
@@ -310,7 +321,11 @@ function makeFlatFixture(opts: { withDependent?: boolean } = {}) {
   };
 }
 
-async function runFlatPush(root: string, projection: "stacked" | "flat-first", opts: { reviewableStack?: boolean } = {}) {
+async function runFlatPush(
+  root: string,
+  projection: "stacked" | "flat-first",
+  opts: { reviewableStack?: boolean; dryRun?: boolean; baseBranch?: string } = {},
+) {
   const { push } = await import("./push");
   using db = openStore(root);
   const plan = await computePlan({ git: backend, repoRoot: root, branch: "feature", baseBranch: "main" });
@@ -320,10 +335,10 @@ async function runFlatPush(root: string, projection: "stacked" | "flat-first", o
     db,
     repoRoot: root,
     branch: "feature",
-    baseBranch: "main",
+    baseBranch: opts.baseBranch ?? "main",
     mergeBase,
     plan,
-    dryRun: false,
+    dryRun: !!opts.dryRun,
     projection,
     reviewableStack: opts.reviewableStack,
   });
@@ -473,12 +488,115 @@ test("--reviewable-stack also refuses whatever depended on the refused projectio
   }
 });
 
-test("--reviewable-stack is a no-op in stacked mode, which has no generated bases", async () => {
+test("--reviewable-stack passes stacked mode, which has no generated bases", async () => {
   const { root, cleanup } = makeFlatFixture();
   try {
     const { results } = await runFlatPush(root, "stacked", { reviewableStack: true });
     expect(results.every((r) => r.status === "created")).toBe(true);
     expect(results.some((r) => r.hiddenBase)).toBe(false);
+    // Every base above the bottom is the previous projection's own PR branch.
+    expect(results[0]!.baseReview).toMatchObject({ kind: "default-branch", branch: "main" });
+    expect(results.slice(1).every((r) => r.baseReview.kind === "prerequisite")).toBe(true);
+  } finally {
+    cleanup();
+  }
+});
+
+// --- issue #14 follow-up: a base has to be a branch, and reviewed -------------
+
+/** Everything the base-branch check refuses, exercised against a real repo. */
+async function expectBaseRefused(root: string, base: string, contains: string, opts: { dryRun?: boolean } = {}) {
+  const before = gitOutput(["for-each-ref", "--format=%(refname)"], root);
+  let message = "";
+  try {
+    await runFlatPush(root, "flat-first", { reviewableStack: true, baseBranch: base, dryRun: opts.dryRun });
+    throw new Error("expected the base check to refuse this run");
+  } catch (e) {
+    message = String((e as Error).message);
+  }
+  expect(message).toContain(contains);
+  // "Before pushing anything" is the requirement: no PR, and the repository is
+  // exactly as it was — the refusal beat materialization, not just the push.
+  expect(ghCreatePr).not.toHaveBeenCalled();
+  expect(gitOutput(["for-each-ref", "--format=%(refname)"], root)).toBe(before);
+}
+
+test("--reviewable-stack refuses a commit sha as --base before anything is pushed", async () => {
+  const { root, remote, cleanup } = makeFlatFixture();
+  try {
+    const sha = gitOutput(["rev-parse", "main"], root).trim();
+    await expectBaseRefused(root, sha, "is a commit, not a branch");
+    // Nothing reached the remote either.
+    expect(gitOutput(["branch"], remote)).not.toContain("drip/feature/");
+  } finally {
+    cleanup();
+  }
+});
+
+test("--reviewable-stack refuses a branch published to stand in for a prerequisite", async () => {
+  const { root, cleanup } = makeFlatFixture();
+  try {
+    // The reported workaround: publish a branch at the prerequisite's commit so
+    // `gh pr create --base` stops complaining. It has no PR and no intent.
+    git(["push", "-q", "origin", "main:prereq-tip"], root);
+    git(["branch", "prereq-tip", "main"], root);
+    await expectBaseRefused(root, "prereq-tip", "no open PR of its own");
+  } finally {
+    cleanup();
+  }
+});
+
+test("a base branch that is itself under review is accepted, and named as such", async () => {
+  const { root, cleanup } = makeFlatFixture();
+  try {
+    git(["push", "-q", "origin", "main:release/2"], root);
+    git(["branch", "release/2", "main"], root);
+    openPrs = [{ number: 77, url: "https://example.com/pull/77", title: "release 2", headRefName: "release/2", baseRefName: "main" }];
+
+    const { byFile } = await runFlatPush(root, "flat-first", { reviewableStack: true, baseBranch: "release/2" });
+    expect(byFile.get("helper.ts")!.status).toBe("created");
+    expect(byFile.get("helper.ts")!.baseReview).toMatchObject({ kind: "base-pr", branch: "release/2", prNumber: 77 });
+  } finally {
+    cleanup();
+  }
+});
+
+test("GitHub unreadable: a dry-run reports it, a real push refuses", async () => {
+  const { root, cleanup } = makeFlatFixture();
+  try {
+    defaultBranch = null;
+
+    const { byFile } = await runFlatPush(root, "flat-first", { reviewableStack: true, dryRun: true });
+    expect(byFile.get("helper.ts")!.baseReview).toMatchObject({ kind: "unconfirmed", branch: "main" });
+
+    await expectBaseRefused(root, "main", "may not decide a base is reviewable by failing to look");
+  } finally {
+    cleanup();
+  }
+});
+
+test("a one-prerequisite base names the projection whose PR branch it is", async () => {
+  const { root, cleanup } = makeFlatFixture();
+  try {
+    const { byFile } = await runFlatPush(root, "flat-first", { reviewableStack: true });
+    const a = byFile.get("a.ts")!;
+    const shared = byFile.get("helper.ts")!;
+    expect(a.base).toBe(shared.branchName);
+    expect(a.baseReview).toMatchObject({ kind: "prerequisite", projection: shared.sliceLabel, prNumber: 42 });
+  } finally {
+    cleanup();
+  }
+});
+
+test("a dry-run names the prerequisite's branch even though its PR doesn't exist yet", async () => {
+  const { root, remote, cleanup } = makeFlatFixture();
+  try {
+    const { byFile } = await runFlatPush(root, "flat-first", { reviewableStack: true, dryRun: true });
+    const a = byFile.get("a.ts")!;
+    expect(a.base).toBe(byFile.get("helper.ts")!.branchName);
+    expect(a.baseReview).toMatchObject({ kind: "prerequisite", prNumber: null });
+    expect(ghCreatePr).not.toHaveBeenCalled();
+    expect(gitOutput(["branch"], remote)).not.toContain("drip/feature/");
   } finally {
     cleanup();
   }

@@ -10,6 +10,14 @@ export type CommitInfo = {
   authorDate: string;
 };
 
+/**
+ * What a ref *name* is, as opposed to what it resolves to. `rev-parse` answers
+ * the second question and happily turns a tag, a remote-tracking ref or a raw
+ * sha into a commit — which is exactly how a commit sha reached `gh pr create
+ * --base` and got rejected there instead of here (docs/adr/0032).
+ */
+export type RefKind = "branch" | "tag" | "remote" | "commit" | "none";
+
 export interface GitBackend {
   showToplevel(cwd: string): string;
   revParse(ref: string, cwd: string): string;
@@ -29,6 +37,8 @@ export interface GitBackend {
   worktreeAdd(path: string, commitish: string, cwd: string): void;
   worktreeRemove(path: string, cwd: string): void;
   log(range: string, cwd: string): CommitInfo[];
+  /** what a name resolves to in this clone — a PR base has to be a branch (docs/adr/0032) */
+  refKind(name: string, cwd: string): RefKind;
   updateRef(ref: string, sha: string, cwd: string): void;
   fetch(remote: string, ref: string, cwd: string): void;
   /** every `refs/heads/*` on the remote, keyed by short branch name */
@@ -140,6 +150,29 @@ export class ShellGitBackend implements GitBackend {
           message: message ?? "",
         };
       });
+  }
+  // Deliberately name-first: `show-ref --verify` is asked about each full
+  // refname in turn, and only a name that is no ref at all falls through to
+  // rev-parse. Asking rev-parse first would classify `main` and `deadbeef`
+  // identically, since both resolve to a commit.
+  refKind(name: string, cwd: string): RefKind {
+    const exists = (ref: string) => {
+      try {
+        run(["show-ref", "--verify", "--quiet", ref], cwd);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    if (exists(`refs/heads/${name}`)) return "branch";
+    if (exists(`refs/tags/${name}`)) return "tag";
+    if (exists(`refs/remotes/${name}`)) return "remote";
+    try {
+      run(["rev-parse", "--verify", "--quiet", `${name}^{commit}`], cwd);
+      return "commit";
+    } catch {
+      return "none";
+    }
   }
   updateRef(ref: string, sha: string, cwd: string) {
     run(["update-ref", ref, sha], cwd);

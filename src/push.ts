@@ -3,11 +3,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import { reconcileComments } from "./anchors";
+import { DripError } from "./errors";
 import type { GitBackend } from "./git-backend";
 import { ghCreatePr, ghPrClose, ghPrComment, ghPrSetBase } from "./github";
 import { buildSlicePatch, materializeFlatFirst, materializeSliceCommits, type FlatFirstSlice, type ProjectionMode } from "./materialize";
 import type { Hunk, PlanResult } from "./planner";
 import { unitBranchName } from "./refs";
+import { reviewBaseBranch, type BaseReview } from "./reviewable";
 import { computeContentHash, computeSliceSignature } from "./signature";
 import { deleteCorrespondence, getCorrespondence, upsertCorrespondence, type Correspondence } from "./store";
 
@@ -44,6 +46,13 @@ export type PushResult = {
    * filtered on `pull_request.branches: [main]` never runs on it (issue #14).
    */
   hiddenBase: boolean;
+  /**
+   * What makes this PR's base something a reviewer can open — the repository's
+   * default branch, a PR of its own, or the prerequisite projection whose PR
+   * branch it is. `unchecked` when `--reviewable-stack` was off, since drip
+   * doesn't read GitHub to form an opinion nobody asked for (docs/adr/0032).
+   */
+  baseReview: BaseReview;
 };
 
 // Pure: which of the five statuses a slice is in, given what's already known
@@ -113,7 +122,11 @@ export async function push(opts: {
   units?: PushUnits;
   /** open drip-owned PRs as drafts; never changes an existing PR's state */
   draft?: boolean;
-  /** refuse any projection that would need a generated integration base (issue #14) */
+  /**
+   * Refuse any base a reviewer can't open: a generated integration base
+   * (issue #14), a base branch that isn't a branch or that nothing reviews, or
+   * a prerequisite with no PR branch of its own (docs/adr/0032).
+   */
   reviewableStack?: boolean;
   /**
    * Push over a *drip-owned* branch that has moved on the remote, instead of
@@ -148,6 +161,46 @@ export async function push(opts: {
     }
   };
 
+  // What the remote actually holds right now, read once for the whole run.
+  // Without this, "unchanged" means "drip's materialized tree matches the one
+  // drip recorded last time" and says nothing about the branch a reviewer is
+  // looking at: a commit pushed onto a drip-owned branch made the PR disagree
+  // with the projection, and drip either force-pushed over it or reported
+  // `unchanged` and left it there. Sha comparison against the recorded
+  // correspondence closes both holes (docs/adr/0028).
+  //
+  // A real push needs the network anyway, so a failure here is fatal — silently
+  // skipping the check immediately before a force-push is the bug being fixed.
+  // A dry-run is expected to work offline, so there it degrades to "unknown"
+  // and every affected result says the check didn't run.
+  //
+  // Read before anything is materialized because the base-branch check below
+  // needs it, and that one has to refuse before drip does any work at all.
+  let remoteHeads: Map<string, string> | null;
+  try {
+    remoteHeads = git.lsRemoteHeads("origin", repoRoot);
+  } catch (e) {
+    if (!dryRun) throw e;
+    remoteHeads = null;
+  }
+
+  // The base every root in this run targets. Under --reviewable-stack it must
+  // be a branch a reviewer can open — checked once, before any branch is
+  // materialized, because "GitHub rejected the PR" is not where a caller should
+  // find out that `--base` was a commit sha (docs/adr/0032).
+  let baseBranchReview: BaseReview = { kind: "unchecked" };
+  if (opts.reviewableStack) {
+    const check = reviewBaseBranch({ git, repoRoot, base: baseBranch, remoteHeads, requireConfirmation: !dryRun });
+    if (!check.ok) throw new DripError(`--reviewable-stack refuses this run's base: ${check.message}`);
+    baseBranchReview = check.review;
+  }
+
+  // Branches this run leaves on the remote with a PR on them — the only
+  // branches a dependent projection may target under --reviewable-stack.
+  // Filled as each unit is decided, so a prerequisite that was blocked,
+  // squash-merged or never pushed is simply absent.
+  const reviewedBranches = new Map<string, { projection: string; prNumber: number | null }>();
+
   // Both modes materialize the same slice content; they differ only in what
   // each slice's branch is built on, and therefore what its PR can target.
   const flatById = new Map<string, FlatFirstSlice>();
@@ -173,26 +226,6 @@ export async function push(opts: {
   // current tip? A clean --reverse --check apply means yes. One scratch index,
   // rebuilt fresh per slice from the tip (--check never mutates it, but
   // read-tree is cheap and keeps each check independent of the others).
-  // What the remote actually holds right now, read once for the whole run.
-  // Without this, "unchanged" means "drip's materialized tree matches the one
-  // drip recorded last time" and says nothing about the branch a reviewer is
-  // looking at: a commit pushed onto a drip-owned branch made the PR disagree
-  // with the projection, and drip either force-pushed over it or reported
-  // `unchanged` and left it there. Sha comparison against the recorded
-  // correspondence closes both holes (docs/adr/0028).
-  //
-  // A real push needs the network anyway, so a failure here is fatal — silently
-  // skipping the check immediately before a force-push is the bug being fixed.
-  // A dry-run is expected to work offline, so there it degrades to "unknown"
-  // and every affected result says the check didn't run.
-  let remoteHeads: Map<string, string> | null;
-  try {
-    remoteHeads = git.lsRemoteHeads("origin", repoRoot);
-  } catch (e) {
-    if (!dryRun) throw e;
-    remoteHeads = null;
-  }
-
   const baseTip = git.revParse(baseBranch, repoRoot);
   const tmpDir = mkdtempSync(join(tmpdir(), "drip-reconcile-"));
   const indexFile = join(tmpDir, "index");
@@ -200,6 +233,8 @@ export async function push(opts: {
 
   const results: PushResult[] = [];
   let baseForNext = baseBranch;
+  /** which unit `baseForNext` belongs to — null while it's still the base branch */
+  let baseForNextUnit: string | null = null;
   // Slices whose content already landed on the base branch: a flat-first
   // dependent must target the base branch itself rather than a branch that
   // was dropped from this run.
@@ -223,7 +258,26 @@ export async function push(opts: {
       // recorded as blocked so its dependents are refused too.
       const block = (note: string): void => {
         blockedIds.add(sliceId);
-        results.push({ sliceLabel, branchName, prUrl: existing?.prUrl ?? null, prNumber: existing?.prNumber ?? null, adopted: !!existing?.adopted, status: "blocked", base: baseBranch, note, draft: null, hiddenBase: false });
+        results.push({ sliceLabel, branchName, prUrl: existing?.prUrl ?? null, prNumber: existing?.prNumber ?? null, adopted: !!existing?.adopted, status: "blocked", base: baseBranch, note, draft: null, hiddenBase: false, baseReview: { kind: "unchecked" } });
+      };
+
+      /**
+       * The base a dependent targets is its prerequisite's branch — which is
+       * only a review surface if this run actually leaves a PR on it. Refusing
+       * here is the one-prerequisite half of the same rule the generated base
+       * gets: a base nobody can open is a base nobody reviews (docs/adr/0032).
+       */
+      const prerequisiteBase = (prereqId: string, prereqBranch: string): BaseReview | null => {
+        const owner = reviewedBranches.get(prereqBranch);
+        if (!owner && opts.reviewableStack) {
+          block(
+            `its base would be ${prereqBranch}, the branch for ${label(prereqId)} — but this run leaves no PR on it, so reviewers get ` +
+              `a base they can't open. Push ${label(prereqId)} in this run, or bind it to the PR that already implements it with ` +
+              "`drip manifest adopt`. drip will not publish a branch to stand in for it.",
+          );
+          return null;
+        }
+        return { kind: "prerequisite", projection: label(prereqId), prNumber: owner?.prNumber ?? null };
       };
 
       if (!commit) {
@@ -249,8 +303,14 @@ export async function push(opts: {
       let integrationBranch: string | null = null;
       let base: string;
       let note: string | null = null;
+      let baseReview: BaseReview = baseBranchReview;
       if (projection === "stacked") {
         base = baseForNext;
+        if (baseForNextUnit) {
+          const review = prerequisiteBase(baseForNextUnit, base);
+          if (!review) continue;
+          baseReview = review;
+        }
       } else if (flat!.integrationCommit) {
         // A generated integration base is mergeable and not reviewable: it has
         // no PR, so reviewers can't see the prerequisites as a stack, and a
@@ -267,11 +327,15 @@ export async function push(opts: {
         }
         integrationBranch = `${branchName}-base`;
         base = integrationBranch;
+        baseReview = { kind: "generated" };
         note =
           `integration base unions ${flat!.prerequisites.map(label).join(", ")} — '${integrationBranch}' is generated and has no PR, ` +
           "so these prerequisites are not directly reviewable on GitHub and a workflow filtered on the base branch won't run CI here";
       } else if (flat!.baseSliceId && !droppedToBase.has(flat!.baseSliceId)) {
         base = sliceBranch(flat!.baseSliceId);
+        const review = prerequisiteBase(flat!.baseSliceId, base);
+        if (!review) continue;
+        baseReview = review;
       } else {
         base = baseBranch;
       }
@@ -324,6 +388,9 @@ export async function push(opts: {
       if (status === "squash-merged") {
         draft = null;
         hiddenBase = false;
+        // Its PR is about to be closed, so it targets nothing and the base's
+        // reviewability is no longer a claim about anything.
+        baseReview = { kind: "unchecked" };
       }
 
       // Has the branch moved since drip last wrote it? Only meaningful once
@@ -384,9 +451,20 @@ export async function push(opts: {
         }
       }
 
+      // A branch this run leaves standing with a PR on it is one a dependent
+      // may target; a squash-merged one, whose PR is about to be closed, is not.
+      const markReviewable = (prNumber: number | null) => {
+        reviewedBranches.set(branchName, { projection: sliceLabel, prNumber });
+        baseForNext = branchName;
+        baseForNextUnit = sliceId;
+      };
+
       if (dryRun) {
-        results.push({ sliceLabel, branchName, prUrl: existing?.prUrl ?? null, prNumber: existing?.prNumber ?? null, adopted: !!existing?.adopted, status, base, note, draft, hiddenBase });
-        if (status !== "squash-merged") baseForNext = branchName;
+        results.push({ sliceLabel, branchName, prUrl: existing?.prUrl ?? null, prNumber: existing?.prNumber ?? null, adopted: !!existing?.adopted, status, base, note, draft, hiddenBase, baseReview });
+        // Nothing is opened in a dry-run, so a PR this run *would* open is
+        // recorded with a null number rather than skipped — "the base is the
+        // branch this same run publishes" is exactly what the plan has to show.
+        if (status !== "squash-merged") markReviewable(existing?.prNumber ?? null);
         else droppedToBase.add(sliceId);
         continue;
       }
@@ -397,15 +475,15 @@ export async function push(opts: {
           deleteCorrespondence(db, branch, signature);
         }
         droppedToBase.add(sliceId);
-        results.push({ sliceLabel, branchName, prUrl: existing?.prUrl ?? null, prNumber: existing?.prNumber ?? null, adopted: !!existing?.adopted, status, base, note, draft, hiddenBase });
+        results.push({ sliceLabel, branchName, prUrl: existing?.prUrl ?? null, prNumber: existing?.prNumber ?? null, adopted: !!existing?.adopted, status, base, note, draft, hiddenBase, baseReview });
         continue; // dropped from the stack — baseForNext stays where it was
       }
 
       if (status === "unchanged") {
         // Nothing to do: the hash above already covers the branch's tree and
         // its target ref, so "unchanged" really means the PR is already right.
-        results.push({ sliceLabel, branchName, prUrl: existing!.prUrl, prNumber: existing!.prNumber, adopted: existing!.adopted, status, base, note, draft, hiddenBase });
-        baseForNext = branchName;
+        results.push({ sliceLabel, branchName, prUrl: existing!.prUrl, prNumber: existing!.prNumber, adopted: existing!.adopted, status, base, note, draft, hiddenBase, baseReview });
+        markReviewable(existing!.prNumber);
         continue;
       }
 
@@ -438,6 +516,7 @@ export async function push(opts: {
             "force-with-lease refused rather than discard those commits. Re-run to see where it stands now.",
           draft: null,
           hiddenBase: false,
+          baseReview,
         });
         continue;
       }
@@ -488,8 +567,8 @@ export async function push(opts: {
         baseRef,
         adopted: !!existing?.adopted,
       });
-      results.push({ sliceLabel, branchName, prUrl, prNumber, adopted: !!existing?.adopted, status, base, note, draft, hiddenBase });
-      baseForNext = branchName;
+      results.push({ sliceLabel, branchName, prUrl, prNumber, adopted: !!existing?.adopted, status, base, note, draft, hiddenBase, baseReview });
+      markReviewable(prNumber);
     }
   } finally {
     rmSync(tmpDir, { recursive: true, force: true });

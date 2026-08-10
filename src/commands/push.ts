@@ -2,6 +2,7 @@ import { buildCommand } from "@stricli/core";
 import { DripError } from "../errors";
 import { findManifest, printManifestReport, unitsFromManifest, verificationUnits } from "../manifest";
 import { push, type PushUnits } from "../push";
+import { describeBase } from "../reviewable";
 import { linearChains, linkStacks, printStackLinks, renderChain } from "../stacks";
 import { runVerify } from "../workflow";
 import {
@@ -140,9 +141,28 @@ export const pushCommand = buildCommand({
         // dry-run says "would open a draft" and a re-run over an existing PR
         // says nothing rather than implying it changed anything.
         const state = r.draft === null ? "" : r.draft ? " (draft)" : " (ready for review)";
-        const base = r.hiddenBase ? `${r.base} (generated, not reviewable on GitHub)` : r.base;
-        console.log(`  ${r.sliceLabel} -> ${r.branchName} [${r.status}]${state} base: ${base}${r.prUrl ? ` ${r.prUrl}` : ""}`);
+        // The base is printed with what makes it reviewable, not just its name:
+        // "which branch owns my prerequisite" is the question a stack's plan has
+        // to answer before it's pushed (docs/adr/0032).
+        console.log(`  ${r.sliceLabel} -> ${r.branchName} [${r.status}]${state} base: ${describeBase(r.base, r.baseReview)}${r.prUrl ? ` ${r.prUrl}` : ""}`);
         if (r.note) console.log(`      ${r.note}`);
+      }
+
+      // What --reviewable-stack actually established, said once. Its refusals
+      // are loud; what it *confirmed* should be too, since "every base is one a
+      // reviewer can open" is the claim the flag exists to make.
+      if (flags.reviewableStack) {
+        const bottom = results.map((r) => r.baseReview).find((b) => b.kind !== "prerequisite" && b.kind !== "unchecked");
+        const onPrereq = results.filter((r) => r.baseReview.kind === "prerequisite").length;
+        if (bottom?.kind === "unconfirmed") {
+          console.log(
+            `\nREVIEWABLE STACK: '${bottom.branch}' is a branch, but ${bottom.reason}.\n  A dry-run reports that rather than failing on it; a real push refuses.`,
+          );
+        } else if (bottom?.kind === "default-branch") {
+          console.log(`\nREVIEWABLE STACK: ${onPrereq} PR(s) on a prerequisite's own PR branch, the rest on '${bottom.branch}' (default branch).`);
+        } else if (bottom?.kind === "base-pr") {
+          console.log(`\nREVIEWABLE STACK: ${onPrereq} PR(s) on a prerequisite's own PR branch, the rest on '${bottom.branch}', itself under review as #${bottom.prNumber}.`);
+        }
       }
 
       // A generated integration base merges fine and reviews terribly, so it is
@@ -207,7 +227,7 @@ export const pushCommand = buildCommand({
       },
       manifest: { kind: "parsed", parse: String, brief: "push a manifest's projections instead of atomic slices", optional: true },
       ...manifestCheckFlags,
-      reviewableStack: { kind: "boolean", brief: "refuse any projection needing a generated integration base", default: false },
+      reviewableStack: { kind: "boolean", brief: "refuse any PR base a reviewer can't open: generated, non-branch or unreviewed", default: false },
       noLinkStack: { kind: "boolean", brief: "push the PRs without grouping them into a GitHub stack", default: false },
       draft: { kind: "boolean", brief: "open drip-owned PRs as drafts", default: false },
       reclaim: { kind: "boolean", brief: "rebuild what drip owns — a branch that moved, a stack that diverged — from the mega branch", default: false },

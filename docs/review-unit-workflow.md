@@ -80,8 +80,11 @@ And two more the workflow gives you if you ask for them:
 - `--require-verification` — a projection containing code must declare a
   command that actually runs (docs/adr/0023), which a shared
   `verificationProfile` can supply (docs/adr/0024).
-- `--reviewable-stack` — refuse any PR that would target a generated
-  integration base with no PR of its own (docs/adr/0023).
+- `--reviewable-stack` — every base must be one a reviewer can open: the
+  repository's default branch, a branch itself under review, or a prerequisite
+  projection's own PR branch. Refuses a generated integration base
+  (docs/adr/0023), a `--base` that is a commit or a tag rather than a branch,
+  and a branch published to stand in for a prerequisite (docs/adr/0032).
 
 ## Where the agent goes
 

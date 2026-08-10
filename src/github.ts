@@ -116,6 +116,30 @@ export function ghListOpenPrs(repoRoot: string, limit = 50): PrSummary[] {
   }));
 }
 
+/**
+ * The branch this repository merges into by default — the one base in a PR
+ * graph that needs no PR of its own, because it is what everything else is
+ * eventually reviewed *against* (docs/adr/0032).
+ *
+ * Read from GitHub rather than guessed from `origin/HEAD`, which is a clone-time
+ * snapshot that a fresh `git init` doesn't have at all. Returns null when it
+ * can't be read, so the caller decides what an unanswerable question means —
+ * a real push refuses, a dry-run says it couldn't confirm.
+ */
+export function ghDefaultBranch(repoRoot: string): string | null {
+  try {
+    const out = execFileSync("gh", ["repo", "view", "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"], {
+      cwd: repoRoot,
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+      .toString()
+      .trim();
+    return out || null;
+  } catch {
+    return null;
+  }
+}
+
 export type ReviewComment = {
   id: number;
   path: string;
